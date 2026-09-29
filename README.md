@@ -41,6 +41,7 @@ paper money.</sub>
 flowchart LR
     subgraph R1 ["1 · Research and selection"]
         direction TB
+        X["Lessons from<br/>the learning loop"] -.-> M
         M["Muse, research agent<br/>scans the market"] -->|"picks with cited bars,<br/>news and levels"| I["Intake<br/>schema and schedule checks"]
         I --> J{"Jev, AI judge<br/>ranks the picks"}
     end
@@ -57,7 +58,6 @@ flowchart LR
     end
     R1 -->|"top 10 selected"| R2
     R2 -->|"filled"| R3
-    R3 -.->|"lessons"| R1
 ```
 
 | Part | What it does |
