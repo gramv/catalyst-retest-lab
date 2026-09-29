@@ -4127,3 +4127,27 @@ own minimums (a stop at least 2% under the max entry, at least 2R) bind every pr
   - The five V3 setups Jev selected stay valid until the 22:00 slot supersedes them.
 - **More fills need an owner decision** on a named version (NEXT-BUILD-PLAN, "Entry distance"),
   not a research-method change.
+
+### 2026-09-28 — Open-source release (owner request)
+
+Owner, 2026-09-28 evening: "prepare opensourcing it with MIT license and push to github".
+- **Published:** https://github.com/gramv/catalyst-retest-lab, public. It is a clean snapshot of
+  `bb0e972` (plus the two scrubs below) as one commit, `382af50`, authored with the owner's
+  GitHub no-reply address. This repository's history (434 commits) was not pushed.
+- **License:** MIT (`LICENSE`, added here in `bb0e972`). The IBM Plex fonts keep the SIL OFL 1.1
+  (`src/catalyst_lab/static/fonts/OFL.txt`).
+- **Excluded from the public copy:**
+  - `artifacts/`: captured third-party pages, news excerpts, provider responses and ledger
+    exports. The two tests that read it skip without it.
+  - The owner's home-folder paths (replaced by `~`).
+  - The trader's live domain (one PHASES line).
+- **Checks before the push:**
+  - Every added line in the whole history, and the exported tree, was scanned for keys, tokens,
+    private keys and database URLs with passwords, plus high-entropy strings. The only hits were
+    test fixtures, placeholders, and scripts inside a captured third-party page (excluded).
+  - `.env.example` holds names only.
+  - `tests/test_safety.py` passed on the export.
+- **To publish later changes:** export again and push a new snapshot commit; the public repo is
+  not this repository's remote.
+- **GitHub CLI:** `~/.config` on the owner's Mac is owned by root, so `gh` keeps its settings in
+  `GH_CONFIG_DIR=~/.local/share/gh` (account `gramv`, token in the macOS keychain).
