@@ -39,16 +39,25 @@ paper money.</sub>
 
 ```mermaid
 flowchart LR
-    M["Muse<br/>research agent"] -->|"picks with cited bars,<br/>news and levels"| I["Intake<br/>schema and schedule checks"]
-    I --> J{"Jev<br/>AI judge<br/>ranks, keeps top 10"}
-    J -->|selected| S["System check<br/>live price, stop at least 2% away,<br/>reward at least 2x risk"]
-    S --> W["Watching<br/>Alpaca trade and quote streams"]
-    W -->|"price touches the entry"| R["Risk gate<br/>one-use, 5-second<br/>authorization"]
-    R --> B[("Alpaca paper<br/>entry + stop-limit")]
-    B --> T["Trade maintenance<br/>Jev reviews every minute:<br/>hold, raise stop, flag"]
-    T --> V["Window review<br/>after 4 hours:<br/>continue or exit"]
-    V --> L["Learning loop<br/>scorecard, replays,<br/>post-mortems"]
-    L -.->|lessons| M
+    subgraph R1 ["1 · Research and selection"]
+        direction TB
+        M["Muse, research agent<br/>scans the market"] -->|"picks with cited bars,<br/>news and levels"| I["Intake<br/>schema and schedule checks"]
+        I --> J{"Jev, AI judge<br/>ranks the picks"}
+    end
+    subgraph R2 ["2 · Entry"]
+        direction TB
+        S["System check<br/>live price, stop at least 2% away,<br/>reward at least 2x risk"] --> W["Watching<br/>Alpaca trade and quote streams"]
+        W -->|"price touches the entry"| G["Risk gate<br/>one-use, 5-second authorization"]
+        G --> B[("Alpaca paper account<br/>entry + stop-limit at the broker")]
+    end
+    subgraph R3 ["3 · Manage and learn"]
+        direction TB
+        T["Trade maintenance<br/>Jev every minute:<br/>hold, raise stop, flag"] --> V["Window review<br/>after 4 hours: continue or exit"]
+        V --> L["Learning loop<br/>scorecard, replays, post-mortems"]
+    end
+    R1 -->|"top 10 selected"| R2
+    R2 -->|"filled"| R3
+    R3 -.->|"lessons"| R1
 ```
 
 | Part | What it does |
