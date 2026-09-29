@@ -1,0 +1,13 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir . && useradd --uid 10001 --create-home experiment
+USER experiment
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+EXPOSE 8080
+# Public experiment page (docs/packages/experiment-page.md): read-only and paper-only.
+# EXPERIMENT_DATABASE_URL must use the catalyst_public role of migration 024, never the app,
+# risk, reporting or owner role. Supply no broker or Jev/TypeSafe variable: the service refuses
+# to start when any APCA_* variable or TYPESAFE_API_KEY is set. The port is $PORT, else 8080.
+CMD ["python", "-m", "catalyst_lab.experiment_page", "--host", "0.0.0.0"]

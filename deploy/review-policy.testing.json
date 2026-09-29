@@ -1,0 +1,43 @@
+{
+  "version": "JEV_LIVE_REVIEW_POLICY_V1",
+  "retry_http_statuses": [
+    429,
+    529
+  ],
+  "max_attempts": 3,
+  "backoff_base_ms": 250,
+  "backoff_multiplier": 2,
+  "backoff_cap_ms": 2000,
+  "jitter_mode": "EQUAL",
+  "jitter_lower_fraction": 0.5,
+  "retry_after_policy": "RESPECT_MINIMUM_OR_ABANDON",
+  "breaker_scope": "PROVIDER_MODEL_CREDENTIAL_SLOT",
+  "breaker_failure_threshold": 3,
+  "breaker_failure_classes": [
+    "HTTP_ERROR",
+    "TRANSPORT_FAILURE",
+    "TIMEOUT",
+    "INVALID_RESPONSE",
+    "MODEL_MISMATCH",
+    "CREDENTIAL_ECHO"
+  ],
+  "breaker_cooldown_seconds": 30,
+  "half_open_max_inflight": 1,
+  "half_open_max_attempts": 1,
+  "breaker_recovery_successes": 2,
+  "recovery_probe_spacing_seconds": 1,
+  "recovery_probe_policy": "SYNTHETIC_NON_AUTHORIZING",
+  "question_timeout_seconds": 3,
+  "batch_timeout_seconds": 3,
+  "overall_review_deadline_seconds": 10,
+  "evidence_max_age_seconds": 60,
+  "context_max_age_seconds": 60,
+  "expiry_grace_seconds": 0,
+  "max_clock_offset_ms": 250,
+  "same_candidate_max_active_chains": 1,
+  "selection_policy": "EXACT_REVISION_FIRST_VALID_CONFLICT_NEEDS_REVIEW",
+  "material_supersession_policy": "MATERIAL_REVISION_ONLY",
+  "duplicate_policy": "AUDIT_REJECT_SAME_REQUEST_RETRY",
+  "heartbeat_period_seconds": 5,
+  "heartbeat_deadline_seconds": 15
+}

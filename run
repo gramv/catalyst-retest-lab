@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+# Keep binary dependencies outside Documents/iCloud and avoid shared cache inodes.
+export UV_PROJECT_ENVIRONMENT="${XDG_DATA_HOME:-$HOME/.local/share}/catalyst-retest-lab/venv"
+export UV_LINK_MODE=copy
+# Keep Python bytecode outside iCloud too; reading evicted __pycache__ files can stall startup.
+export PYTHONPYCACHEPREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/catalyst-retest-lab/pycache"
+uv sync --locked --extra dev --quiet
+# Python skips .pth files carrying macOS UF_HIDDEN. Clear that inherited flag
+# after sync, then prevent uv from reinstalling the editable package on this run.
+if [ "$(uname -s)" = Darwin ]; then
+    chflags nohidden "$UV_PROJECT_ENVIRONMENT"/lib/python*/site-packages/*.pth
+fi
+exec uv run --no-sync "$@"

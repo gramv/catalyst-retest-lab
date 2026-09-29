@@ -1,0 +1,98 @@
+{
+  "agents": [],
+  "audit": {
+    "database_url": "REQUIRED_CATALYST_APP_READ_CONNECTION_TO_SAME_LEDGER",
+    "directory": "/REQUIRED/private-paper/audit-checkpoints",
+    "interval_seconds": 3600
+  },
+  "backup": {
+    "directory": "/REQUIRED/private-paper/backups",
+    "retention_days": 14
+  },
+  "config_version": 2,
+  "environment": {
+    "APCA_API_KEY_ID": "REQUIRED_PAPER_ALPACA_KEY_ID",
+    "APCA_API_SECRET_KEY": "REQUIRED_PAPER_ALPACA_SECRET",
+    "CATALYST_ENVIRONMENT": "local",
+    "JEV_BYTES_PER_TOKEN": "3",
+    "JEV_CREDENTIAL_SLOT": "paper-local",
+    "JEV_MONTHLY_BUDGET_USD": "50",
+    "JEV_PRICE_PER_MILLION_INPUT_TOKENS_USD": "0.042",
+    "JEV_REVIEW_POLICY_JSON": "{\"version\": \"JEV_LIVE_REVIEW_POLICY_V2\", \"retry_http_statuses\": [429, 529], \"max_attempts\": 3, \"backoff_base_ms\": 250, \"backoff_multiplier\": 2, \"backoff_cap_ms\": 2000, \"jitter_mode\": \"EQUAL\", \"jitter_lower_fraction\": 0.5, \"retry_after_policy\": \"RESPECT_MINIMUM_OR_ABANDON\", \"breaker_scope\": \"PROVIDER_MODEL_CREDENTIAL_SLOT\", \"breaker_failure_threshold\": 3, \"breaker_failure_classes\": [\"HTTP_ERROR\", \"TRANSPORT_FAILURE\", \"TIMEOUT\", \"INVALID_RESPONSE\", \"MODEL_MISMATCH\", \"CREDENTIAL_ECHO\"], \"breaker_cooldown_seconds\": 30, \"half_open_max_inflight\": 1, \"half_open_max_attempts\": 1, \"breaker_recovery_successes\": 2, \"recovery_probe_spacing_seconds\": 1, \"recovery_probe_policy\": \"SYNTHETIC_NON_AUTHORIZING\", \"question_timeout_seconds\": 8, \"batch_timeout_seconds\": 8, \"overall_review_deadline_seconds\": 10, \"evidence_max_age_seconds\": 60, \"context_max_age_seconds\": 60, \"expiry_grace_seconds\": 0, \"max_clock_offset_ms\": 250, \"same_candidate_max_active_chains\": 1, \"selection_policy\": \"EXACT_REVISION_FIRST_VALID_CONFLICT_NEEDS_REVIEW\", \"material_supersession_policy\": \"MATERIAL_REVISION_ONLY\", \"duplicate_policy\": \"AUDIT_REJECT_SAME_REQUEST_RETRY\", \"heartbeat_period_seconds\": 5, \"heartbeat_deadline_seconds\": 15}",
+    "JEV_WORKER_DATABASE_URL": "REQUIRED_JEV_WORKER_CONNECTION_TO_SAME_LEDGER",
+    "JEV_WORKER_MAX_INFLIGHT": "5",
+    "JEV_WORKER_POLL_SECONDS": "1",
+    "MANAGED_CLASSIFICATION_POLICY": "ALPACA_CRYPTO_SECTORS_V1",
+    "MANAGED_CRYPTO_CLASSIFICATIONS_JSON": "null",
+    "MANAGED_CRYPTO_DAY_POLICY_JSON": "{\"policy_id\": \"CRYPTO_NY_DAY_PAPER_V1\", \"entry_cutoff_minutes_before_midnight\": 10, \"flatten_minutes_before_midnight\": 5, \"max_hold_seconds\": 86400}",
+    "MANAGED_CRYPTO_WINDOW_JSON": "{\"version\": \"CRYPTO_WINDOW_REVIEW_V1\", \"window_minutes\": 240}",
+    "MANAGED_CYCLE_POLICY_JSON": "{\"selection_limit\": 10, \"review_deadline_seconds\": 10, \"claim_lease_seconds\": 15, \"max_packet_age_seconds\": 60, \"max_inflight\": 5, \"review_validity_seconds\": 1800, \"require_technical_evidence\": true}",
+    "MANAGED_DATABASE_URL": "REQUIRED_CATALYST_RISK_CONNECTION_TO_REVIEWED_LEDGER",
+    "MANAGED_ENVIRONMENT": "supervised_paper",
+    "MANAGED_HTTP_PORT": "8780",
+    "MANAGED_MANAGEMENT_REVIEWS": "DISABLED",
+    "MANAGED_MONITOR_TRIGGER_POLICY_JSON": "{\"policy_id\": \"JEV_MONITOR_SCHEDULING_ENGINEERING_V1\", \"minimum_interval_seconds\": 5, \"near_target_progress_fraction\": \"0.8\"}",
+    "MANAGED_POSITION_POLICY_JSON": "{\"quote_max_age_seconds\": 5, \"context_max_age_seconds\": 60, \"max_options\": 5, \"max_bars\": 20, \"max_news\": 4, \"max_structural_bars\": 64, \"max_history\": 4, \"context_version\": \"JEV_MANAGED_POSITION_CONTEXT_V3\", \"state_byte_budget\": 11000}",
+    "MANAGED_POSITION_REVIEW_SECONDS": "10",
+    "MANAGED_REPORT_MAX_SECONDS": "86400",
+    "MANAGED_RESEARCH_SCHEDULE_JSON": "{\"timezone\": \"America/New_York\", \"runs\": [\"08:00\"], \"grace_minutes\": 60}",
+    "MANAGED_RISK_POLICY_ID": "JEV_MANAGED_RISK_V3",
+    "MANAGED_RUNTIME_POLICY_JSON": "{\"profile\": \"MUSE_JEV_MANAGED_TEST_V1\", \"execution_tick_seconds\": 1, \"market_poll_seconds\": 1, \"research_poll_seconds\": 1, \"heartbeat_seconds\": 5, \"reconcile_seconds\": 30, \"stream_open_timeout_seconds\": 8, \"stream_read_timeout_seconds\": 1, \"reconnect_seconds\": 1, \"max_reconnect_seconds\": 30, \"shutdown_timeout_seconds\": 5, \"market_queue_capacity\": 5000}",
+    "MANAGED_SELECTION_RULE": "JEV_TOP_K_SELECTION_V2",
+    "MANAGED_SOURCE_POLICY_JSON": "{\"stock_feed\": \"iex\", \"timeout_seconds\": 3, \"batch_size\": 50, \"page_size\": 10000, \"max_pages\": 10, \"lookback_padding_bars\": 5}",
+    "MANAGED_TOPK_SELECTION_JSON": "{\"k\": 10}",
+    "MANAGED_US_CLASSIFICATIONS_JSON": "[]",
+    "TYPESAFE_ENV_FILE": "/REQUIRED/private-paper/typesafe.env"
+  },
+  "ledger": {
+    "data_directory": "/REQUIRED/ledger/postgres",
+    "marker_file": "/REQUIRED/ledger/LEDGER.json",
+    "pg_ctl": "/REQUIRED/postgresql/bin/pg_ctl",
+    "socket_directory": "/REQUIRED/ledger/socket",
+    "wait_seconds": 120
+  },
+  "logs": {
+    "backups": 5,
+    "directory": "/REQUIRED/private-paper/logs",
+    "max_bytes": 20971520
+  },
+  "muse": {
+    "api": "http://127.0.0.1:8780",
+    "command": [
+      "/REQUIRED/muse-codex/node_modules/.bin/codex",
+      "-c",
+      "web_search=\"live\"",
+      "exec",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "--ignore-user-config"
+    ],
+    "crypto_interval_seconds": 1800,
+    "spool": "/REQUIRED/private-paper/muse.sqlite",
+    "token_file": "/REQUIRED/private-paper/muse-token",
+    "us_interval_seconds": 1800
+  },
+  "notify": {},
+  "operator": {
+    "token_file": "/REQUIRED/private-paper/operator-token"
+  },
+  "release": {
+    "directory": "/REQUIRED/releases/COMMIT",
+    "source_sha256": "REQUIRED_RELEASE_SOURCE_SHA256"
+  },
+  "status": {
+    "token_file": "/REQUIRED/private-paper/status-token"
+  },
+  "watchdog": {
+    "alarm_file": "/REQUIRED/private-paper/alarms.json",
+    "api": "http://127.0.0.1:8780",
+    "interval_seconds": 30,
+    "muse_max_age_seconds": 600,
+    "reconciliation_max_age_seconds": 90,
+    "research_max_age_seconds": 180,
+    "tick_max_age_seconds": 15,
+    "timeout_seconds": 3
+  }
+}

@@ -1,0 +1,203 @@
+{
+  "verified_at": "2026-09-19T14:03:44.697318+00:00",
+  "model": "jev-1.13.0",
+  "scope": "Three synthetic engineering SKEPTIC reviews; no trading authorization",
+  "probe_policy": "ENGINEERING_ACCESS_PROBE_V1: one attempt, 10-second deadline",
+  "credential_delivery": "User-provided credential in transient process environment; Keychain background read blocked",
+  "reviews": [
+    {
+      "request_id": "8907977f-de5f-496f-a32b-28009dd928ce",
+      "status": "RECORDED",
+      "reason": null,
+      "receipt_ids": [
+        "8f579f76-c21c-42ef-9918-88eb4acc3fcd"
+      ],
+      "answers": {
+        "already_priced": {
+          "type": "choice",
+          "choice": "MEDIUM",
+          "confidence": 0.16,
+          "probabilities": {
+            "HIGH": 0.07,
+            "LOW": 0.29,
+            "Insufficient evidence": 0.27,
+            "MEDIUM": 0.37
+          }
+        },
+        "news_stale": {
+          "type": "choice",
+          "choice": "NO",
+          "confidence": 0.91,
+          "probabilities": {
+            "Insufficient evidence": 0.01,
+            "YES": 0.05,
+            "NO": 0.94
+          }
+        },
+        "unsupported_inference": {
+          "type": "choice",
+          "choice": "NO",
+          "confidence": 0.96,
+          "probabilities": {
+            "Insufficient evidence": 0.0,
+            "YES": 0.02,
+            "NO": 0.98
+          }
+        },
+        "verdict": {
+          "type": "choice",
+          "choice": "APPROVE",
+          "confidence": 0.37,
+          "probabilities": {
+            "Insufficient evidence": 0.01,
+            "REJECT": 0.41,
+            "NEEDS_REVIEW": 0.05,
+            "APPROVE": 0.53
+          }
+        }
+      },
+      "verification": [
+        {
+          "valid": true,
+          "receipt_id": "8f579f76-c21c-42ef-9918-88eb4acc3fcd",
+          "request_hash": "6c324f93c3c227b359f310646f231975b1de3d999e9558dc1d490446a4b681ef",
+          "response_hash": "e87a299d029bc507a529a01420be371fb127eeb01bc2c0863c492ff86a747170",
+          "outcome": "VALID"
+        }
+      ]
+    },
+    {
+      "request_id": "971c11b2-9e5b-4138-9b13-ade854c0d765",
+      "status": "NEEDS_REVIEW",
+      "reason": "UNCERTAIN_JUDGMENT",
+      "receipt_ids": [
+        "383208e4-41f7-470a-88ae-4a98ef867046"
+      ],
+      "answers": {
+        "already_priced": {
+          "type": "choice",
+          "choice": "Insufficient evidence",
+          "confidence": 0.7,
+          "probabilities": {
+            "HIGH": 0.0,
+            "LOW": 0.2,
+            "Insufficient evidence": 0.78,
+            "MEDIUM": 0.02
+          }
+        },
+        "news_stale": {
+          "type": "choice",
+          "choice": "NO",
+          "confidence": 0.86,
+          "probabilities": {
+            "YES": 0.04,
+            "NO": 0.91,
+            "Insufficient evidence": 0.05
+          }
+        },
+        "unsupported_inference": {
+          "type": "choice",
+          "choice": "YES",
+          "confidence": 0.99,
+          "probabilities": {
+            "YES": 1.0,
+            "NO": 0.0,
+            "Insufficient evidence": 0.0
+          }
+        },
+        "verdict": {
+          "type": "choice",
+          "choice": "REJECT",
+          "confidence": 1.0,
+          "probabilities": {
+            "NEEDS_REVIEW": 0.0,
+            "REJECT": 1.0,
+            "Insufficient evidence": 0.0,
+            "APPROVE": 0.0
+          }
+        }
+      },
+      "verification": [
+        {
+          "valid": true,
+          "receipt_id": "383208e4-41f7-470a-88ae-4a98ef867046",
+          "request_hash": "16751392d71fc0ef3e54a093897a7109427a7524bf2611ca9192d4583051c315",
+          "response_hash": "f65aba3bcd3cce23a258363d18940cfc98ab31eefe1fca2d828e957df49873a2",
+          "outcome": "VALID"
+        }
+      ]
+    },
+    {
+      "request_id": "559563cb-7715-4f73-8843-6208ad83cd83",
+      "status": "NEEDS_REVIEW",
+      "reason": "UNCERTAIN_JUDGMENT",
+      "receipt_ids": [
+        "019522b0-ed23-4541-bb97-fe3dd19ea1e2"
+      ],
+      "answers": {
+        "already_priced": {
+          "type": "choice",
+          "choice": "Insufficient evidence",
+          "confidence": 0.69,
+          "probabilities": {
+            "HIGH": 0.0,
+            "Insufficient evidence": 0.77,
+            "LOW": 0.23,
+            "MEDIUM": 0.0
+          }
+        },
+        "news_stale": {
+          "type": "choice",
+          "choice": "NO",
+          "confidence": 0.33,
+          "probabilities": {
+            "NO": 0.55,
+            "YES": 0.01,
+            "Insufficient evidence": 0.44
+          }
+        },
+        "unsupported_inference": {
+          "type": "choice",
+          "choice": "YES",
+          "confidence": 0.33,
+          "probabilities": {
+            "NO": 0.05,
+            "YES": 0.55,
+            "Insufficient evidence": 0.4
+          }
+        },
+        "verdict": {
+          "type": "choice",
+          "choice": "REJECT",
+          "confidence": 0.84,
+          "probabilities": {
+            "NEEDS_REVIEW": 0.0,
+            "Insufficient evidence": 0.11,
+            "APPROVE": 0.0,
+            "REJECT": 0.89
+          }
+        }
+      },
+      "verification": [
+        {
+          "valid": true,
+          "receipt_id": "019522b0-ed23-4541-bb97-fe3dd19ea1e2",
+          "request_hash": "2218ca498e23e3f6123d977728354f612863833d34f54815f34afeef98cd265b",
+          "response_hash": "88b0b04c6a4bd4c49f216d393d3fad625e6e67b6ce1d8587403fe1228c683e2f",
+          "outcome": "VALID"
+        }
+      ]
+    }
+  ],
+  "metrics": {
+    "attempts": 3,
+    "valid_responses": 3,
+    "p50_ms": 478.274415945634,
+    "p95_ms": 778.1392284552568
+  },
+  "audit_chain": {
+    "valid": true,
+    "event_count": 3402,
+    "head_hash": "8a1877374ea3fb68d61c26e92c9e407ca1fc8b3989af372b74f703e845ddc757"
+  }
+}

@@ -1,0 +1,67 @@
+# Catalyst Retest Lab: the managed paper engine on Railway (package cloud, 2026-09-27).
+# PAPER TRADING ONLY. One image for the trader, the ops service and the one-off provision
+# service; each service's start command picks its component (.railway/railway.ts).
+#
+# Build context: a staged, committed tree (scripts/cloud_release.py) holding
+# release-source.json. No secret is a build argument or a file in the image; .dockerignore
+# admits only what the build needs. PG_MAJOR must be Railway's Postgres major version (the
+# IaC postgres() helper of the pinned SDK deploys ghcr.io/railwayapp-templates/postgres-ssl:18):
+# pg_dump refuses a newer server.
+FROM python:3.12-slim
+
+ARG PG_MAJOR=18
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=UTC \
+    CATALYST_ENVIRONMENT=railway \
+    PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# tzdata, and the PostgreSQL client tools (pg_dump, pg_dumpall) of exactly PG_MAJOR from the
+# PostgreSQL project's signed apt repository (key fingerprint checked before use). The runtime
+# user's home is /nonexistent: catalyst_lab.cloud_entry makes it the components' HOME, where
+# libpq finds no ~/.postgresql certificate (root's /root would fail every TLS connection).
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg tzdata; \
+    install -d -m 0755 /usr/share/postgresql-common/pgdg; \
+    curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
+    gpg --show-keys --with-colons /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        | grep -qx 'fpr:::::::::B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8:'; \
+    . /etc/os-release; \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "postgresql-client-${PG_MAJOR}"; \
+    apt-get purge -y --auto-remove curl gnupg; \
+    rm -rf /var/lib/apt/lists/*; \
+    pg_dump --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."; \
+    pg_dumpall --version | grep -q "(PostgreSQL) ${PG_MAJOR}\."; \
+    groupadd --gid 10001 catalyst; \
+    useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin catalyst
+
+WORKDIR /app
+
+# The locked runtime dependencies, every file pinned by hash (uv export of uv.lock).
+COPY deploy/requirements.managed.txt /tmp/requirements.managed.txt
+RUN pip install --require-hashes --only-binary=:all: -r /tmp/requirements.managed.txt \
+    && rm /tmp/requirements.managed.txt
+
+# The package, and the release identity sealed from the staged commit: the build fails if the
+# uploaded package is not the staged one (catalyst_lab.cloud_release). The code stays root-owned
+# and read-only to the runtime user; release.json belongs to it, as managed_ops requires.
+COPY src /app/src
+COPY release-source.json /app/release-source.json
+RUN python -m catalyst_lab.cloud_release seal /app --uid 10001 --gid 10001
+
+EXPOSE 8080
+
+# The container starts as root only inside catalyst_lab.cloud_entry, which hands the Railway
+# volume (root-owned when mounted) to uid 10001 and drops root for good before any component
+# runs; the process keeps PID 1. Railway's start command replaces this default.
+CMD ["python", "-m", "catalyst_lab.cloud_entry", "trader"]

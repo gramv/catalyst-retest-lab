@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+.env
+.env.*
+!.env.example
+.local/
+exports/
+.DS_Store
+# Runtime/private files that must never be committed (plan 0.1)
+*.pid
+*.log
+*.sqlite
+api-token
+muse-token
+launch*.json
+# Third-party page captures retained only as local evidence
+artifacts/**/*.raw
+# Agent worktrees created by the Claude desktop app live inside the checkout
+.claude/worktrees/
+
+# Research-agent run folders (research_agent/run.py default: runs/<NY date>)
+/runs/
+
+# Railway IaC SDK install (npm install --prefix .railway), never committed
+.railway/node_modules/
+.railway/package-lock.json

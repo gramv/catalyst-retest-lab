@@ -1,0 +1,284 @@
+{
+  "first_run": {
+    "health": {
+      "status": "ok",
+      "alpaca": "paper",
+      "strategy_version": "CATALYST_RETEST_V1",
+      "time": "2026-09-17T22:21:37.565726+00:00",
+      "phase": "EXECUTION_LOCKED",
+      "broker_connected": true,
+      "trading_enabled": false,
+      "market_data": {
+        "enabled": true,
+        "feed": "iex",
+        "data_provider": "ALPACA",
+        "feed_coverage": "IEX_ONLY",
+        "rest_verified_at": "2026-09-17T22:21:27.515905+00:00",
+        "broker_connected": true,
+        "stream_connected": true,
+        "stream_authenticated": true,
+        "subscribed_symbol_count": 1,
+        "observations_received": 0,
+        "fresh_quote_count": 0,
+        "session_open": false,
+        "official_close": "2026-09-17T16:00:00-04:00",
+        "flatten_time": "2026-09-17T15:55:00-04:00",
+        "error": null,
+        "execution_enabled": false,
+        "workers_alive": true,
+        "admission_gate": "VALIDATION_CONTEXT_INCOMPLETE",
+        "broker_monitor": {
+          "trade_updates_connected": true,
+          "trading_enabled": false,
+          "reconciliation": {
+            "startup_clean": true,
+            "last_snapshot_clean": true,
+            "completed_at": "2026-09-17T22:21:27.321060+00:00",
+            "interval_seconds": 45,
+            "ready": true,
+            "error": null
+          },
+          "watch_permitted": true,
+          "error": null,
+          "workers_alive": true
+        }
+      }
+    },
+    "execution": {
+      "trading_enabled": false,
+      "positions": [],
+      "orders": [],
+      "last_reconciliation": {
+        "event_seq": 27,
+        "process_run_id": "14e85b9e-197b-4391-8020-679ebb7f9c44",
+        "session_date": "2026-09-17",
+        "started_at": "2026-09-17T22:21:27.031542+00:00",
+        "completed_at": "2026-09-17T22:21:27.321060+00:00",
+        "startup": false,
+        "clean": true,
+        "discrepancies": [],
+        "broker_snapshot": {
+          "orders": {},
+          "positions": {}
+        }
+      },
+      "halted": false,
+      "halt_reasons": []
+    },
+    "market_data": {
+      "enabled": true,
+      "feed": "iex",
+      "data_provider": "ALPACA",
+      "feed_coverage": "IEX_ONLY",
+      "rest_verified_at": "2026-09-17T22:21:27.515905+00:00",
+      "broker_connected": true,
+      "stream_connected": true,
+      "stream_authenticated": true,
+      "subscribed_symbol_count": 1,
+      "observations_received": 0,
+      "fresh_quote_count": 0,
+      "session_open": false,
+      "official_close": "2026-09-17T16:00:00-04:00",
+      "flatten_time": "2026-09-17T15:55:00-04:00",
+      "error": null,
+      "execution_enabled": false,
+      "workers_alive": true,
+      "admission_gate": "VALIDATION_CONTEXT_INCOMPLETE",
+      "broker_monitor": {
+        "trade_updates_connected": true,
+        "trading_enabled": false,
+        "reconciliation": {
+          "startup_clean": true,
+          "last_snapshot_clean": true,
+          "completed_at": "2026-09-17T22:21:27.321060+00:00",
+          "interval_seconds": 45,
+          "ready": true,
+          "error": null
+        },
+        "watch_permitted": true,
+        "error": null,
+        "workers_alive": true
+      },
+      "account": {
+        "status": "ACTIVE",
+        "currency": "USD",
+        "equity": "10000",
+        "cash": "10000",
+        "trading_blocked": false,
+        "account_blocked": false,
+        "trade_suspended_by_user": false
+      },
+      "quotes": [],
+      "subscribed_symbols": [
+        "AAPL"
+      ]
+    },
+    "polling": {
+      "schema": 4,
+      "runs": [
+        {
+          "process_run_id": "14e85b9e-197b-4391-8020-679ebb7f9c44",
+          "started_at": "2026-09-17T22:19:57.025522+00:00",
+          "completed_at": "2026-09-17T22:19:57.301959+00:00",
+          "startup": true,
+          "clean": true
+        },
+        {
+          "process_run_id": "14e85b9e-197b-4391-8020-679ebb7f9c44",
+          "started_at": "2026-09-17T22:20:42.030876+00:00",
+          "completed_at": "2026-09-17T22:20:42.280575+00:00",
+          "startup": false,
+          "clean": true
+        },
+        {
+          "process_run_id": "14e85b9e-197b-4391-8020-679ebb7f9c44",
+          "started_at": "2026-09-17T22:21:27.031542+00:00",
+          "completed_at": "2026-09-17T22:21:27.321060+00:00",
+          "startup": false,
+          "clean": true
+        },
+        {
+          "process_run_id": "14e85b9e-197b-4391-8020-679ebb7f9c44",
+          "started_at": "2026-09-17T22:22:12.041926+00:00",
+          "completed_at": "2026-09-17T22:22:12.369764+00:00",
+          "startup": false,
+          "clean": true
+        }
+      ],
+      "start_intervals_seconds": [
+        45.005354,
+        45.000666,
+        45.010384
+      ]
+    }
+  },
+  "after_restart": {
+    "health": {
+      "status": "ok",
+      "alpaca": "paper",
+      "strategy_version": "CATALYST_RETEST_V1",
+      "time": "2026-09-17T22:23:09.458475+00:00",
+      "phase": "EXECUTION_LOCKED",
+      "broker_connected": true,
+      "trading_enabled": false,
+      "market_data": {
+        "enabled": true,
+        "feed": "iex",
+        "data_provider": "ALPACA",
+        "feed_coverage": "IEX_ONLY",
+        "rest_verified_at": "2026-09-17T22:23:09.022088+00:00",
+        "broker_connected": true,
+        "stream_connected": true,
+        "stream_authenticated": true,
+        "subscribed_symbol_count": 1,
+        "observations_received": 0,
+        "fresh_quote_count": 0,
+        "session_open": false,
+        "official_close": "2026-09-17T16:00:00-04:00",
+        "flatten_time": "2026-09-17T15:55:00-04:00",
+        "error": null,
+        "execution_enabled": false,
+        "workers_alive": true,
+        "admission_gate": "VALIDATION_CONTEXT_INCOMPLETE",
+        "broker_monitor": {
+          "trade_updates_connected": true,
+          "trading_enabled": false,
+          "reconciliation": {
+            "startup_clean": true,
+            "last_snapshot_clean": true,
+            "completed_at": "2026-09-17T22:23:09.068814+00:00",
+            "interval_seconds": 45,
+            "ready": true,
+            "error": null
+          },
+          "watch_permitted": true,
+          "error": null,
+          "workers_alive": true
+        }
+      }
+    },
+    "execution": {
+      "trading_enabled": false,
+      "positions": [],
+      "orders": [],
+      "last_reconciliation": {
+        "event_seq": 36,
+        "process_run_id": "ad2a03c9-5e43-4d30-9798-35f5836c54bd",
+        "session_date": "2026-09-17",
+        "started_at": "2026-09-17T22:23:08.824432+00:00",
+        "completed_at": "2026-09-17T22:23:09.068814+00:00",
+        "startup": true,
+        "clean": true,
+        "discrepancies": [],
+        "broker_snapshot": {
+          "orders": {},
+          "positions": {}
+        }
+      },
+      "halted": false,
+      "halt_reasons": []
+    },
+    "market_data": {
+      "enabled": true,
+      "feed": "iex",
+      "data_provider": "ALPACA",
+      "feed_coverage": "IEX_ONLY",
+      "rest_verified_at": "2026-09-17T22:23:09.022088+00:00",
+      "broker_connected": true,
+      "stream_connected": true,
+      "stream_authenticated": true,
+      "subscribed_symbol_count": 1,
+      "observations_received": 0,
+      "fresh_quote_count": 0,
+      "session_open": false,
+      "official_close": "2026-09-17T16:00:00-04:00",
+      "flatten_time": "2026-09-17T15:55:00-04:00",
+      "error": null,
+      "execution_enabled": false,
+      "workers_alive": true,
+      "admission_gate": "VALIDATION_CONTEXT_INCOMPLETE",
+      "broker_monitor": {
+        "trade_updates_connected": true,
+        "trading_enabled": false,
+        "reconciliation": {
+          "startup_clean": true,
+          "last_snapshot_clean": true,
+          "completed_at": "2026-09-17T22:23:09.068814+00:00",
+          "interval_seconds": 45,
+          "ready": true,
+          "error": null
+        },
+        "watch_permitted": true,
+        "error": null,
+        "workers_alive": true
+      },
+      "account": {
+        "status": "ACTIVE",
+        "currency": "USD",
+        "equity": "10000",
+        "cash": "10000",
+        "trading_blocked": false,
+        "account_blocked": false,
+        "trade_suspended_by_user": false
+      },
+      "quotes": [],
+      "subscribed_symbols": [
+        "AAPL"
+      ]
+    },
+    "ledger_counts": {
+      "orders": 0,
+      "fills": 0,
+      "positions": 0,
+      "trades": 0,
+      "halts": 0
+    }
+  },
+  "audit_checkpoint": {
+    "file": "exports/20260917T222326236122Z.jsonl",
+    "valid": true,
+    "event_count": 36,
+    "head_hash": "411bd0e7f683598a4ebaf130da2cf62468b08538bcd3cde3b59df9026205627f",
+    "note": "Verified prefix at 2026-09-17T22:23:26Z; running monitor continues appending."
+  }
+}

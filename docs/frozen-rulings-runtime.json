@@ -1,0 +1,54 @@
+{
+  "checked_at": "2026-09-18T00:05:22.892314+00:00",
+  "health_phase": "RISK_GATED",
+  "submission_mode": "RISK_DECISION_REQUIRED",
+  "trading_enabled": true,
+  "broker_monitor": {
+    "trade_updates_connected": true,
+    "trading_enabled": true,
+    "reconciliation": {
+      "startup_clean": true,
+      "last_snapshot_clean": true,
+      "completed_at": "2026-09-18T00:05:22.185919+00:00",
+      "interval_seconds": 45,
+      "ready": true,
+      "error": null
+    },
+    "watch_permitted": true,
+    "error": null,
+    "workers_alive": true,
+    "risk_engine_configured": true
+  },
+  "market_stream_authenticated": true,
+  "authorization_ttl_seconds": 5,
+  "session_baseline": {
+    "session_date": "2026-09-17",
+    "day_start_equity": "10000",
+    "source": "ALPACA_LAST_EQUITY",
+    "observed_at": "2026-09-18T00:05:22.195724+00:00",
+    "event_seq": 183,
+    "reconciliation_seq": 182
+  },
+  "database_counts": {
+    "schema_version": 6,
+    "orders": 0,
+    "fills": 0,
+    "risk_decisions": 0,
+    "engineering_runs": 0,
+    "active_reservations": 0
+  },
+  "audit": {
+    "valid": true,
+    "event_count": 183,
+    "head_hash": "8d0d161202934b4c18d3ffb361179750a80cbdbe6d340fe56fbfbee87d39bb43"
+  },
+  "paper_account_status": "ACTIVE",
+  "paper_equity": "10000",
+  "open_positions": 0,
+  "open_orders": 0,
+  "regular_session_open": false,
+  "next_open": "2026-09-18T09:30:00-04:00",
+  "closed_session_enrollment": "REJECTED_REGULAR_SESSION_REQUIRED",
+  "broker_mutations_sent": 0,
+  "controlled_acceptance": "NOT_RUN"
+}

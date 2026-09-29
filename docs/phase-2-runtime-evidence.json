@@ -1,0 +1,51 @@
+{
+  "checked_at": "2026-09-17T21:47:07.828564+00:00",
+  "health": {
+    "status": "ok",
+    "alpaca": "paper",
+    "strategy_version": "CATALYST_RETEST_V1",
+    "time": "2026-09-17T21:47:07.492366+00:00",
+    "phase": "WATCH_TRIGGER",
+    "broker_connected": true,
+    "trading_enabled": false,
+    "market_data": {
+      "enabled": true,
+      "feed": "iex",
+      "data_provider": "ALPACA",
+      "feed_coverage": "IEX_ONLY",
+      "rest_verified_at": "2026-09-17T21:46:50.780622+00:00",
+      "broker_connected": true,
+      "stream_connected": true,
+      "stream_authenticated": true,
+      "subscribed_symbol_count": 1,
+      "observations_received": 0,
+      "fresh_quote_count": 0,
+      "session_open": false,
+      "official_close": "2026-09-17T16:00:00-04:00",
+      "flatten_time": "2026-09-17T15:55:00-04:00",
+      "error": null,
+      "execution_enabled": false,
+      "workers_alive": true,
+      "admission_gate": "STARTUP_RECONCILIATION_REQUIRED"
+    }
+  },
+  "account": {
+    "status": "ACTIVE",
+    "currency": "USD",
+    "equity": "10000",
+    "cash": "10000",
+    "trading_blocked": false,
+    "account_blocked": false,
+    "trade_suspended_by_user": false
+  },
+  "subscribed_symbols": [
+    "AAPL"
+  ],
+  "broker_positions": 0,
+  "broker_open_orders": 0,
+  "audit_manifest": {
+    "valid": true,
+    "event_count": 13,
+    "head_hash": "1fb61efe65cdfb308d95b0f60d4dc55ae930ab22243d1f8ce92cffb4d70f6c91"
+  }
+}

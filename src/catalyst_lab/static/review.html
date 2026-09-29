@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Catalyst · Research review</title>
+  <link rel="stylesheet" href="/review-assets/dashboard.css">
+  <link rel="stylesheet" href="/review-assets/review.css">
+  <script src="/review-assets/review.js" defer></script>
+</head>
+<body>
+<div class="paper-banner">PAPER TRADING — SIMULATED. Not real money.</div>
+<header class="masthead"><a class="wordmark" href="/"><span class="brand-mark" aria-hidden="true">C</span><strong>Catalyst</strong><span class="quiet-label">Research review</span></a><button id="logout" hidden>Lock screen</button></header>
+<main>
+  <div class="page-heading"><h1>Research shortlist</h1><span class="updated" id="connection" role="status">Private view</span></div>
+  <section id="login-panel" aria-label="Private access">
+    <h2>Open your research reports</h2><p class="subtle">Use the review read token. It stays in this tab’s memory.</p>
+    <form id="login"><label for="token">Read token</label><div class="login-row"><input id="token" type="password" autocomplete="off" required><button type="submit">Connect</button></div></form>
+  </section>
+  <p id="notice" role="alert" hidden></p>
+  <section id="workspace" hidden>
+    <nav class="tabs" aria-label="Research markets">
+      <button class="tab active" data-market="US_STOCKS" aria-pressed="true">US stocks</button>
+      <button class="tab" data-market="CRYPTO" aria-pressed="false">Crypto</button>
+      <button class="tab" data-market="INDIA" aria-pressed="false">Indian stocks</button>
+    </nav>
+    <div class="section-top"><div class="cohort-line"><span class="cohort-badge">Engineering test</span><span id="market-note">US research · paper test status shown when enrolled</span></div><button id="refresh">Refresh</button></div>
+    <div class="report-controls"><label for="reports">Report</label><select id="reports" aria-label="Research report"></select><span id="worker" role="status">Worker status unavailable</span></div>
+    <p id="empty" class="research-empty" hidden>No reports for this market yet.</p>
+    <section id="report-panel" hidden aria-label="Report results">
+      <div class="metrics">
+        <article class="metric primary"><h2>Selected</h2><p id="selected" class="metric-value">—</p><small>Recorded research decision</small></article>
+        <article class="metric"><h2>Rejected</h2><p id="rejected" class="metric-value">—</p><small>Retained in the record</small></article>
+        <article class="metric"><h2>Needs review</h2><p id="needs-review" class="metric-value">—</p><small>Uncertain or unavailable</small></article>
+        <article class="metric"><h2>Pending</h2><p id="pending" class="metric-value">—</p><small>Awaiting a recorded result</small></article>
+      </div>
+      <div class="table-scroll"><table><thead><tr><th>Instrument</th><th>Research decision</th><th>Current validity</th><th>Details</th></tr></thead><tbody id="items"></tbody></table></div>
+      <p id="report-meta" class="subtle"></p>
+    </section>
+    <details><summary>How to read this list</summary><p class="detail-note">Jev reviews Muse’s evidence. Selected means the research policy passed; it is not an order or a risk authorization. Expired decisions remain visible as history. Engineering tests are excluded from strategy results. Indian stocks remain research-only.</p></details>
+  </section>
+  <footer><span>Muse → Jev → research shortlist</span><span>Local test surface</span></footer>
+</main>
+<dialog id="detail"><button id="close-detail" class="close-button">Close</button><div id="detail-body"></div></dialog>
+</body>
+</html>

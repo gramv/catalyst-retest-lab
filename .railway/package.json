@@ -1,0 +1,12 @@
+{
+  "name": "catalyst-retest-lab-railway-config",
+  "private": true,
+  "type": "module",
+  "description": "Only for `railway config plan|apply`: the pinned Railway IaC SDK. Install with `npm install --prefix .railway --no-package-lock`.",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "railway": "3.11.0"
+  }
+}

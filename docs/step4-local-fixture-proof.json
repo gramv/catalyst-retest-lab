@@ -1,0 +1,206 @@
+{
+  "provider": "fixture",
+  "engineering_only": true,
+  "market_data": "SYNTHETIC_LAB_FIXTURE",
+  "network_broker_requests": 0,
+  "strategy_version": "CATALYST_RETEST_V1",
+  "cohort": "JEV_ENGINEERING_TEST",
+  "railway_deployment": "DEFERRED_BY_OWNER",
+  "steps": [
+    {
+      "step": "EXISTING_CANDIDATE_FIXTURE",
+      "status": "VALIDATED",
+      "broker_order": false
+    },
+    {
+      "step": "MUSE_EVIDENCE_POST",
+      "http_status": 201,
+      "bundle_hash": "017ce670bdb393df9e3bfab662891fe15bc7e0b4cfb8c8d526d2022b155ac2f8",
+      "context_hash": "1f1e065a1eca66aff39db553a770e74f8811a7c60f8245fb35ed8b6723e39251",
+      "revision": 1,
+      "cohort": "JEV_ENGINEERING_TEST",
+      "deadline": "2026-09-19T15:19:51.488487+00:00",
+      "status": "STORED_EVIDENCE_ONLY",
+      "authorizes_entry": false
+    },
+    {
+      "step": "JEV_REVIEW",
+      "status": "NEEDS_REVIEW",
+      "provider_evidence": "SYNTHETIC_NO_NETWORK",
+      "receipt": {
+        "valid": true,
+        "receipt_id": "12c0c125-48dc-4a12-ad90-a6c057165843",
+        "request_hash": "b6151b0e7f6aeaa38d306f574bdd4cb37f8ccf143fb6c072bbce5d525e932208",
+        "response_hash": "d10db2e824bcdac2c103f16059e95c0c8f298bcb0236175bc76a40b3e9a33b39",
+        "outcome": "VALID"
+      },
+      "verdict": "REJECT"
+    },
+    {
+      "step": "MUSE_STORE_INTENT",
+      "http_status": 201,
+      "intent_id": "12c19725-efd0-49da-8216-8bf671b4722b",
+      "status": "STORED_ONLY_NOT_AUTHORIZED",
+      "authorizes_entry": false
+    }
+  ],
+  "candidate_id": "11c451de-68b9-4517-a731-ba05b9556685",
+  "health": {
+    "status": "ok",
+    "alpaca": "paper",
+    "strategy_version": "CATALYST_RETEST_V1",
+    "surface": "STEP4_REVIEW_STORAGE_ONLY",
+    "trading_enabled": false,
+    "judgments_authorize_entry": false,
+    "intent_consumer": false,
+    "worker_loop": false,
+    "provider_access": "NOT_PROBED",
+    "gate1_policy": "JEV_LIVE_REVIEW_POLICY_V1",
+    "time": "2026-09-19T15:18:51.488019+00:00"
+  },
+  "negative_checks": {
+    "repeat_intent": 409,
+    "intent_get": 405,
+    "candidate_post_to_review_service": 404,
+    "wrong_bundle_binding": 409
+  },
+  "observations": {
+    "cohort": "JEV_ENGINEERING_TEST",
+    "strategy_version": "CATALYST_RETEST_V1",
+    "strategy_results": false,
+    "items": [
+      {
+        "decision_id": "2ad568aa-0972-4b08-b73f-6f6549393116",
+        "receipt_id": "12c0c125-48dc-4a12-ad90-a6c057165843",
+        "question": "already_priced",
+        "answer_json": {
+          "type": "choice",
+          "choice": "Insufficient evidence",
+          "confidence": 1.0,
+          "probabilities": {
+            "LOW": 0.0,
+            "HIGH": 0.0,
+            "MEDIUM": 0.0,
+            "Insufficient evidence": 1.0
+          }
+        },
+        "probability": "1",
+        "decision_confidence": "1",
+        "strategy_version": "CATALYST_RETEST_V1",
+        "cohort": "JEV_ENGINEERING_TEST",
+        "record_purpose": "ENGINEERING_TEST",
+        "bundle_hash": "017ce670bdb393df9e3bfab662891fe15bc7e0b4cfb8c8d526d2022b155ac2f8",
+        "context_hash": "1f1e065a1eca66aff39db553a770e74f8811a7c60f8245fb35ed8b6723e39251",
+        "candidate_id": "11c451de-68b9-4517-a731-ba05b9556685",
+        "evidence_revision": 1,
+        "model": "jev-1.13.0",
+        "latency_ms": "0.424541067332029",
+        "completed_at": "2026-09-19T15:18:51.523129+00:00",
+        "outcome": "VALID",
+        "event_seq": 10
+      },
+      {
+        "decision_id": "f4d0e24a-b49e-4fac-836b-a091583a19a2",
+        "receipt_id": "12c0c125-48dc-4a12-ad90-a6c057165843",
+        "question": "news_stale",
+        "answer_json": {
+          "type": "choice",
+          "choice": "Insufficient evidence",
+          "confidence": 1.0,
+          "probabilities": {
+            "NO": 0.0,
+            "YES": 0.0,
+            "Insufficient evidence": 1.0
+          }
+        },
+        "probability": "1",
+        "decision_confidence": "1",
+        "strategy_version": "CATALYST_RETEST_V1",
+        "cohort": "JEV_ENGINEERING_TEST",
+        "record_purpose": "ENGINEERING_TEST",
+        "bundle_hash": "017ce670bdb393df9e3bfab662891fe15bc7e0b4cfb8c8d526d2022b155ac2f8",
+        "context_hash": "1f1e065a1eca66aff39db553a770e74f8811a7c60f8245fb35ed8b6723e39251",
+        "candidate_id": "11c451de-68b9-4517-a731-ba05b9556685",
+        "evidence_revision": 1,
+        "model": "jev-1.13.0",
+        "latency_ms": "0.424541067332029",
+        "completed_at": "2026-09-19T15:18:51.523129+00:00",
+        "outcome": "VALID",
+        "event_seq": 11
+      },
+      {
+        "decision_id": "e79a51aa-1bc6-4a5c-8666-672f2a282db4",
+        "receipt_id": "12c0c125-48dc-4a12-ad90-a6c057165843",
+        "question": "unsupported_inference",
+        "answer_json": {
+          "type": "choice",
+          "choice": "Insufficient evidence",
+          "confidence": 1.0,
+          "probabilities": {
+            "NO": 0.0,
+            "YES": 0.0,
+            "Insufficient evidence": 1.0
+          }
+        },
+        "probability": "1",
+        "decision_confidence": "1",
+        "strategy_version": "CATALYST_RETEST_V1",
+        "cohort": "JEV_ENGINEERING_TEST",
+        "record_purpose": "ENGINEERING_TEST",
+        "bundle_hash": "017ce670bdb393df9e3bfab662891fe15bc7e0b4cfb8c8d526d2022b155ac2f8",
+        "context_hash": "1f1e065a1eca66aff39db553a770e74f8811a7c60f8245fb35ed8b6723e39251",
+        "candidate_id": "11c451de-68b9-4517-a731-ba05b9556685",
+        "evidence_revision": 1,
+        "model": "jev-1.13.0",
+        "latency_ms": "0.424541067332029",
+        "completed_at": "2026-09-19T15:18:51.523129+00:00",
+        "outcome": "VALID",
+        "event_seq": 12
+      },
+      {
+        "decision_id": "68c3f95c-b5c2-414d-87e9-cf00a1a4bcc0",
+        "receipt_id": "12c0c125-48dc-4a12-ad90-a6c057165843",
+        "question": "verdict",
+        "answer_json": {
+          "type": "choice",
+          "choice": "REJECT",
+          "confidence": 1.0,
+          "probabilities": {
+            "REJECT": 1.0,
+            "APPROVE": 0.0,
+            "NEEDS_REVIEW": 0.0,
+            "Insufficient evidence": 0.0
+          }
+        },
+        "probability": "1",
+        "decision_confidence": "1",
+        "strategy_version": "CATALYST_RETEST_V1",
+        "cohort": "JEV_ENGINEERING_TEST",
+        "record_purpose": "ENGINEERING_TEST",
+        "bundle_hash": "017ce670bdb393df9e3bfab662891fe15bc7e0b4cfb8c8d526d2022b155ac2f8",
+        "context_hash": "1f1e065a1eca66aff39db553a770e74f8811a7c60f8245fb35ed8b6723e39251",
+        "candidate_id": "11c451de-68b9-4517-a731-ba05b9556685",
+        "evidence_revision": 1,
+        "model": "jev-1.13.0",
+        "latency_ms": "0.424541067332029",
+        "completed_at": "2026-09-19T15:18:51.523129+00:00",
+        "outcome": "VALID",
+        "event_seq": 13
+      }
+    ],
+    "next_after_seq": 13
+  },
+  "exposure_check": {
+    "orders": 0,
+    "fills": 0,
+    "risk_decisions": 0
+  },
+  "audit_chain": {
+    "valid": true,
+    "event_count": 14,
+    "head_hash": "bdce8d37cf13877cca7adc66a9425654a37a1391869046bb0cce1978fdc9f175"
+  },
+  "final_candidate_state": "VALIDATED",
+  "test_scope": "In-process HTTP/ASGI + real disposable PostgreSQL; no broker network",
+  "judgments_authorize_entry": false
+}

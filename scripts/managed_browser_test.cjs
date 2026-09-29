@@ -1,0 +1,34 @@
+// Requires the isolated prove_managed_wiring.py fixture server. No provider credentials.
+const {chromium}=require('playwright');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+(async()=>{
+ const browser=await chromium.launch({headless:true,channel:'chrome'});
+ const page=await browser.newPage({viewport:{width:1440,height:1024}});
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('http://127.0.0.1:8767');
+ assert((await page.locator('body').innerText()).includes('PAPER TRADING — SIMULATED'));
+ await page.locator('#token').fill('incorrect-fixture-token');
+ await page.locator('#connect-button').click();
+ await page.waitForFunction(()=>document.querySelector('#message').textContent.includes('(401)'));
+ assert.equal(await page.locator('#trades tr').count(),0);
+ await page.locator('#token').fill('fixture-proof-local-only-not-a-provider-secret');
+ await page.locator('#connect-button').click();
+ await page.waitForFunction(()=>document.querySelector('#contenders').textContent==='20');
+ assert.equal(await page.locator('#selected').innerText(),'10');
+ assert.equal(await page.locator('#open').innerText(),'0');
+ assert.equal(await page.locator('#trades tr').count(),2);
+ assert.equal(await page.locator('#token').inputValue(),'');
+ assert.equal(await page.evaluate(()=>localStorage.length+sessionStorage.length),0);
+ assert((await page.locator('#runtime').innerText()).includes('STOPPED_AFTER_FIXTURE_PROOF'));
+ assert((await page.locator('#trades').innerText()).includes('TIGHTEN_AND_EXTEND'));
+ fs.mkdirSync('artifacts/managed-wiring-proof-2026-09-19',{recursive:true});
+ await page.screenshot({path:'artifacts/managed-wiring-proof-2026-09-19/dashboard-desktop.png',fullPage:true});
+ await page.setViewportSize({width:390,height:844});
+ assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+ await page.screenshot({path:'artifacts/managed-wiring-proof-2026-09-19/dashboard-mobile.png',fullPage:true});
+ assert.deepEqual(errors,[]);
+ const proof={checks:12,result:'passed',providers:'FIXTURES_ONLY',browser_errors:errors};
+ fs.writeFileSync('artifacts/managed-wiring-proof-2026-09-19/browser-proof.json',JSON.stringify(proof,null,2)+'\n');
+ console.log(JSON.stringify(proof)); await browser.close();
+})().catch(e=>{console.error(e.message);process.exit(1)});

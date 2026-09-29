@@ -1,0 +1,33 @@
+// Requires the disposable review_ui_fixture.py server; never targets a trading runtime.
+const {chromium}=require('playwright');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+(async()=>{
+ const browser=await chromium.launch({headless:true, channel:"chrome"}); const page=await browser.newPage({viewport:{width:1440,height:1080}});
+ const errors=[]; page.on('pageerror',e=>errors.push(e.message));
+ await page.goto(process.env.REVIEW_TEST_URL || 'http://127.0.0.1:8792');
+ assert(await page.locator('#login-panel').isVisible()); assert(!(await page.locator('#workspace').isVisible()));
+ await page.locator('#token').fill('incorrect-fixture-token'); await page.getByRole('button',{name:'Connect',exact:true}).click();
+ await page.getByText('Read token not accepted.').waitFor(); assert(!(await page.locator('#workspace').isVisible()));
+ await page.locator('#token').fill('fixture-read-'+'r'.repeat(40)); await page.getByRole('button',{name:'Connect',exact:true}).click();
+ await page.locator('#workspace').waitFor({state:'visible'}); assert.equal(await page.locator('#items tr').count(),3);
+ assert.equal(await page.locator('#selected').innerText(),'1'); assert.equal(await page.locator('#rejected').innerText(),'1'); assert.equal(await page.locator('#needs-review').innerText(),'1');
+ assert.equal(await page.locator('#token').inputValue(),''); assert.equal(await page.evaluate(()=>localStorage.length+sessionStorage.length),0);
+ await page.locator('#items button').first().click(); await page.locator('dialog[open]').waitFor();
+ assert((await page.locator('#detail-body').innerText()).includes('The release supports a new paid commercial product launch.'));
+ assert((await page.locator('#detail-body').innerText()).includes('FICTIONAL ENGINEERING EVIDENCE'));
+ await page.keyboard.press('Escape'); assert(!(await page.locator('#detail').isVisible()));
+ await page.getByRole('button',{name:'Indian stocks',exact:true}).click(); await page.getByText('Indian stocks · research only',{exact:true}).waitFor();
+ await page.waitForFunction(()=>document.querySelectorAll('#items tr').length===3);
+ await page.getByRole('button',{name:'Crypto',exact:true}).click(); await page.waitForFunction(()=>document.querySelectorAll('#items tr').length===3);
+ await page.getByRole('button',{name:'US stocks',exact:true}).click(); await page.waitForFunction(()=>document.querySelectorAll('#items tr').length===3);
+ fs.mkdirSync('artifacts/review-worker',{recursive:true});
+ await page.screenshot({path:'artifacts/review-worker/review-desktop.png',fullPage:true});
+ await page.setViewportSize({width:390,height:844});
+ assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+ await page.screenshot({path:'artifacts/review-worker/review-mobile.png',fullPage:true});
+ await page.getByRole('button',{name:'Lock screen',exact:true}).click();
+ assert(!(await page.locator('#workspace').isVisible())); assert.equal(await page.locator('#items tr').count(),0); assert.equal(await page.locator('#detail-body').innerText(),'');
+ assert.deepEqual(errors,[]); console.log(JSON.stringify({checks:16,result:'passed',fixture_data_only:true,browser_errors:errors}));
+ await browser.close();
+})().catch(e=>{console.error(e.message);process.exit(1)});

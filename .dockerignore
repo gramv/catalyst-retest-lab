@@ -1,0 +1,21 @@
+*
+!pyproject.toml
+!src/
+!src/**
+!Dockerfile.review
+!Dockerfile.dashboard
+!README.md
+# Package cloud (Dockerfile.managed): the hashed requirements and the staged release identity.
+!Dockerfile.managed
+!deploy/requirements.managed.txt
+!release-source.json
+# Never in any image, whatever an exception above admits.
+**/.env
+**/.env.*
+**/__pycache__
+artifacts
+exports
+runs
+.claude
+.railway
+.git

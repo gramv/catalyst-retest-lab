@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Catalyst · Paper trading</title>
+  <meta name="description" content="Catalyst paper-trading results and the complete candidate record. Each market and evidence source stays separate.">
+  <link rel="stylesheet" href="/assets/dashboard.css"><script src="/assets/dashboard.js" defer></script>
+</head>
+<body>
+<div class="paper-banner">PAPER TRADING — SIMULATED. Not real money.</div>
+<header class="masthead">
+  <a class="wordmark" href="/" aria-label="Catalyst Retest Lab home"><span class="brand-mark" aria-hidden="true">C</span><strong>Catalyst</strong><span class="quiet-label">Trading lab</span></a>
+  <span class="public-label">Public record</span>
+</header>
+<main>
+  <div class="page-heading"><h1>Overview</h1><span id="updated" class="updated" role="status">Loading results…</span></div>
+  <nav class="tabs" aria-label="Markets">
+    <button type="button" class="tab active" aria-pressed="true" data-tab="verified">US stocks</button>
+    <button type="button" class="tab" aria-pressed="false" data-tab="crypto">Crypto</button>
+    <button type="button" class="tab" aria-pressed="false" data-tab="india">Indian stocks</button>
+  </nav>
+  <div id="error" role="alert" hidden><span id="error-text"></span><button type="button" id="retry">Try again</button></div>
+  <section id="verified-panel" aria-label="US stock results">
+    <div class="section-top">
+      <div class="cohort-line"><span class="cohort-badge">Alpaca Paper</span><span>V1 baseline · fixed exits</span></div>
+      <label class="filter">Period<select id="window"><option value="">All time</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last year</option></select></label>
+    </div>
+    <p id="measurement-warning" role="status" class="detail-note" hidden>Broker corrections need review. Affected totals are withheld.</p>
+    <div class="metrics" aria-live="polite">
+      <article class="metric primary"><h2>Paper P&amp;L</h2><p id="pnl" class="metric-value">—</p><small>USD · closed trades, before costs</small></article>
+      <article class="metric"><h2>Win rate</h2><p id="win-rate" class="metric-value">—</p><small id="trade-count">No closed trades</small></article>
+      <article class="metric"><h2>Average R</h2><p id="avg-r" class="metric-value">—</p><small>Return per unit of risk</small></article>
+      <article class="metric"><h2>Max drawdown</h2><p id="drawdown" class="metric-value">—</p><small>Closed trades · all time</small></article>
+    </div>
+    <section class="chart-section" aria-label="Performance history">
+      <div class="chart-heading"><h2>Performance</h2><div class="segmented" aria-label="Curve units"><button type="button" class="selected" data-unit="equity" aria-pressed="true">USD</button><button type="button" data-unit="r" aria-pressed="false">R</button></div></div>
+      <div class="chart-key"><span class="line-key"></span><span id="curve-label">Strategy equity · all time</span><strong id="curve-total">—</strong></div>
+      <div id="chart" class="chart" role="img" aria-label="Strategy equity curve loading"></div>
+      <div id="chart-empty" class="chart-empty" hidden><span class="empty-glyph" aria-hidden="true">—</span><h3>No closed strategy trades yet</h3><p>The first completed trade will appear here.</p></div>
+      <div class="chart-foot"><span id="baseline">Baseline unavailable</span><span>Full history, never reset</span></div>
+      <details id="curve-data"><summary>Chart data</summary><div class="table-scroll"><table><thead><tr><th>Closed at</th><th>Equity ($)</th><th>Cumulative P&amp;L ($)</th><th>Cumulative R</th></tr></thead><tbody id="curve-rows"></tbody></table></div></details>
+    </section>
+    <details class="more-stats"><summary>More statistics &amp; breakdowns</summary>
+      <div class="secondary-metrics">
+        <article><h3>Profit factor</h3><p id="profit-factor" class="secondary-value">—</p><small id="pf-note">Gross profits / gross losses</small></article>
+        <article><h3>Worst loss streak</h3><p id="streak" class="secondary-value">—</p><small>Consecutive closed losses</small></article>
+        <article><h3>R measurement</h3><p id="r-definition">Risk denominator pending</p><small id="average-outcomes"></small></article>
+      </div>
+      <div class="breakdowns">
+        <section><h3>By catalyst</h3><div class="table-scroll"><table><thead><tr><th>Catalyst</th><th>Trades</th><th>Paper P&amp;L</th><th>Avg R</th></tr></thead><tbody id="catalysts"></tbody></table></div></section>
+        <section><h3>By strategy</h3><div class="table-scroll"><table><thead><tr><th>Version</th><th>Trades</th><th>Win rate</th><th>Avg R</th></tr></thead><tbody id="versions"></tbody></table></div></section>
+      </div>
+    </details>
+    <section class="log-section">
+      <div class="section-top"><div><h2>Candidate log <span id="log-count" class="count">0</span></h2><p>Every outcome. Picks appear after the session closes.</p></div><a class="button" href="/api/public/export.csv">Export CSV ↗</a></div>
+      <div class="log-controls"><label>State<select id="state"><option value="">All states</option><option>CLOSED</option><option>REJECTED</option><option>RISK_REJECTED</option><option>INVALIDATED</option><option>EXPIRED_UNTRIGGERED</option><option>OPEN</option><option>CANCELED</option><option>BROKER_REJECTED</option><option>WATCHING</option></select></label></div>
+      <div class="table-scroll"><table class="log-table"><thead><tr><th>Symbol / date</th><th>Catalyst</th><th>State</th><th>Reason</th><th>Recorded</th><th><span class="sr-only">Details</span></th></tr></thead><tbody id="log"></tbody></table></div>
+      <div class="pager"><span id="page-info"></span><div><button type="button" id="previous" disabled>← Previous</button><button type="button" id="next" disabled>Next →</button></div></div>
+    </section>
+  </section>
+  <section id="research-panel" hidden>
+    <div class="section-top"><div><h2 id="research-title">Crypto</h2><p>Manual / simulated records · separate from US results</p></div><span id="research-mode" class="research-label">Research only</span></div>
+    <div id="research-empty" class="research-empty"><h3>No results recorded yet</h3><p id="research-empty-note">No execution is connected for this market.</p></div>
+    <div id="research-table" class="table-scroll" hidden><table><thead><tr><th>Symbol / date</th><th>Version / currency</th><th>Direction / quantity</th><th>Reported entry / exit</th><th>Reported P&amp;L</th><th>Source</th></tr></thead><tbody id="research-rows"></tbody></table></div>
+    <div class="pager"><span id="research-page-info"></span><div><button type="button" id="research-previous" disabled>← Previous</button><button type="button" id="research-next" disabled>Next →</button></div></div>
+  </section>
+  <details class="methodology" id="methodology"><summary>Measurement &amp; audit</summary>
+    <div class="method-grid">
+      <article><h3>Evidence stays separate</h3><p>US results use broker fills. Manual reports, engineering tests and Jev-managed trading do not enter the frozen V1 baseline. No combined market return is shown.</p></article>
+      <article><h3>Paper-fill limitations</h3><p>Impact, latency slippage and queue position are not modeled. Adjusted P&amp;L is unavailable. Paper results do not establish achievable returns.</p></article>
+      <article><h3>Measurements</h3><p>Closed trades determine P&amp;L and win rate, with breakevens counted. MFE/MAE use in-position observations. IEX is not consolidated; missing data stays unavailable.</p></article>
+      <article><h3>Permanent history</h3><p>Events are append-only and hash-chained. Corrections add records. Each result keeps its strategy version; today’s picks remain private until the official close.</p></article>
+    </div>
+    <div class="audit-footer"><span id="audit-count">Audit checkpoint unavailable</span><code id="audit-head">—</code></div>
+  </details>
+  <footer><span>Catalyst Retest Lab</span><span>Paper only</span></footer>
+</main>
+<dialog id="detail"><button type="button" id="close-detail" class="close-button" aria-label="Close candidate detail">Close ×</button><div id="detail-body"></div></dialog>
+</body>
+</html>

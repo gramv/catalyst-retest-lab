@@ -1,0 +1,467 @@
+[
+ {
+  "symbol": "UNI",
+  "coingecko_id": "uniswap",
+  "announcement_date": "2026-09-22",
+  "catalyst": "FRESH_CATALYST",
+  "sources": [
+   {
+    "source_id": "uni-new-fact",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://www.prnewswire.com/news-releases/cme-group-to-expand-crypto-derivatives-suite-with-bitcoin-cash-and-uniswap-futures-302886066.html",
+      "excerpt": "CHICAGO, Sept. 22, 2026 /PRNewswire/ -- CME Group, the world's leading derivatives marketplace, today announced that it will launch Bitcoin Cash (BCH) and Uniswap (UNI) futures on October 19, pending regulatory review."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-new-fact-2",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://www.prnewswire.com/news-releases/cme-group-to-expand-crypto-derivatives-suite-with-bitcoin-cash-and-uniswap-futures-302886066.html",
+      "excerpt": "The new contracts further expand the company's extensive single asset Cryptocurrency product suite, which includes Bitcoin, Ether, XRP, Solana, Cardano, Chainlink, Stellar, Avalanche, and Sui futures."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-prior-1",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://financefeeds.com/coinbase-expands-24-7-altcoin-futures-trading-ahead-of-december-launch/",
+      "excerpt": "Coinbase’s CFTC-regulated derivatives division is preparing a major expansion of its altcoin futures market, announcing plans to launch 24/7 trading for Avalanche, Bitcoin Cash, Cardano, Chainlink, Dogecoin, Hedera, Litecoin, Polkadot, Shiba Inu, Stellar and SUI."
+     },
+     {
+      "url": "https://www.gurufocus.com/news/3221245/coinbase-expands-247-trading-for-altcoin-futures",
+      "excerpt": "Starting December 5, the platform will support round-the-clock trading for Avalanche, Bitcoin Cash, Cardano, Chainlink, Dogecoin, Hedera, Litecoin, Polkadot, Shiba Inu, Stellar, and SUI."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-mechanism-1",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://docs.uniswap.org/contracts/protocol-fee/overview",
+      "excerpt": "Releasers define how tokens in the TokenJar are accessed. The simplest version burns UNI in exchange for the collected tokens. Other Releasers could handle cross-chain conversions or alternative value flows."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-mechanism-2",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://www.cryptoninjas.net/news/unification-greenlights-100m-uni-burn-and-switches-on-protocol-fees/",
+      "excerpt": "The proposal of UNIfication has been passed by more than 125 million UNI votes by Uniswap governance, which was well above the expected quorum."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-mechanism-3",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://www.govinfo.gov/content/pkg/FR-2025-09-22/html/2025-18258.htm",
+      "excerpt": "to be an eligible holding under the generic listing standards, the Proposals provide that, for each commodity, or commodity that underlies a commodity-based asset, the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.govinfo.gov/content/pkg/FR-2025-09-22/html/2025-18258.htm",
+      "excerpt": "the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.federalregister.gov/documents/2025/09/22/2025-18258/self-regulatory-organizations-the-nasdaq-stock-market-llc-cboe-bzx-exchange-inc-nyse-arca-inc-order",
+      "excerpt": "to be an eligible holding under the generic listing standards, the Proposals provide that, for each commodity, or commodity that underlies a commodity-based asset, the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.federalregister.gov/documents/2025/09/22/2025-18258/self-regulatory-organizations-the-nasdaq-stock-market-llc-cboe-bzx-exchange-inc-nyse-arca-inc-order",
+      "excerpt": "the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     }
+    ]
+   },
+   {
+    "source_id": "uni-adverse-1",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://blog.uniswap.org/unification",
+      "excerpt": "We propose governance create an annual growth budget of 20M UNI, distributed quarterly using a vesting contract starting January 1, 2026, to fund protocol growth and development."
+     }
+    ]
+   }
+  ],
+  "thesis": "[uni-new-fact] states CME will launch UNI futures on October 19, pending regulatory review. [uni-new-fact-2] lists CME's existing single-asset crypto suite, and UNI is not in it. [uni-prior-1] lists Coinbase Derivatives' altcoin futures, also without UNI. Inference: this is UNI's first CME listing, and no earlier disclosure of it was found. Inference: a regulated CME contract widens institutional access to UNI exposure and starts the six-month futures clock in [uni-mechanism-3], one route to a generic-standard UNI ETP. No excerpt shows the listing itself changing Uniswap protocol fees or the UNI burn.",
+  "economic_relationship": "Protocol channel: in [uni-mechanism-1], collected fees can be released by burning UNI, and [uni-mechanism-2] shows governance passed UNIfication. So burn-driven value depends on protocol fee volume, which a CME futures listing does not directly change. Access channel: under [uni-mechanism-3], a commodity can qualify for generic ETP listing after its futures trade for six months on a DCM that is an ISG market or has a CSSA. Explicit assumptions, not supported by any excerpt: CME counts as such a DCM for the listing exchange; UNI does not already qualify by another route; any resulting ETP demand is net spot buying. Futures also add hedging and short capacity, which can push price either way.",
+  "disproof": "Refuted if CME does not list UNI futures by October 19, or if regulatory review blocks or delays them [uni-new-fact]. Refuted if UNI futures volume and open interest stay negligible in the first 30 days of trading. Refuted if UNI does not outperform a matched large-cap alt basket over the 30 days after listing. The ETF-route inference is refuted if UNI turns out to already meet the generic listing standard by another route. The burn-value link is refuted if protocol-fee UNI burns do not exceed the growth-budget issuance in [uni-adverse-1] over the same period."
+ },
+ {
+  "symbol": "BCH",
+  "coingecko_id": "bitcoin-cash",
+  "announcement_date": "2026-09-22",
+  "catalyst": "CONTINUATION",
+  "sources": [
+   {
+    "source_id": "bch-new-fact",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://www.prnewswire.com/news-releases/cme-group-to-expand-crypto-derivatives-suite-with-bitcoin-cash-and-uniswap-futures-302886066.html",
+      "excerpt": "CHICAGO, Sept. 22, 2026 /PRNewswire/ -- CME Group, the world's leading derivatives marketplace, today announced that it will launch Bitcoin Cash (BCH) and Uniswap (UNI) futures on October 19, pending regulatory review."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-prior-1",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.marketsmedia.com/coinbase-derivatives-has-launched-bitcoin-cash-and-litecoin-futures/",
+      "excerpt": "Coinbase Derivatives has become the first CFTC-regulated exchange to offer margined Bitcoin Cash and Litecoin futures contracts, which launched earlier this month and are performing well."
+     },
+     {
+      "url": "https://fxnewsgroup.com/forex-news/cryptocurrency/coinbase-derivatives-launches-bitcoin-cash-and-litecoin-futures-contracts/",
+      "excerpt": "Coinbase Derivatives has become the first CFTC-regulated exchange to offer margined Bitcoin Cash and Litecoin futures contracts, which launched earlier this month and are performing well."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-prior-2",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://financefeeds.com/coinbase-expands-24-7-altcoin-futures-trading-ahead-of-december-launch/",
+      "excerpt": "Coinbase’s CFTC-regulated derivatives division is preparing a major expansion of its altcoin futures market, announcing plans to launch 24/7 trading for Avalanche, Bitcoin Cash, Cardano, Chainlink, Dogecoin, Hedera, Litecoin, Polkadot, Shiba Inu, Stellar and SUI."
+     },
+     {
+      "url": "https://www.gurufocus.com/news/3221245/coinbase-expands-247-trading-for-altcoin-futures",
+      "excerpt": "Starting December 5, the platform will support round-the-clock trading for Avalanche, Bitcoin Cash, Cardano, Chainlink, Dogecoin, Hedera, Litecoin, Polkadot, Shiba Inu, Stellar, and SUI."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-prior-3",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://startupfortune.com/grayscale-files-to-convert-its-bitcoin-cash-trust-into-a-spot-etf/",
+      "excerpt": "Grayscale filed an amended S-3 with the SEC on September 11, asking to list shares of its Bitcoin Cash Trust on NYSE Arca under the same BCHG ticker."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-mechanism-1",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://bitcoincash.org/",
+      "excerpt": "The Bitcoin Cash protocol ensures there will never be more than 21 million coins in existence. Unlike government-issued currencies, which can be printed without limit, Bitcoin Cash has a fixed supply, making it a form of sound money designed to hold its value over time."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-mechanism-2",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://www.govinfo.gov/content/pkg/FR-2025-09-22/html/2025-18258.htm",
+      "excerpt": "to be an eligible holding under the generic listing standards, the Proposals provide that, for each commodity, or commodity that underlies a commodity-based asset, the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.govinfo.gov/content/pkg/FR-2025-09-22/html/2025-18258.htm",
+      "excerpt": "the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.federalregister.gov/documents/2025/09/22/2025-18258/self-regulatory-organizations-the-nasdaq-stock-market-llc-cboe-bzx-exchange-inc-nyse-arca-inc-order",
+      "excerpt": "to be an eligible holding under the generic listing standards, the Proposals provide that, for each commodity, or commodity that underlies a commodity-based asset, the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     },
+     {
+      "url": "https://www.federalregister.gov/documents/2025/09/22/2025-18258/self-regulatory-organizations-the-nasdaq-stock-market-llc-cboe-bzx-exchange-inc-nyse-arca-inc-order",
+      "excerpt": "the commodity may (1) trade on an ISG market; or (2) have futures traded for at least six months on a DCM that is an ISG market or with which an Exchange has a CSSA."
+     }
+    ]
+   },
+   {
+    "source_id": "bch-adverse-1",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://startupfortune.com/grayscale-files-to-convert-its-bitcoin-cash-trust-into-a-spot-etf/",
+      "excerpt": "The amended filing says the trust intends to list on NYSE Arca as the Grayscale Bitcoin Cash Trust ETF, but it also remains a preliminary prospectus. Nobody's launching tomorrow."
+     }
+    ]
+   }
+  ],
+  "thesis": "[bch-new-fact] states CME will launch BCH futures on October 19, pending regulatory review. However, [bch-prior-1] shows a CFTC-regulated exchange (Coinbase Derivatives) already offers margined BCH futures, and [bch-prior-2] shows that venue expanding them to 24/7 trading. [bch-prior-3] shows Grayscale had already filed to list its BCH trust on NYSE Arca. Inference: the new fact is a second, larger regulated venue for BCH futures, not first-time regulated access. Any effect would have to come from CME's institutional reach, not from new eligibility or a new product category.",
+  "economic_relationship": "[bch-mechanism-1] gives a 21-million-coin supply cap. No excerpt shows fee capture, burn, staking or any other route from trading activity to holders, so the only channel is demand and access. [bch-mechanism-2] makes a commodity eligible for generic ETP listing after six months of futures on a qualifying DCM. Explicit assumption, not stated in any excerpt: the existing Coinbase Derivatives BCH futures [bch-prior-1] may already satisfy this, in which case CME adds little to ETF eligibility. Explicit assumption: extra CME hedging activity turns into net spot demand. It could instead add short and hedge capacity.",
+  "disproof": "Refuted if CME does not list BCH futures by October 19, or if regulatory review blocks them [bch-new-fact]. Refuted if CME BCH open interest stays small relative to existing regulated BCH futures in the first 30 days. Refuted if BCH does not outperform a matched large-cap alt basket over the 30 days after listing. The ETF channel is refuted if the BCHG registration does not become effective or the NYSE Arca listing does not occur; [bch-adverse-1] says it is still a preliminary prospectus."
+ },
+ {
+  "symbol": "LINK",
+  "coingecko_id": "chainlink",
+  "announcement_date": "2026-09-17",
+  "catalyst": "CONTINUATION",
+  "sources": [
+   {
+    "source_id": "link-new-fact",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://menafn.com/1111678849/Bottomline-Launches-Global-Pay-Connect-To-Provide-Financial-Institutions-With-A-Future-Proofed-Payment-Messaging-Ecosystem",
+      "excerpt": "PORTSMOUTH, N.H., Sept. 17, 2026 (GLOBE NEWSWIRE) -- Bottomline, a global leader in business payments, has launched Global Pay Connect, a next-generation Software-as-a-Service (SaaS) platform, to help financial institutions extend their payments infrastructure beyond traditional connectivity through API-enabled services and third-party data integration."
+     },
+     {
+      "url": "https://www.manilatimes.net/2026/09/17/tmt-newswire/globenewswire/bottomline-launches-global-pay-connect-to-provide-financial-institutions-with-a-future-proofed-payment-messaging-ecosystem/2427358",
+      "excerpt": "PORTSMOUTH, N.H., Sept. 17, 2026 (GLOBE NEWSWIRE) -- Bottomline, a global leader in business payments, has launched Global Pay Connect, a next-generation Software-as-a-Service (SaaS) platform, to help financial institutions extend their payments infrastructure beyond traditional connectivity through API-enabled services and third-party data integration."
+     },
+     {
+      "url": "https://www.bottomline.com/newsroom/press-releases/bottomline-launches-global-pay-connect-provide-financial-institutions-future-proofed-payment-messaging-ecosystem",
+      "excerpt": "Bottomline, a global leader in business payments, has launched Global Pay Connect, a next-generation Software-as-a-Service (SaaS) platform, to help financial institutions extend their payments infrastructure beyond traditional connectivity through API-enabled services and third-party data integration."
+     },
+     {
+      "url": "https://globalfintechseries.com/banking/digital-payments/bottomline-launches-global-pay-connect-to-provide-financial-institutions-with-a-future-proofed-payment-messaging-ecosystem/",
+      "excerpt": "Bottomline, a global leader in business payments, has launched Global Pay Connect, a next-generation Software-as-a-Service (SaaS) platform, to help financial institutions extend their payments infrastructure beyond traditional connectivity through API-enabled services and third-party data integration."
+     }
+    ]
+   },
+   {
+    "source_id": "link-new-fact-2",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://menafn.com/1111678849/Bottomline-Launches-Global-Pay-Connect-To-Provide-Financial-Institutions-With-A-Future-Proofed-Payment-Messaging-Ecosystem",
+      "excerpt": "Global Pay Connect enables interoperability through Chainlink, connecting banks seamlessly to multiple blockchain networks through a single, network-agnostic integration model via their existing Bottomline connectivity."
+     },
+     {
+      "url": "https://www.bottomline.com/newsroom/press-releases/bottomline-launches-global-pay-connect-provide-financial-institutions-future-proofed-payment-messaging-ecosystem",
+      "excerpt": "Global Pay Connect enables interoperability through Chainlink, connecting banks seamlessly to multiple blockchain networks through a single, network-agnostic integration model via their existing Bottomline connectivity."
+     },
+     {
+      "url": "https://globalfintechseries.com/banking/digital-payments/bottomline-launches-global-pay-connect-to-provide-financial-institutions-with-a-future-proofed-payment-messaging-ecosystem/",
+      "excerpt": "Global Pay Connect enables interoperability through Chainlink, connecting banks seamlessly to multiple blockchain networks through a single, network-agnostic integration model via their existing Bottomline connectivity."
+     },
+     {
+      "url": "https://www.manilatimes.net/2026/09/17/tmt-newswire/globenewswire/bottomline-launches-global-pay-connect-to-provide-financial-institutions-with-a-future-proofed-payment-messaging-ecosystem/2427358",
+      "excerpt": "Global Pay Connect enables interoperability through Chainlink, connecting banks seamlessly to multiple blockchain networks through a single, network-agnostic integration model via their existing Bottomline connectivity."
+     }
+    ]
+   },
+   {
+    "source_id": "link-prior-1",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.crowdfundinsider.com/2026/09/305942-bottomline-partners-with-chainlink-to-connect-swift-banks-to-onchain-payments/",
+      "excerpt": "frequently described as one of the three largest firms that help institutions use the Swift messaging system, entered a strategic collaboration with the oracle and interoperability platform on September 3"
+     }
+    ]
+   },
+   {
+    "source_id": "link-prior-2",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.coingabbar.com/en/chainlink-news-today-global-pay-connect-600-banks",
+      "excerpt": "This follows a strategic partnership between Bottomline and Chainlink first announced on September 3, meaning today's update marks the platform itself going live, not a new partnership announcement."
+     }
+    ]
+   },
+   {
+    "source_id": "link-mechanism-1",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://chain.link/blog/chainlink-reserve-strategic-link-reserve",
+      "excerpt": "The Chainlink Reserve is designed to support the long-term growth and sustainability of the Chainlink Network by accumulating LINK tokens using offchain revenue from large enterprises that are adopting the Chainlink standard and from onchain service usage."
+     }
+    ]
+   },
+   {
+    "source_id": "link-mechanism-2",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://chain.link/blog/chainlink-reserve-strategic-link-reserve",
+      "excerpt": "This enables revenue from both onchain service usage, as well as significant offchain revenue from existing and ongoing enterprise integrations, usage and maintenance, to be programmatically converted to LINK (if not already paid in LINK)."
+     }
+    ]
+   },
+   {
+    "source_id": "link-adverse-1",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://www.coingabbar.com/en/chainlink-news-today-global-pay-connect-600-banks",
+      "excerpt": "Neither company has disclosed which banks will use the service first or when initial live transactions will settle through it."
+     }
+    ]
+   }
+  ],
+  "thesis": "[link-new-fact] states Bottomline launched Global Pay Connect, and [link-new-fact-2] says it connects banks to multiple blockchains through Chainlink. [link-prior-1] shows the Bottomline-Chainlink strategic collaboration was announced September 3, and [link-prior-2] describes the Sept. 17 news as the platform going live, not a new partnership. Inference: the only new substance is that the product is now available. The relationship itself was already public. No excerpt gives fees, volumes or named adopting banks [link-adverse-1].",
+  "economic_relationship": "[link-mechanism-1]: the Chainlink Reserve accumulates LINK using offchain enterprise revenue and onchain usage. [link-mechanism-2]: that revenue is programmatically converted to LINK. Proposed chain: bank flows over Global Pay Connect use Chainlink services, fees go to Chainlink, the fees are converted to LINK, and the LINK goes into the Reserve. Explicit assumptions NOT supported by any excerpt: Bottomline or its banks pay Chainlink material usage fees; those fees go through Payment Abstraction; volume arrives within a tradable horizon. Because no fees or volumes are disclosed, the size of any LINK demand is unknown.",
+  "disproof": "Refuted if no named bank goes live or settles a transaction through Global Pay Connect via Chainlink within about 90 days [link-adverse-1]. Refuted if Chainlink Reserve LINK accumulation shows no acceleration after launch. Refuted if LINK does not outperform a matched large-cap alt basket over the 30 days after Sept. 17. The novelty claim is refuted if the Sept. 17 release adds no substantive fact beyond the Sept. 3 partnership, as [link-prior-1] and [link-prior-2] suggest."
+ },
+ {
+  "symbol": "AAVE",
+  "coingecko_id": "aave",
+  "announcement_date": "2026-09-16",
+  "catalyst": "SCHEDULED_EVENT",
+  "sources": [
+   {
+    "source_id": "aave-new-fact",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://aave.com/docs/resources/changelog",
+      "excerpt": "Aave V4 launches on Arc, Circle's USDC-native Layer 1. The market deploys a Core Hub with Main and Forex Spokes, listing USDC, EURC, cirBTC, and WETH."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-new-fact-2",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://governance.aave.com/t/arfc-deploy-aave-v4-on-arc/25170",
+      "excerpt": "Execution will happen alongside the Arc network launch on September 16th. The ARFC snapshot is taken as the binding vote for this execution, and Aave Labs is coordinating the activation alongside the network launch."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-prior-1",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://governance.aave.com/t/arfc-deploy-aave-v4-on-arc/25170",
+      "excerpt": "Aave Labs proposes deploying Aave V4 on Arc, the institutional-grade public layer-1 blockchain built by Circle, at or near Arc mainnet launch."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-mechanism-1",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://governance.aave.com/t/arfc-deploy-aave-v4-on-arc/25170",
+      "excerpt": "The Liquidity Fee is the fraction of borrower interest captured by the protocol treasury, equivalent to the reserve factor in V3."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-mechanism-2",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://aave.com/docs/ecosystem/aave",
+      "excerpt": "The Aave DAO operates a buyback program that uses protocol revenue to acquire AAVE tokens on the open market."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-adverse-1",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://governance.aave.com/t/arfc-deploy-aave-v4-on-arc/25170",
+      "excerpt": "In connection with the deployment, Aave DAO is expected to receive a minimum of $2m per year in protocol revenue from the Aave V4 deployment on Arc, with any shortfalls covered by certain Arc ecosystem participants for the first five years following deployment."
+     }
+    ]
+   },
+   {
+    "source_id": "aave-adverse-2",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://governance.aave.com/t/arfc-pause-aave-buybacks/24686",
+      "excerpt": "Following the rsETH bridge incident on April 18, 2026, AAVE buybacks have been paused since April 19, 2026. This ARFC formalises the pause and outlines the conditions under which the buyback cadence will be reassessed."
+     }
+    ]
+   }
+  ],
+  "thesis": "[aave-new-fact] states Aave V4 launched on Arc with a Core Hub listing USDC, EURC, cirBTC and WETH, and [aave-new-fact-2] states execution was set for the Arc launch on September 16th. [aave-prior-1] shows the same deployment was proposed earlier, at or near Arc mainnet launch, so the event was pre-announced and scheduled. It was not a surprise. Inference: the launch adds a new revenue-generating market. Per [aave-adverse-1], the DAO's expected revenue from it is framed as a $2m/yr minimum, which suggests a modest near-term contribution.",
+  "economic_relationship": "Per [aave-mechanism-1], the Liquidity Fee is the share of borrower interest captured by the protocol treasury. Per [aave-mechanism-2], the DAO runs a buyback that uses protocol revenue to buy AAVE on the open market. Per [aave-adverse-2], buybacks were paused from 2026-04-19. Explicit assumptions, not supported by an excerpt: (a) buybacks are currently executing (a secondary report says automated buybacks resumed in June 2026, but there is no primary excerpt for that); (b) Arc revenue is large enough, relative to total DAO revenue, to change buyback volume. [aave-adverse-1] frames the guaranteed floor at only $2m/yr.",
+  "disproof": "Refuted if Arc V4 market revenue to the Aave DAO over the first 6 months annualizes at or below the $2m/yr floor in [aave-adverse-1], which would mean the market adds no material revenue. Also refuted if onchain treasury data shows no AAVE buyback execution between 2026-09-16 and 2026-12-31, which would mean the pause in [aave-adverse-2] still binds and there is no revenue-to-token path."
+ },
+ {
+  "symbol": "FIL",
+  "coingecko_id": "filecoin",
+  "announcement_date": "2026-09-01",
+  "catalyst": "SCHEDULED_EVENT",
+  "sources": [
+   {
+    "source_id": "fil-new-fact",
+    "role": "new-fact",
+    "candidates": [
+     {
+      "url": "https://raw.githubusercontent.com/filecoin-project/FIPs/master/FIPS/fip-0118.md",
+      "excerpt": "status: Accepted type: Technical category: Core created: 2026-07-14 spec-sections: --- # FIP-0118: (Solstice) Deprecate Fil+ and Fund Services via Block-Reward Split"
+     }
+    ]
+   },
+   {
+    "source_id": "fil-prior-1",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.filecoin.io/blog/the-2026-filecoin-network-strategy",
+      "excerpt": "In 2026, the Filecoin network's cryptoeconomics will strengthen to drive rewards toward paid usage, useful work, and long-term participation. Later this year the final network vesting periods will end, shepherding in a new era of token economics."
+     }
+    ]
+   },
+   {
+    "source_id": "fil-prior-2",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.filecoin.io/blog/understanding-filecoin-circulating-supply",
+      "excerpt": "The Filecoin Foundation's 100M FIL vest linearly over 6 years, beginning at network launch. Protocol Labs . Protocol Labs's 300M FIL vest linearly over 6 years, beginning at network launch."
+     }
+    ]
+   },
+   {
+    "source_id": "fil-prior-3",
+    "role": "prior-disclosure",
+    "candidates": [
+     {
+      "url": "https://www.filecoin.io/blog/understanding-filecoin-circulating-supply",
+      "excerpt": "Since the release of Filecoin's mainnet on October 15th, 2020, the network has now surpassed a number of important milestones"
+     }
+    ]
+   },
+   {
+    "source_id": "fil-mechanism-1",
+    "role": "mechanism",
+    "candidates": [
+     {
+      "url": "https://raw.githubusercontent.com/filecoin-project/FIPs/master/FIPS/fip-0118.md",
+      "excerpt": "And where demand is not yet proven, the freed portion is burned, reducing dilution for all participants rather than overpaying for security the network already has in excess."
+     }
+    ]
+   },
+   {
+    "source_id": "fil-adverse-1",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://raw.githubusercontent.com/filecoin-project/FIPs/master/FIPS/fip-0118.md",
+      "excerpt": "The weight w1 ramps down from 95% to 50% over roughly 9 quarters. During the first quarter (the bootstrap phase), `w2 = 1 − w1` so no w0 share is scheduled and w2 reaches 10% by the end of the quarter."
+     }
+    ]
+   },
+   {
+    "source_id": "fil-adverse-2",
+    "role": "adverse",
+    "candidates": [
+     {
+      "url": "https://www.filecoin.io/blog/understanding-filecoin-circulating-supply",
+      "excerpt": "Simple Minting : 330M FIL tokens are released on a 6 year half-life based on time."
+     }
+    ]
+   }
+  ],
+  "thesis": "[fil-prior-2] says the Filecoin Foundation's 100M FIL and Protocol Labs' 300M FIL vest linearly over 6 years from network launch, and [fil-prior-3] dates the launch to October 15th, 2020. Inference: those vesting streams end around Oct 15, 2026. [fil-prior-1] already said the final vesting periods would end this year. The only new primary fact is [fil-new-fact]: FIP-0118 now has status Accepted. [fil-mechanism-1] says block reward not paid out for proven demand is burned. Inference: FIL supply growth may slow when vesting ends and, later, through FIP-0118 burns. Adverse: the vesting end was disclosed in 2020; [fil-adverse-1] schedules no burn share in the first quarter; [fil-adverse-2] shows time-based minting continues after vesting ends.",
+  "economic_relationship": "[fil-prior-2]: 400M FIL vests linearly over 6 years from launch. When vesting ends, that flow of newly liquid FIL stops. [fil-mechanism-1]: under FIP-0118, block reward not allocated to proven demand is burned, which reduces dilution. Assumption (not in excerpts): vested FIL was a meaningful source of sell flow. Assumption (not in excerpts): FIP-0118 gets scheduled into a network upgrade; no excerpt gives an activation date. Assumption: service volume stays below the gates, so the burn share is positive after the bootstrap quarter ([fil-adverse-1]). [fil-adverse-2]: time-based minting continues, so supply growth slows but doesn't stop.",
+  "disproof": "Refuted if FIL circulating-supply growth in the 30 days after Oct 15, 2026 is not lower than in the 30 days before, meaning the vesting end implied by [fil-prior-2] and [fil-prior-3] didn't cut net inflow or other releases replaced it. Also refuted if FIP-0118 isn't included in any scheduled network upgrade by the review horizon, or if it activates but burns nothing through the horizon, as [fil-adverse-1] describes for the first quarter. Also refuted if continuing emissions ([fil-adverse-2]) keep net supply growth flat."
+ }
+]
