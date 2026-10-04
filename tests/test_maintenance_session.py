@@ -12,10 +12,15 @@ import pytest
 
 from catalyst_lab.account_risk import JEV_MANAGED_ARM
 from catalyst_lab.audit import verify_events
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.test_agent_research_session import make_session as make_session
 from tests.test_agent_research_session import session_script, submit
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
+
+# Every setup here is admitted as before package trade-plan (CRYPTO_MAINTENANCE_V3 or earlier,
+# the one-tick stop-limit); the new versions are tests/test_trade_plan_*.py.
+pytestmark = pytest.mark.usefixtures("pre_trade_plan_admission")
 
 
 def report(now):

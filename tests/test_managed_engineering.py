@@ -821,8 +821,9 @@ def test_runtime_status_never_reports_reviews_while_disabled(ex):
     assert build(None, management_reviews="ENABLED").status()["position_jev_configured"] is False
 
 
-def factory(monkeypatch, setting):
-    """build_runtime_from_env with fixture collaborators, as in test_managed_runtime."""
+def factory(monkeypatch, setting, *, captured=None):
+    """build_runtime_from_env with fixture collaborators, as in test_managed_runtime.
+    ``captured`` (a dict) receives the keyword arguments the engine was built with."""
     import catalyst_lab.authorization as auth
     import catalyst_lab.managed_broker as broker_module
     import catalyst_lab.managed_execution as execution_module
@@ -855,7 +856,9 @@ def factory(monkeypatch, setting):
     monkeypatch.setattr(broker_module, "ManagedPaperBroker", lambda *_, **__: object())
     execution = Execution()
     execution.repo, execution.now = fake_repo, lambda: NOW
-    monkeypatch.setattr(execution_module, "ManagedExecution", lambda *_, **__: execution)
+    monkeypatch.setattr(execution_module, "ManagedExecution",
+                        lambda *_, **options: (
+                            {} if captured is None else captured).update(options) or execution)
     monkeypatch.setattr(cycles, "ResearchCycle", lambda *_, **__: Research())
     monkeypatch.setattr(sources, "AlpacaMarketSource", lambda *args: Source())
     return build_runtime_from_env()
@@ -934,7 +937,19 @@ def test_populated_schema16_ledger_migrates_through_017_to_020_with_audit_intact
                 conn.execute((MIGRATIONS / "023_selection_topk_v2.sql").read_text())
                 conn.execute((MIGRATIONS / "024_public_experiment.sql").read_text())
                 conn.execute((MIGRATIONS / "025_jev_review_policy_v2.sql").read_text())
-            assert audit_state(root)[3] == 25
+            # 026 (JEV_MANAGED_RISK_V4) appends exactly its three audited policy rows.
+            from tests.test_risk_v4 import apply_migration_026
+
+            apply_migration_026(root)
+            # 027 (the trade plan's planned-stop guard) adds no row.
+            from tests.test_trade_plan_migration import apply_migration_027
+
+            apply_migration_027(root)
+            # 028, 029 (public page views) and 030 (JEV_TOP_K_SELECTION_V3) add no row.
+            from tests.test_selection_topk_v3 import apply_migrations_after_027
+
+            apply_migrations_after_027(root)  # And 031 (package plugin-c3, four policy rows).
+            assert audit_state(root)[3] == 31
             assert {t: v for t, v in audited_after.items() if t in audited} == audited
             assert audited_after["operator_flatten_completions"] == (0, 0)
             assert halts_after == halts

@@ -5,7 +5,7 @@
 The user authorized one actual Alpaca Paper bracket → fill → flatten to verify the plumbing.
 Its signal starts with `TEST-`, its `record_purpose` is `ENGINEERING_TEST`, and `strategy_eligible`
 is false. It must never appear in strategy performance or the public dashboard. This path is
-implemented and simulated locally. The [September 18 real paper run](PROVING-RUN-2026-09-18.md)
+implemented and simulated locally. The September 18 real paper run
 partially filled and closed through protective safety with result FAILED_CLOSED. It did not pass
 the nominal controlled-exit acceptance condition; no second attempt is queued.
 
@@ -77,7 +77,7 @@ excluded from strategy reporting by provenance, not erased from the audit.
 disposable PostgreSQL with the fake paper venue and fake Jev transports
 (`tests/test_managed_engineering.py`). Nothing here has contacted Alpaca or TypeSafe, and no
 owner ledger was touched. The first real run is the owner's supervised 0.10 session
-([runbook](OPERATIONS-RUNBOOK.md#first-supervised-managed-trade-plan-010)).
+(runbook).
 
 None of about 100 real Jev reviews has selected anything, so plan 0.10 needs a way to run the
 first real managed trade that doesn't wait for an organic selection. The owner enrolls **one**

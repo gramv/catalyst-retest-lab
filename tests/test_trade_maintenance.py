@@ -8,12 +8,13 @@ source and a mock Jev transport. No broker, provider, network or owner-ledger co
 
 from datetime import timedelta
 from decimal import Decimal as D
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from catalyst_lab import crypto_maintenance as cm
-from catalyst_lab import exit_flags
+from catalyst_lab import entry_working, exit_flags
 from catalyst_lab.audit import verify_events
 from catalyst_lab.jev_contract import encoded
 from catalyst_lab.maintenance_dossier import STATE_BYTE_BUDGET
@@ -21,6 +22,7 @@ from catalyst_lab.managed_dossier import encoded_bytes
 from catalyst_lab.managed_ops import maintenance_alarms, status_alarms
 from catalyst_lab.managed_review import ManagedContext
 from tests.maintenance_fixtures import (
+    Bars,
     admit,
     admit_many,
     bodies,
@@ -37,10 +39,15 @@ from tests.maintenance_fixtures import (
     trigger,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.maintenance_fixtures import v1_admission as v1_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 from tests.test_managed_execution import observation, packet
+
+# Every setup here is admitted as before package trade-plan (CRYPTO_MAINTENANCE_V3 or earlier,
+# the one-tick stop-limit); the new versions are tests/test_trade_plan_*.py.
+pytestmark = pytest.mark.usefixtures("pre_trade_plan_admission")
 
 
 def state(mt, sid):
@@ -99,7 +106,10 @@ def test_a_full_fill_is_protected_at_once_and_the_open_is_recorded(mt):
     assert len(bodies(engine, "MAINTENANCE_OPENED", sid)) == 1  # Once per lifecycle.
 
 
-def test_a_partial_fill_is_protected_at_once_and_the_rest_works_ten_minutes(mt):
+def test_a_partial_fill_is_protected_at_once_and_the_rest_works_ten_minutes(mt, monkeypatch):
+    # Admitted before CRYPTO_ENTRY_WORKING_LIMIT_V1, which ends the rest at its 300 s fill window
+    # (tests/test_entry_working.py); this setup keeps the partial-entry rule's ten minutes.
+    monkeypatch.setattr(entry_working, "admission_fields", lambda packet: {})
     engine, venue, _ = mt
     sid = admit(mt, "SOL/USD")
     trigger(mt, sid)
@@ -169,17 +179,193 @@ def test_a_protection_refused_while_the_rest_works_cancels_the_rest_then_protect
     current = state(mt, sid)
     assert current["partial_entry_cancel"] == "PARTIAL_ENTRY_PROTECTION_REFUSED"
     assert not current.get("exit_requested")  # Not today's PROTECTION_REJECTED flatten.
-    engine.manage(sid, quote(mt, "100.05", "100.08"))
+    plan = engine.manage(sid, quote(mt, "100.05", "100.08"))
+    assert (plan.state, plan.reason) == ("CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT")
     assert order["status"] == "canceled" and not stop_orders(mt, "SOL/USD")
-    engine.manage(sid, quote(mt, "100.05", "100.08"))
+    plan = engine.manage(sid, quote(mt, "100.05", "100.08"))
+    assert plan.state == "PROTECTION_REQUIRED"
     [stop] = stop_orders(mt, "SOL/USD")
     assert stop["qty"] == "5" and not venue.orders_of("sell", "market")
     assert [d["reason"] for d in decisions(engine, sid, "CANCEL")] == [
         "PARTIAL_ENTRY_PROTECTION_REFUSED"]
 
 
+# The fixture venue refuses a sell stop-limit while a buy of the coin is open, as Alpaca paper's
+# wash-trade guard did live (CRV 2026-09-30 00:15 UTC, PEPE 19:15 UTC).
+ABOVE_M = ("100.08", "100.11")  # A fresh quote with the ask above the max entry (100.10).
+
+
+def test_a_remainder_cancelled_at_the_first_pass_is_cancelled_before_protection_is_sent(mt):
+    """PEPE/USD, 2026-09-30 19:15 UTC (setup 0c8755e4): a partial fill, and the next pass finds
+    the ask above M. That pass sent the stop-limit with the remainder's cancel; the venue refused
+    the sell while the buy worked, and the refusal flattened the filled part at market. Now the
+    remainder is cancelled first and the stop-limit follows once the entry is gone: nothing is
+    refused and nothing is sold."""
+    engine, venue, _ = mt
+    venue.refuse_stop_while_buy_open = True
+    sid = admit(mt, "SOL/USD")
+    trigger(mt, sid)
+    order = entry_order(mt, "SOL/USD")
+    fill(mt, order, "5")
+    plan = engine.manage(sid, quote(mt, *ABOVE_M))
+    assert (plan.state, plan.reason) == ("CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT")
+    assert [d["reason"] for d in decisions(engine, sid, "CANCEL")] == [
+        "PARTIAL_ENTRY_ABOVE_MAX_ENTRY"]
+    assert order["status"] == "canceled" and not decisions(engine, sid, "PROTECT")
+    venue.now += timedelta(seconds=1)
+    plan = engine.manage(sid, quote(mt, *ABOVE_M))
+    assert (plan.state, plan.reason) == ("PROTECTION_REQUIRED", "UNCOVERED_BROKER_INVENTORY")
+    [stop] = stop_orders(mt, "SOL/USD")
+    assert (stop["qty"], stop["stop_price"], stop["limit_price"]) == ("5", "95", "94.99")
+    plan = engine.manage(sid, quote(mt, *ABOVE_M))
+    assert (plan.state, plan.reason) == ("PROTECTED", "NATIVE_STOP_LIMIT_PRESENT")
+    current = state(mt, sid)
+    assert (current["state"], current.get("exit_requested"), current["partial_entry_cancel"]) == (
+        "OPEN", None, "PARTIAL_ENTRY_ABOVE_MAX_ENTRY")
+    assert not venue.orders_of("sell", "market") and not bodies(engine, "BROKER_REJECTED", sid)
+    [completed] = bodies(engine, "MAINTENANCE_ENTRY_COMPLETED", sid)
+    assert (completed["outcome"], completed["cancel_reason"]) == (
+        "REMAINDER_CANCELLED", "PARTIAL_ENTRY_ABOVE_MAX_ENTRY")
+    assert verify_events(engine.repo.export_events())["valid"]
+
+
+def test_no_protection_is_sent_while_the_remainder_cancel_is_in_flight(mt):
+    engine, venue, _ = mt
+    venue.refuse_stop_while_buy_open = True
+    venue.defer_cancel = True  # The cancel is accepted; the order stays pending_cancel.
+    sid = admit(mt, "SOL/USD")
+    trigger(mt, sid)
+    order = entry_order(mt, "SOL/USD")
+    fill(mt, order, "5")
+    plan = engine.manage(sid, quote(mt, *ABOVE_M))
+    assert (plan.reason, order["status"]) == ("CANCEL_ENTRY_BEFORE_PROTECT", "pending_cancel")
+    for _ in range(3):
+        venue.now += timedelta(seconds=1)
+        plan = engine.manage(sid, quote(mt, *ABOVE_M))
+        assert (plan.state, plan.reason, plan.proposals) == (
+            "CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT", ())
+    assert len(decisions(engine, sid, "CANCEL")) == 1 and not decisions(engine, sid, "PROTECT")
+    order["status"] = "canceled"  # The broker completes the cancel.
+    venue.now += timedelta(seconds=1)
+    assert engine.manage(sid, quote(mt, *ABOVE_M)).state == "PROTECTION_REQUIRED"
+    [stop] = stop_orders(mt, "SOL/USD")
+    assert stop["qty"] == "5" and not venue.orders_of("sell", "market")
+    assert state(mt, sid).get("exit_requested") is None
+
+
+def test_the_app_watched_stop_covers_the_position_until_the_stop_limit_rests(mt):
+    """While the remainder's cancel is in flight the position has no stop-limit at the broker; the
+    setup's stop rule (here CRYPTO_STOP_BREACH_V2) still sells it: a print at the stop establishes
+    the breach and the fallback sells at market 5 s later, once the entry is gone."""
+    engine, venue, _ = mt
+    venue.refuse_stop_while_buy_open = True
+    venue.defer_cancel = True
+    sid = admit(mt, "SOL/USD")
+    assert state(mt, sid)["stop_breach_version"] == "CRYPTO_STOP_BREACH_V2"
+    trigger(mt, sid)
+    order = entry_order(mt, "SOL/USD")
+    fill(mt, order, "5")
+    assert engine.manage(sid, quote(mt, *ABOVE_M)).reason == "CANCEL_ENTRY_BEFORE_PROTECT"
+    venue.now += timedelta(seconds=1)
+    assert engine.manage(sid, quote(mt, "94.90", "95.10")).reason == "CANCEL_ENTRY_BEFORE_PROTECT"
+    [breach] = bodies(engine, "STOP_BREACH_ESTABLISHED", sid)
+    assert breach["breach_evidence"] == "TRADE_PRINT"
+    venue.now += timedelta(seconds=5)
+    plan = engine.manage(sid, quote(mt, "94.90", "95.10"))
+    assert (plan.state, plan.reason) == ("CANCELING", "STOP_LIMIT_NOT_FILLED")
+    assert state(mt, sid)["exit_requested"] == "STOP_LIMIT_NOT_FILLED"
+    order["status"] = "canceled"
+    plan = engine.manage(sid, quote(mt, "94.90", "95.10"))
+    assert plan.state == "EXIT_REQUIRED"
+    [sell] = venue.orders_of("sell", "market")
+    assert sell["qty"] == "5" and not decisions(engine, sid, "PROTECT")
+
+
+@pytest.mark.parametrize("cancel_in_flight", [False, True])
+def test_a_protection_refused_while_an_entry_worked_is_sent_again_and_never_flattens(
+        mt, monkeypatch, cancel_in_flight):
+    """The refusal is judged on the broker view its POST was authorized on, not on the state when
+    the refusal is handled. Replayed with PEPE's plan of 2026-09-30 (the stop-limit and the
+    remainder's cancel in one plan: the planner's sequencing for setups without the rule): the
+    state already records the remainder's cancel when the refusal arrives, which took the
+    PROTECTION_REJECTED flatten. Now the refusal records PARTIAL_ENTRY_PROTECTION_REFUSED with the
+    entry orders the POST saw, the recorded cancel reason stays, and protection is sent again
+    under a fresh client order ID once the entry is gone. With the cancel in flight, the next
+    plan's stop-limit (sent while the buy is pending_cancel) is refused and retried the same way."""
+    from catalyst_lab import crypto_execution
+
+    planner = crypto_execution.plan_crypto_recovery
+
+    def one_plan(*args, retain_entry=None, **options):
+        return planner(*args, **options)
+
+    monkeypatch.setattr(crypto_execution, "plan_crypto_recovery", one_plan)
+    engine, venue, _ = mt
+    venue.refuse_stop_while_buy_open = True
+    venue.defer_cancel = cancel_in_flight
+    sid = admit(mt, "SOL/USD")
+    trigger(mt, sid)
+    order = entry_order(mt, "SOL/USD")
+    fill(mt, order, "5")
+    plan = engine.manage(sid, quote(mt, *ABOVE_M))
+    assert [p.action for p in plan.proposals] == ["CRYPTO_PROTECT", "CRYPTO_CANCEL"]
+    current = state(mt, sid)
+    assert current.get("exit_requested") is None  # Not the PROTECTION_REJECTED flatten.
+    assert current["partial_entry_cancel"] == "PARTIAL_ENTRY_ABOVE_MAX_ENTRY"  # Recorded once.
+    [refused] = bodies(engine, "PARTIAL_ENTRY_PROTECTION_REFUSED", sid)
+    assert refused["entry_orders"] == [{"id": order["id"], "status": "partially_filled"}]
+    if cancel_in_flight:
+        assert order["status"] == "pending_cancel"
+        venue.now += timedelta(seconds=1)
+        engine.manage(sid, quote(mt, *ABOVE_M))
+        second = bodies(engine, "PARTIAL_ENTRY_PROTECTION_REFUSED", sid)[1]
+        assert second["entry_orders"] == [{"id": order["id"], "status": "pending_cancel"}]
+        assert state(mt, sid).get("exit_requested") is None
+        order["status"] = "canceled"
+    assert order["status"] == "canceled" and not stop_orders(mt, "SOL/USD")
+    venue.now += timedelta(seconds=1)
+    engine.manage(sid, quote(mt, *ABOVE_M))
+    [stop] = stop_orders(mt, "SOL/USD")
+    *refused_ids, sent = [d["payload"]["client_order_id"]
+                          for d in decisions(engine, sid, "PROTECT")]
+    assert stop["client_order_id"] == sent and sent not in refused_ids
+    assert len(refused_ids) == (2 if cancel_in_flight else 1)
+    assert stop["qty"] == "5" and not venue.orders_of("sell", "market")
+    assert state(mt, sid).get("exit_requested") is None
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_a_protection_refused_with_no_entry_working_still_flattens(mt, partial):
+    """CRYPTO_PARTIAL_ENTRY_V1 keeps today's PROTECTION_REJECTED flatten for a refusal while no
+    entry order works: the venue refuses every stop-limit, after a full fill or after the rest of
+    a partial fill was cancelled first."""
+    engine, venue, _ = mt
+    sid = admit(mt, "SOL/USD")
+    trigger(mt, sid)
+    order = entry_order(mt, "SOL/USD")
+    if partial:
+        fill(mt, order, "5")
+        assert engine.manage(sid, quote(mt, *ABOVE_M)).reason == "CANCEL_ENTRY_BEFORE_PROTECT"
+        assert order["status"] == "canceled"
+        venue.now += timedelta(seconds=1)
+    else:
+        fill(mt, order, order["qty"])
+    venue.reject_protection = True
+    engine.manage(sid, quote(mt, *ABOVE_M))
+    assert len(bodies(engine, "BROKER_REJECTED", sid)) == 1
+    assert not bodies(engine, "PARTIAL_ENTRY_PROTECTION_REFUSED", sid)
+    assert state(mt, sid)["exit_requested"] == "PROTECTION_REJECTED"
+    venue.now += timedelta(seconds=1)
+    assert engine.manage(sid, quote(mt, *ABOVE_M)).state == "EXIT_REQUIRED"
+    [sell] = venue.orders_of("sell", "market")
+    assert D(sell["qty"]) == (D(5) if partial else D(order["qty"]))
+
+
 def test_older_setups_keep_todays_partial_fill_and_the_control_arm_opens_like_the_managed(
         mt, monkeypatch):
+    # Admitted before CRYPTO_ENTRY_WORKING_LIMIT_V1 (its fill window would end the control arm's
+    # rest at 300 s on any pass in between: tests/test_entry_working.py).
+    monkeypatch.setattr(entry_working, "admission_fields", lambda packet: {})
     engine, venue, _ = mt
     older = engine.admit(packet(mt, "OLD/USD"))
     engine.observe_trigger(older, observation(mt))
@@ -434,6 +620,47 @@ def test_a_stop_raise_is_checked_applied_and_replaces_the_resting_stop_limit_by_
     assert verify_events(engine.repo.export_events())["valid"]
 
 
+class RestQuoteBars(Bars):
+    """The fixture bars plus a REST latest quote (bid 106, ask 106.03) one second old."""
+
+    def _latest(self, market, symbols, kind):
+        self.quote_reads.append((market, tuple(symbols), kind))
+        at = self.venue.now - timedelta(seconds=1)
+        return {s: SimpleNamespace(bid=D("106"), ask=D("106.03"), timestamp=at)
+                for s in symbols}, []
+
+
+def test_a_slow_answer_reads_its_own_quote_and_its_stop_raise_still_applies(mt, v1_admission):
+    """2026-09-28: with the stream quiet (its last quote older than 5 s), the request's quote
+    came from the pass's one REST read. An answer slower than that read's 5 s reuse window
+    found no read left and recorded no quote, so a stop raise was refused
+    CURRENT_QUOTE_UNAVAILABLE. The decision now reads its own quote."""
+    engine, venue, _ = mt
+    sid = open_trade(mt)
+    kit = maintainer(mt, bars=RestQuoteBars(venue))
+    kit.jev.answer("RAISE_STOP", stop="first")
+    kit.jev.hook = lambda body: setattr(venue, "now", venue.now + timedelta(seconds=6))
+    venue.now += timedelta(seconds=1)
+    quiet = venue.now - timedelta(seconds=30)
+
+    def quiet_stream(setup):  # The stream's last quote arrived 30 s ago.
+        return {"bid": "106", "ask": "106.03", "quote_at": quiet.isoformat(),
+                "quote_received_at": quiet, "trade_price": "106", "trade_at": quiet.isoformat(),
+                "trade_id": "fixture", "feed_healthy": True, "data_provider": "LAB_FIXTURE",
+                "data_feed": "FIXTURE"}
+
+    kit.prices = quiet_stream
+    run_pass(mt, kit)
+    [decision] = bodies(engine, "MAINTENANCE_DECISION", sid)
+    assert (decision["outcome"], decision["code"], decision["action"]) == (
+        "APPLIED", None, "RAISE_STOP")
+    assert decision["quote"]["quote_source"] == "ALPACA_REST_LATEST_QUOTE"
+    assert decision["quote"]["bid"] == "106"
+    assert state(mt, sid)["stop"] == "103.00"
+    # One REST read for the request, one for the decision six seconds later.
+    assert [kind for _, _, kind in kit.bars.quote_reads] == ["quotes", "quotes"]
+
+
 def test_a_refused_replace_falls_back_to_cancel_then_place(mt):
     engine, venue, _ = mt
     sid = open_trade(mt)
@@ -659,7 +886,7 @@ def test_price_gapping_through_the_stop_during_a_review_discards_the_review(mt):
     assert (obsolete["request_id"], obsolete["reason"]) == (request_id,
                                                            "STOP_CROSSED_DURING_REVIEW")
     assert state(mt, sid)["stop"] == "95"  # Nothing applied; the stop fires on its own.
-    venue.now += timedelta(seconds=3)
+    venue.now += timedelta(seconds=5)  # CRYPTO_STOP_BREACH_V2: 5 s after the print at 94.80.
     engine.manage(sid, quote(mt, "94.80"))
     assert state(mt, sid)["exit_requested"] == "STOP_LIMIT_NOT_FILLED"
 

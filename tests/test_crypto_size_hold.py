@@ -133,7 +133,8 @@ def test_v3_row_and_crypto_terms_carry_the_owner_numbers_and_v1_v2_are_untouched
             lab.research_audit_matches('ACCOUNT_RISK_MARKET_TERMS',to_jsonb(t),t.event_seq))
             FROM lab.account_risk_market_terms t) AS terms FROM lab.account_risk_policies p"""
         ).fetchone()
-    assert (audited["policies"], audited["terms"]) == (4, 1)
+    # Migration 026 adds JEV_MANAGED_RISK_V4 and its terms (tests/test_risk_v4.py).
+    assert (audited["policies"], audited["terms"]) == (6, 3)  # V4 (026) and V5 (031).
     assert verify_events(er.export_events())["valid"]
 
 
@@ -190,7 +191,8 @@ def test_market_terms_are_written_only_with_their_new_managed_policy_row(er):
     with er.connect() as conn:
         assert {r["policy_id"] for r in conn.execute(
             "SELECT policy_id FROM lab.account_risk_market_terms").fetchall()} == {
-            V3, "LAB_FIXTURE_WITH_TERMS"}
+            V3, "JEV_MANAGED_RISK_V4", "JEV_MANAGED_RISK_V5",
+            "LAB_FIXTURE_WITH_TERMS"}  # V4: migration 026; V5: 031.
     assert verify_events(er.export_events())["valid"]
 
 
@@ -509,7 +511,10 @@ def test_the_reservation_guard_is_migration_016_byte_for_byte_behind_one_slice_b
         unchanged = {r["proname"]: r["prosrc"] for r in conn.execute(
             """SELECT proname,prosrc FROM pg_proc WHERE proname IN ('enforce_risk_reservation',
             'guard_legacy_shared_budget') AND pronamespace='lab'::regnamespace""").fetchall()}
-    assert live == new
+    # Migration 027 (package trade-plan) reads the stop through lab.managed_planned_stop; for a
+    # setup without a trade plan that is this packet stop (tests/test_trade_plan_migration.py).
+    assert live == new.replace("(s.record_json->'levels'->>'stop')::numeric",
+                               "lab.managed_planned_stop(s.setup_id)")
     for name in unchanged:  # V1's two triggers are migration 016's, untouched by 022.
         assert unchanged[name] == function_body(
             MIGRATIONS / "016_account_risk_policy.sql",
@@ -1213,10 +1218,12 @@ V3_TERMS_AUDIT_ROW = {
 MIGRATION_022_EVENTS = 2
 
 
-def assert_migration_022_appended(owner_url, head_before):
+def assert_migration_022_appended(owner_url, head_before, *, later=()):
     """Exactly migration 022's two audit events follow ``head_before`` (the audit head before
     it ran): the JEV_MANAGED_RISK_V3 row, then its CRYPTO terms, each hash-chained to the one
-    before (event_hash = sha256(previous_hash || event_body)). Returns the new head."""
+    before (event_hash = sha256(previous_hash || event_body)), then exactly ``later``'s
+    ``(kind, row)`` events of a later migration (026's for a step to the current schema).
+    Returns the new head."""
     import hashlib
     import json
 
@@ -1228,10 +1235,11 @@ def assert_migration_022_appended(owner_url, head_before):
             event_body,payload_json::text FROM lab.trade_events WHERE seq>%s ORDER BY seq""",
             (start,),
         ).fetchall()
-    assert len(rows) == MIGRATION_022_EVENTS
+    assert len(rows) == MIGRATION_022_EVENTS + len(later)
     previous = head_before
     for row, (kind, audited) in zip(rows, (("ACCOUNT_RISK_POLICIES", V3_POLICY_AUDIT_ROW),
-                                           ("ACCOUNT_RISK_MARKET_TERMS", V3_TERMS_AUDIT_ROW)),
+                                           ("ACCOUNT_RISK_MARKET_TERMS", V3_TERMS_AUDIT_ROW),
+                                           *later),
                                     strict=True):
         seq, event_type, strategy, candidate, previous_hash, event_hash, body, payload = row
         assert (event_type, strategy, candidate) == ("SYSTEM_EVENT", "CATALYST_RETEST_V1", None)

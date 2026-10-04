@@ -804,6 +804,80 @@ def test_open_jev_breaker_alarms_and_clears_once_closed(ops, state):
     assert "JEV_BREAKER_OPEN" not in status_alarms(status, now, config["watchdog"])
 
 
+def test_the_scorecard_is_due_from_seven_utc_on_the_day_the_nightly_run_records():
+    """Package ops-alarms: the jobs run at 05:30 UTC (after the New York midnight all year) and
+    record the previous New York day; from 07:00 UTC that day's DAILY_SCORECARD_V1 is due,
+    and until 07:00 UTC the check stays on the day the run before recorded."""
+    from datetime import date
+    from zoneinfo import ZoneInfo
+
+    from catalyst_lab.learning_jobs import previous_days
+    from catalyst_lab.managed_ops import LEARNING_JOBS_DUE_AFTER, scorecard_due_day
+
+    assert LEARNING_JOBS_DUE_AFTER == timedelta(hours=7)
+    for month in (7, 12):  # EDT and EST.
+        run = datetime(2026, month, 15, 5, 30, tzinfo=UTC)
+        recorded = date(2026, month, 14)
+        assert previous_days(run)[-1] == recorded  # The day this run records.
+        assert scorecard_due_day(run) == recorded - timedelta(days=1)
+        assert scorecard_due_day(run.replace(hour=6, minute=59, second=59)) == (
+            recorded - timedelta(days=1))
+        assert scorecard_due_day(run.replace(hour=7, minute=0)) == recorded
+        assert scorecard_due_day(run.replace(hour=23, minute=59)) == recorded
+        assert scorecard_due_day(run.replace(day=16, hour=3)) == recorded
+        assert scorecard_due_day(run.replace(day=16, hour=7)) == recorded + timedelta(days=1)
+    # Any time zone: 03:00 UTC on the 29th is 23:00 on the 28th in New York.
+    late = datetime(2026, 9, 29, 3, 0, tzinfo=UTC).astimezone(ZoneInfo("America/New_York"))
+    assert scorecard_due_day(late) == date(2026, 9, 27)
+
+
+def test_ledger_alarms_raise_a_missed_scorecard_and_a_large_ledger_and_fail_closed():
+    """LEARNING_JOBS_MISSED while the due scorecard is not recorded; DATABASE_SIZE_HIGH from
+    3 GB (60% of the 5 GB Postgres volume); a fact the ops watchdog could not read is
+    LEDGER_CHECK_FAILED, never healthy."""
+    from catalyst_lab.managed_ops import DATABASE_SIZE_HIGH_BYTES, ledger_alarms
+
+    assert DATABASE_SIZE_HIGH_BYTES == 3_000_000_000
+
+    def facts(recorded=True, size=211_000_000, **extra):
+        return {"checked_at": "2026-09-29T07:00:00+00:00", "scorecard_day": "2026-09-28",
+                "scorecard_recorded": recorded, "database_bytes": size, **extra}
+
+    assert ledger_alarms(facts()) == []
+    assert ledger_alarms(facts(recorded=False)) == ["LEARNING_JOBS_MISSED"]
+    assert ledger_alarms(facts(size=DATABASE_SIZE_HIGH_BYTES - 1)) == []
+    assert ledger_alarms(facts(size=DATABASE_SIZE_HIGH_BYTES)) == ["DATABASE_SIZE_HIGH"]
+    assert ledger_alarms(facts(recorded=False, size=4 * 10**9)) == [
+        "LEARNING_JOBS_MISSED", "DATABASE_SIZE_HIGH"]
+    size_unread = facts(code="INSUFFICIENTPRIVILEGE")
+    del size_unread["database_bytes"]
+    assert ledger_alarms(size_unread) == ["LEDGER_CHECK_FAILED"]
+    size_unread["scorecard_recorded"] = False
+    assert ledger_alarms(size_unread) == ["LEARNING_JOBS_MISSED", "LEDGER_CHECK_FAILED"]
+    for broken in (None, "nope", {"code": "OPERATIONALERROR"}, facts(recorded=None),
+                   facts(recorded="yes"), facts(size=True), facts(size="211"), facts(size=-1),
+                   facts(size=3.5e9)):
+        assert ledger_alarms(broken) == ["LEDGER_CHECK_FAILED"], broken
+
+
+def test_the_ops_volume_alarms_below_twenty_percent_free_and_fails_closed():
+    from catalyst_lab.managed_ops import OPS_VOLUME_MIN_FREE_PERCENT, ops_volume_alarms
+
+    assert OPS_VOLUME_MIN_FREE_PERCENT == 20
+    total = 4096 * 1024 * 1024  # The ops volume's 4 GB (sizeMB 4096 in .railway/railway.ts).
+    fifth = -(-total // 5)  # The least free space that is 20% of it.
+    assert ops_volume_alarms({"total_bytes": total, "free_bytes": total}) == []
+    assert ops_volume_alarms({"total_bytes": total, "free_bytes": fifth}) == []
+    assert ops_volume_alarms({"total_bytes": total, "free_bytes": fifth - 1}) == [
+        "OPS_VOLUME_LOW"]
+    assert ops_volume_alarms({"total_bytes": total, "free_bytes": 0}) == ["OPS_VOLUME_LOW"]
+    for broken in (None, {"code": "FILENOTFOUNDERROR"}, {"total_bytes": 0, "free_bytes": 0},
+                   {"total_bytes": total, "free_bytes": total + 1},
+                   {"total_bytes": total, "free_bytes": -1},
+                   {"total_bytes": str(total), "free_bytes": total}):
+        assert ops_volume_alarms(broken) == ["OPS_VOLUME_LOW"], broken
+
+
 def test_fresh_muse_heartbeat_does_not_hide_exhausted_delivery_or_failed_work(ops):
     _, config = ops
     now = datetime.now(UTC)

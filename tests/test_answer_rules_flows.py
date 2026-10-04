@@ -17,6 +17,7 @@ import pytest
 from catalyst_lab import crypto_maintenance as cm
 from catalyst_lab.audit import verify_events
 from catalyst_lab.jev_contract import INSUFFICIENT
+from catalyst_lab.trade_maintenance import TradeMaintenance
 from catalyst_lab.unchanged_plan import TARGET_RAISE, maintenance_level_changes
 from tests.maintenance_fixtures import (
     admit_many,
@@ -33,10 +34,15 @@ from tests.maintenance_fixtures import (
     trigger,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.maintenance_fixtures import v1_admission as v1_admission
 from tests.maintenance_fixtures import v2_admission as v2_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
+
+# Every setup here is admitted as before package trade-plan (CRYPTO_MAINTENANCE_V3 or earlier,
+# the one-tick stop-limit); the new versions are tests/test_trade_plan_*.py.
+pytestmark = pytest.mark.usefixtures("pre_trade_plan_admission")
 
 # WIF's maintenance answer of 2026-09-27 (jev-1.13.0, round 5), on the fixture's options: HOLD
 # 0.39 with stop_option S1 0.49 against KEEP 0.41 -- refused by V1 as contradictory.
@@ -286,6 +292,28 @@ def test_v2_reviews_every_completed_minute_and_never_inside_a_minute(mt):
     one_minute = [c for c in kit.bars.calls if c[2] == "1Min"]
     assert {c[1] for c in one_minute} == {"SOL/USD"} and {c[3] for c in one_minute} == {60}
     assert len(one_minute) == 3  # One GET per completed minute and coin (cached per minute).
+
+
+def test_the_review_history_is_the_last_five_reviews_with_their_own_requests_options(mt):
+    engine, venue, _ = mt
+    sid = open_trade(mt)  # 30 s into a minute.
+    kit = maintainer(mt)
+    assert reviewed(mt, kit, bid="101", seconds=31)  # The next minute completed (+1 s).
+    for _ in range(7):
+        assert reviewed(mt, kit, bid="101", seconds=60)
+    requests = bodies(engine, "POSITION_REVIEW_REQUEST", sid)
+    answered = bodies(engine, "MAINTENANCE_DECISION", sid)
+    assert len(requests) == len(answered) == 8
+    assert [len(r["context"]["state"]["review_history"]) for r in requests] == [
+        0, 1, 2, 3, 4, 5, 5, 5]
+    with engine.repo.connect() as conn:
+        history = TradeMaintenance.review_history(conn, sid, state(mt, sid)["lifecycle_id"])
+    assert [h["requested_at"] for h in history] == [d["requested_at"] for d in answered[-5:]]
+    for row, request in zip(history, requests[-5:], strict=True):
+        options = request["context"]["options"]
+        assert row["option_prices"] == {
+            kind: {o["option_id"]: o["price"] for o in options[kind]}
+            for kind in ("stop", "target")}
 
 
 def test_a_minute_that_completes_while_the_review_is_in_flight_is_skipped_and_recorded(mt):

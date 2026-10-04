@@ -1,7 +1,10 @@
-"""The live dashboard's HTML shell: title, the fixture banner, empty sections and the first data.
+"""The live page's HTML shell (EXPERIMENT_DASHBOARD_V3; V2 package public-page): the title, the
+fixture banner, the status line's band, empty sections and the first data.
 
+Two views share one shell: the live page (``/``) and a trade's own page (``/trade/{n}``).
 ``/experiment.js`` renders every section from the JSON document with DOM calls only (never
-``innerHTML``) and polls ``/api/public/experiment`` every few seconds. The first document is
+``innerHTML``), draws the charts as inline SVG and polls ``/api/public/experiment`` every 30
+seconds. The first document is
 embedded as an inert ``application/json`` block, so the page renders at once without a second
 request; the Content-Security-Policy still forbids every inline script.
 """
@@ -13,15 +16,22 @@ from html import escape
 from pathlib import Path
 
 STATIC = Path(__file__).with_name("static")
+BRAND = "Catalyst"
+# The live page, top to bottom (EXPERIMENT_DASHBOARD_V3, package public-page-v3): the status
+# band is above <main>; then the account (equity and its KPIs), the equity curve with the BTC
+# benchmark and the drawdown, performance (daily P&L, the R distribution and the statistics),
+# open positions, today vs the limits and the market, the research agent and Jev, closed today
+# and past days.
 SECTIONS = (
-    ("live", "Positions"),
-    ("closed", "Closed trades"),
-    ("research", "Research"),
-    ("jev", "Jev"),
-    ("picks", "Latest picks"),
-    ("past", "Performance"),
+    ("account", None),
+    ("equity", "Trading P&L"),
+    ("performance", "Performance"),
+    ("open", "Open positions"),
+    ("tiles", None),
+    ("agents", None),
+    ("closed", "Closed today"),
+    ("past", "Past days"),
 )
-SIDE_BY_SIDE = ("research", "jev")  # One row on wide screens: research beside Jev.
 PRELOAD_FONTS = ("IBMPlexSans-Regular.woff2", "IBMPlexMono-Regular.woff2")
 
 
@@ -46,56 +56,61 @@ def embedded_json(document):
 
 
 def section(key, title):
-    return (f'<section class="block" id="{key}" aria-labelledby="{key}-title">'
-            f'<div class="block-head"><h2 id="{key}-title">{e(title)}</h2>'
-            f'<span class="block-meta" id="{key}-meta"></span></div>'
+    head = (f'<div class="section-head"><h2 id="{key}-title">{e(title)}</h2>'
+            f'<span class="section-meta" id="{key}-meta"></span></div>' if title else "")
+    label = f' aria-labelledby="{key}-title"' if title else ""
+    return (f'<section class="section" id="{key}"{label}>{head}'
             f'<div class="body" id="{key}-body"></div></section>')
 
 
 def sections():
-    html = []
-    for key, title in SECTIONS:
-        if key == SIDE_BY_SIDE[0]:
-            html.append('<div class="split">')
-        html.append(section(key, title))
-        if key == SIDE_BY_SIDE[-1]:
-            html.append("</div>")
-    return "\n".join(html)
+    return "\n".join(section(key, title) for key, title in SECTIONS)
 
 
-def render_page(document):
+def render_page(document, trade_no=None):
+    """The live page, or with ``trade_no`` that trade's own page (its data is in the
+    document; the service answers 404 for a trade the document does not list)."""
     fixture = ""
     if document["fixture_data"]:
         fixture = f'<div class="fixture-banner" role="alert">{e(document["data_label"])}</div>'
     preload = "\n".join(f'<link rel="preload" href="/fonts/{name}" as="font" type="font/woff2" '
                         'crossorigin>' for name in PRELOAD_FONTS)
+    title = document["title"]
+    if trade_no is None:
+        view = 'data-view="main"'
+        head = (f'<div class="brand"><span class="kicker">{BRAND}</span>'
+                f'<h1 id="title">{e(title)}</h1></div>')
+        body = sections()
+        page_title = title
+    else:
+        view = f'data-view="trade" data-trade="{int(trade_no)}"'
+        head = ('<div class="brand"><a class="back" href="/">&larr; Live page</a>'
+                '<span class="crumb" id="crumb"></span></div>')
+        body = '<div id="trade-body"></div>'
+        page_title = f"Trade #{int(trade_no)} · {title}"
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>{e(document["title"])}</title>
+<meta name="color-scheme" content="light">
+<title>{e(page_title)}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 {preload}
 <link rel="stylesheet" href="/experiment.css?v={asset_version()}">
 <script defer src="/experiment.js?v={asset_version()}"></script>
 </head>
-<body>
+<body {view}>
 {fixture}<header class="masthead"><div class="wrap mast">
-<h1 id="title">{e(document["title"])}</h1>
-<div class="mast-status"><span class="state" id="pill"><span class="dot"
-aria-hidden="true"></span><span id="pill-text">&hellip;</span></span>
-<span class="updated" id="updated">loading</span>
-<span class="account" id="account"></span></div>
+{head}
+<div class="updated" id="updated">Paper account</div>
 </div></header>
+<div class="status-band" id="status" role="status" aria-live="polite"><div class="wrap status-row"
+id="status-body"></div></div>
 <main class="wrap" id="app">
 <noscript><p class="empty">This page updates itself with JavaScript. The same figures as JSON:
 <a href="/api/public/experiment">/api/public/experiment</a>.</p></noscript>
-<section class="summary" id="summary" aria-labelledby="summary-title">
-<h2 class="sr-only" id="summary-title">Summary</h2><div class="body" id="summary-body"></div>
-</section>
-{sections()}
+{body}
 </main>
 <script type="application/json" id="initial-data">{embedded_json(document)}</script>
 </body>
@@ -103,5 +118,5 @@ aria-hidden="true"></span><span id="pill-text">&hellip;</span></span>
 """
 
 
-__all__ = ["PRELOAD_FONTS", "SECTIONS", "SIDE_BY_SIDE", "asset_version", "embedded_json",
+__all__ = ["BRAND", "PRELOAD_FONTS", "SECTIONS", "asset_version", "embedded_json",
            "render_page", "section"]

@@ -148,8 +148,12 @@ def test_levels_alone_refuse_a_short_stop_and_otherwise_wait_for_a_live_price():
 
 
 def test_codes_are_classified_permanent_or_transient():
+    # Package trade-plan adds CRYPTO_TRADE_PLAN_V1's two refusals of a planned pick.
     assert sc.SYSTEM_CHECK_REFUSALS == {"PRICE_MISMATCH", "STOP_ALREADY_HIT",
-                                        "BREAKOUT_NOT_ENABLED", "STOP_DISTANCE_BELOW_MINIMUM"}
+                                        "BREAKOUT_NOT_ENABLED", "STOP_DISTANCE_BELOW_MINIMUM",
+                                        "TRADE_PLAN_TARGET_NOT_ABOVE_MAX_ENTRY",
+                                        "TRADE_PLAN_STOP_NOT_POSITIVE"}
+    assert "HOURLY_RANGE_UNAVAILABLE" not in PERMANENT_ADMISSION_REFUSALS
     assert sc.SYSTEM_CHECK_REFUSALS | {"SUPERSEDED_BY_NEW_RESEARCH"} <= PERMANENT_ADMISSION_REFUSALS
     assert "LIVE_PRICE_UNAVAILABLE" not in PERMANENT_ADMISSION_REFUSALS
     refusal = sc.AdmissionRefused("PRICE_MISMATCH", {"system_check": {"code": "PRICE_MISMATCH"}})

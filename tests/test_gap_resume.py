@@ -38,6 +38,7 @@ from catalyst_lab.managed_store import ManagedAuthorizationGate
 from catalyst_lab.scan_sources import AlpacaMarketSource, SourceIssue, SourcePolicy
 from catalyst_lab.setup_scan import CompletedBar
 from tests.maintenance_fixtures import MaintenanceVenue, maintainer
+from tests.maintenance_fixtures import pre_jev_b1_admission as pre_jev_b1_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 from tests.test_managed_execution import packet
@@ -771,6 +772,7 @@ def heartbeats_of(engine, run):
             if r["body"]["runtime_id"] == run.runtime_id]
 
 
+@pytest.mark.usefixtures("pre_jev_b1_admission")  # V4's maintenance (before jev-b1).
 def test_a_restart_backfills_keeps_protection_and_checks_each_pending_setup_once(
     lab, monkeypatch,
 ):

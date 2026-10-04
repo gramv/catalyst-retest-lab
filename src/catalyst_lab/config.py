@@ -7,7 +7,7 @@ PAPER_ENDPOINT = "https://paper-api.alpaca.markets"
 MUSE_SCOPES = frozenset({"candidate:create", "candidate:read", "analytics:read"})
 AUTHORIZATION_TTL_SECONDS = 5
 BASELINE_SOURCE = "BROKER_PREVIOUS_CLOSE"
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 31
 # Official R remains unset until the user resolves the Phase 5 denominator.
 REPORTING_R_METHOD = None
 

@@ -32,7 +32,14 @@ the recorded fractions are rounded to 12 decimal places for reading only.
 shortlist goes live"): once a V3 selection of a newer ``run_slot`` is published, every older
 V3 setup still WATCHING is revoked and every older, unexpired, unadmitted V3 selection is
 declined, both with ``SUPERSEDED_BY_NEW_RESEARCH``. Positions, working entries and V2 cycles
-are never touched. The one SQL helper below reads the ledger; it never writes.
+are never touched.
+
+``RESEARCH_RUN_SUPERSESSION_V2`` (package research-loop-app, docs/RESEARCH-LOOP-V2.md 3.2)
+applies instead while the configured schedule is ``RESEARCH_SCHEDULE_V2``: a V3 pick of run
+``r`` is superseded only by a published V3 selection of a later run that is a full run (any
+symbol: the daily run replaces the day's set) or is for the same symbol (any run: an adjusted
+pick replaces that coin's setup). Run kinds come from the configured schedule. Under V1 the V1
+rule applies unchanged. The SQL helpers below read the ledger; they never write.
 """
 
 import re
@@ -40,13 +47,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
+from catalyst_lab import strategies
 from catalyst_lab.broker_budget import RESEARCH, request_priority
 from catalyst_lab.research_report_v3 import REPORT_SCHEMA_V3
+from catalyst_lab.research_schedule import FULL_RUN, SCHEDULE_VERSION_V2
+from catalyst_lab.strategies import core
 
 D = Decimal
 
 SYSTEM_CHECK_VERSION = "SYSTEM_CHECK_V1"
 SUPERSESSION_VERSION = "RESEARCH_RUN_SUPERSESSION_V1"
+SUPERSESSION_VERSION_V2 = "RESEARCH_RUN_SUPERSESSION_V2"
 
 # Owner thresholds (named constants, Decimal only).
 PRICE_MISMATCH_FRACTION = D("0.05")
@@ -59,8 +70,11 @@ REST_QUOTE_READS_PER_TICK = 1
 RATIO_QUANTUM = D("1e-12")  # Recorded fractions only; decisions compare exact products.
 _PRECISION = 80
 
-PULLBACK, IMMEDIATE, BREAKOUT = "PULLBACK", "IMMEDIATE", "BREAKOUT"
-TRADED_ENTRY_TYPES = frozenset({PULLBACK, IMMEDIATE})  # Breakouts after a backtest earns them.
+PULLBACK, IMMEDIATE, BREAKOUT = core.PULLBACK, core.IMMEDIATE, core.BREAKOUT
+# PULLBACK_V1's entry types (STRATEGY_REGISTRY_V1): breakouts after a backtest earns them. The
+# check reads the packet's strategy (``strategies.traded_entry_types``); every pick without a
+# ``strategy_id`` is PULLBACK_V1, so this set is the one applied today.
+TRADED_ENTRY_TYPES = strategies.PULLBACK_V1.entry_types
 
 LIVE_PRICE_UNAVAILABLE = "LIVE_PRICE_UNAVAILABLE"  # Transient: the next tick retries.
 STOP_DISTANCE_BELOW_MINIMUM = "STOP_DISTANCE_BELOW_MINIMUM"
@@ -68,12 +82,22 @@ PRICE_MISMATCH = "PRICE_MISMATCH"
 STOP_ALREADY_HIT = "STOP_ALREADY_HIT"
 BREAKOUT_NOT_ENABLED = "BREAKOUT_NOT_ENABLED"
 SUPERSEDED_BY_NEW_RESEARCH = "SUPERSEDED_BY_NEW_RESEARCH"
+# AGENT_RESEARCH_WITHDRAWAL_V1 (research_withdrawal.py): the proposing agent withdrew the pick.
+WITHDRAWN_BY_RESEARCH = "WITHDRAWN_BY_RESEARCH"
 # A selected pick refused with one of these is to be replaced by Jev's next-ranked pick (a
-# later package); SUPERSEDED_BY_NEW_RESEARCH is permanent too, but its run is over.
+# later package); SUPERSEDED_BY_NEW_RESEARCH is permanent too, but its run is over, and a
+# withdrawn pick is replaced by the agent's own newer research, never by the ranking.
+# CRYPTO_TRADE_PLAN_V1 (trade_plan.py): a pick whose planned levels cannot stand is refused
+# like a system-check failure (recorded once, final for the receipt, replaced under top-K).
+TRADE_PLAN_TARGET_NOT_ABOVE_MAX_ENTRY = "TRADE_PLAN_TARGET_NOT_ABOVE_MAX_ENTRY"
+TRADE_PLAN_STOP_NOT_POSITIVE = "TRADE_PLAN_STOP_NOT_POSITIVE"
 SYSTEM_CHECK_REFUSALS = frozenset(
-    {STOP_DISTANCE_BELOW_MINIMUM, PRICE_MISMATCH, STOP_ALREADY_HIT, BREAKOUT_NOT_ENABLED}
+    {STOP_DISTANCE_BELOW_MINIMUM, PRICE_MISMATCH, STOP_ALREADY_HIT, BREAKOUT_NOT_ENABLED,
+     TRADE_PLAN_TARGET_NOT_ABOVE_MAX_ENTRY, TRADE_PLAN_STOP_NOT_POSITIVE}
 )
-PERMANENT_REFUSALS = SYSTEM_CHECK_REFUSALS | {SUPERSEDED_BY_NEW_RESEARCH}
+PERMANENT_REFUSALS = SYSTEM_CHECK_REFUSALS | {SUPERSEDED_BY_NEW_RESEARCH, WITHDRAWN_BY_RESEARCH}
+# Declines that never get a replacement decision (TOPK_REPLACEMENT_V1 or _V2).
+NOT_REPLACED = frozenset({SUPERSEDED_BY_NEW_RESEARCH, WITHDRAWN_BY_RESEARCH})
 
 # (recorded check name, refusal code), in evaluation order.
 CHECKS = (
@@ -88,6 +112,9 @@ PASSED, REFUSED, RETRY = "PASSED", "REFUSED", "RETRY"
 # The final refusal of one selection receipt (like CRYPTO_ADMISSION_REFUSED for the grid).
 REFUSED_EVENT = "SYSTEM_CHECK_REFUSED"
 REFUSED_KEY = "system-check-refused:"
+# A selection's one RESEARCH_ADMISSION_DECLINED is keyed by this plus its selection event_seq
+# (the runtime's declines, and AGENT_RESEARCH_WITHDRAWAL_V1's).
+ADMISSION_DECLINED_KEY = "research:admission-declined:"
 
 STREAM_SOURCE = "ALPACA_STREAM"
 REST_SOURCE = "ALPACA_REST_LATEST_QUOTE"
@@ -261,7 +288,8 @@ def evaluate(packet, quote, *, now, attempts=None):
         results["stop_not_hit"] = FAIL if quote.bid <= stop or (
             quote.last is not None and quote.last <= stop
         ) else PASS
-        results["entry_type_traded"] = PASS if kind in TRADED_ENTRY_TYPES else FAIL
+        traded = strategies.traded_entry_types(packet)
+        results["entry_type_traded"] = PASS if kind in traded else FAIL
         evidence.update(
             live=quote.evidence(),
             price_deviation_fraction=str(_ratio(abs(mid - agent), agent)),
@@ -454,13 +482,50 @@ class LivePriceReader:
         return _RestRead(read_at, quote, code)
 
 
+# --- Run supersession ---------------------------------------------------------------------------
+
+def supersession_version(schedule):
+    """The run-supersession version the configured schedule selects: V2 while it is
+    ``RESEARCH_SCHEDULE_V2``, else V1 (also when no schedule is configured)."""
+    if getattr(schedule, "version", None) == SCHEDULE_VERSION_V2:
+        return SUPERSESSION_VERSION_V2
+    return SUPERSESSION_VERSION
+
+
+def superseding_run_slot(schedule, run_slot, symbol, newer):
+    """``RESEARCH_RUN_SUPERSESSION_V2``: the latest run slot among ``newer`` (``(run_slot,
+    symbol)`` of published V3 selections) that supersedes a V3 pick of ``symbol`` answering
+    ``run_slot``: a later full run with any symbol, or a later run of either kind with the same
+    symbol. None when nothing supersedes it. Pure; run kinds are ``schedule.run_kind``."""
+    found = [slot for slot, other in newer
+             if slot > run_slot and (other == symbol or schedule.run_kind(slot) == FULL_RUN)]
+    return max(found, default=None)
+
+
 # --- Ledger reads (never writes) ----------------------------------------------------------------
 
 def newest_v3_run_slot(conn):
-    """The newest ``run_slot`` of any published V3 selection (whatever became of it), or None."""
+    """The newest ``run_slot`` of any published V3 selection (whatever became of it), or None.
+    A promoted strategy's signal (``STRATEGY_PAPER_PATH_V1``) is not a research run: never read."""
     return conn.execute(
         """SELECT max((body->'packet'->>'run_slot')::timestamptz) AS newest
         FROM lab.managed_events WHERE setup_id IS NULL AND kind='RESEARCH_SELECTED'
-        AND body->'packet'->>'report_schema_version'=%s""",
-        (REPORT_SCHEMA_V3,),
+        AND body->'packet'->>'report_schema_version'=%s
+        AND body->'packet'->>'selection_policy' IS DISTINCT FROM %s""",
+        (REPORT_SCHEMA_V3, strategies.SIGNAL_SELECTION_POLICY),
     ).fetchone()["newest"]
+
+
+def newer_v3_selections(conn, after):
+    """``(run_slot, symbol)`` of every published V3 selection (whatever became of it) whose
+    ``run_slot`` is later than ``after``: what ``superseding_run_slot`` reads."""
+    rows = conn.execute(
+        """SELECT DISTINCT (body->'packet'->>'run_slot')::timestamptz AS run_slot,
+        body->'packet'->>'symbol' AS symbol
+        FROM lab.managed_events WHERE setup_id IS NULL AND kind='RESEARCH_SELECTED'
+        AND body->'packet'->>'report_schema_version'=%s
+        AND body->'packet'->>'selection_policy' IS DISTINCT FROM %s
+        AND (body->'packet'->>'run_slot')::timestamptz>%s""",
+        (REPORT_SCHEMA_V3, strategies.SIGNAL_SELECTION_POLICY, after),
+    ).fetchall()
+    return [(row["run_slot"], row["symbol"]) for row in rows]

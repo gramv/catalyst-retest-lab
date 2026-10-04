@@ -14,18 +14,46 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from catalyst_lab import crypto_holding, crypto_maintenance, crypto_trigger, gap_resume, stale_print
+from catalyst_lab import ai_mode as ai_modes
+from catalyst_lab import (
+    coinbase_feed,
+    coinbase_trigger,
+    crypto_holding,
+    crypto_maintenance,
+    crypto_trigger,
+    entry_working,
+    execution_quality,
+    execution_setting,
+    gap_resume,
+    maker_entry,
+    pause_wait,
+    regime_gate,
+    risk_baseline,
+    stale_print,
+    stop_breach,
+    stop_execution,
+    strategies,
+    trade_plan,
+)
 from catalyst_lab.account_risk import (
     ARM_METHOD,
     CAPACITY_REASONS,
+    FIXED_EXIT_ARM,
     LEGACY_MANAGED_POLICY_ID,
+    SOFT_LIMIT_EVENT,
+    SOFT_LIMIT_REASON,
+    SOFT_LIMIT_WAIT_EVENT,
     VENUE,
     account_risk_failure,
     assign_arm,
     binding_constraint,
     classification_known,
+    daily_loss_threshold,
     load_policy,
     slice_size,
+    soft_limit_reached,
+    soft_wait_key,
+    strategy_risk_failure,
 )
 from catalyst_lab.broker_budget import RESEARCH, BudgetedBroker, request_priority
 from catalyst_lab.broker_ledger import (
@@ -41,8 +69,10 @@ from catalyst_lab.crypto_execution import (
     CryptoDayPolicy,
     CryptoExecutionError,
     build_limit_entry,
+    collar_price,
     native_stop_levels,
     off_grid_levels,
+    stop_limit_price,
 )
 from catalyst_lab.crypto_holding import (
     CRYPTO_24H_HOLD,
@@ -60,19 +90,27 @@ from catalyst_lab.managed_store import COHORT, POLICY, TERMINAL, ManagedStore
 from catalyst_lab.market import NY
 from catalyst_lab.paper_execution import BrokerMutationRejected, BrokerMutationUnknown
 from catalyst_lab.repository import json_safe
+from catalyst_lab.research_schedule import ResearchSchedule
 from catalyst_lab.risk_math import broker_amount, buying_power_check
+from catalyst_lab.strategies import core
 from catalyst_lab.system_check import (
+    ADMISSION_DECLINED_KEY,
     LIVE_PRICE_UNAVAILABLE,
     REFUSED,
     REFUSED_EVENT,
     REFUSED_KEY,
     SUPERSEDED_BY_NEW_RESEARCH,
     SUPERSESSION_VERSION,
+    SUPERSESSION_VERSION_V2,
+    WITHDRAWN_BY_RESEARCH,
     AdmissionRefused,
     LivePriceUnavailable,
     evaluate,
     is_v3_packet,
+    newer_v3_selections,
     newest_v3_run_slot,
+    superseding_run_slot,
+    supersession_version,
     v3_facts,
 )
 from catalyst_lab.us_admission import admission_profile
@@ -97,7 +135,7 @@ FEE_BACKFILL_EVENT = "ALPACA_FEE_BACKFILL_COMPLETED"
 # passed since it (2026-09-28: every 30 s run was recorded, 20% of the ledger's managed events).
 FEE_BACKFILL_REFRESH = timedelta(minutes=30)
 FEE_BACKFILL_COUNTS = ("activities_read", "matched", "already_recorded", "unmatched",
-                       "invalid", "conflicting")
+                       "invalid", "conflicting", "ambiguous")
 
 # Refused closes (plan phase 0, 2026-09-26), both markets, in or out of an operator flatten.
 # After the n-th consecutive broker refusal of a setup's close (market sell), its next close
@@ -109,6 +147,23 @@ FEE_BACKFILL_COUNTS = ("activities_read", "matched", "already_recorded", "unmatc
 EXIT_RETRY_BASE_SECONDS = 1
 EXIT_RETRY_CAP_SECONDS = 60
 EXIT_REFUSAL_ALARM_THRESHOLD = 5
+
+
+def working_entries(orders, roles):
+    """The setup's entry orders not yet terminal at the broker (working, or a cancel in flight),
+    as ``{id, status}``, from one broker view."""
+    return [{"id": o["id"], "status": o["status"]} for o in orders
+            if roles.get(o["id"]) == "ENTRY" and o["status"] not in BROKER_TERMINAL]
+
+
+def crypto_trigger_rules(state):
+    """The crypto trigger version a setup recorded, as its module: CRYPTO_COINBASE_TRIGGER_V1
+    (``coinbase_trigger``), CRYPTO_ALPACA_TRIGGER_V1 (``crypto_trigger``), or None for today's
+    trigger. A module-level function: ``ManagedExecution._trigger_failure`` is also called
+    unbound by the research shadow evaluator (``jev_shadow``)."""
+    # STRATEGY_REGISTRY_V1: the setup's strategy dispatches (PULLBACK_V1 for every setup without
+    # a stamped ``strategy_id``; its rule is exactly the one above).
+    return strategies.live_trigger(state)
 
 
 def error_code(exc):
@@ -188,12 +243,20 @@ def explicit_fill_fee_usd(payload):
 class ManagedExecution:
     def __init__(self, repository, broker, *, policy, clock, review_store, crypto_day_policy=None,
                  crypto_liquidity_reader=None, risk_policy_id=LEGACY_MANAGED_POLICY_ID,
-                 crypto_window=None):
+                 crypto_window=None, research_schedule=None, reference_feed=None,
+                 entry_pacing=None, trade_plan_enabled=None, crypto_execution=None,
+                 paper_strategies=(), ai_mode=None):
         if crypto_day_policy is not None and not isinstance(crypto_day_policy, CryptoDayPolicy):
             raise ValueError("EXPLICIT_CRYPTO_DAY_POLICY_REQUIRED")
+        if ai_mode is not None and ai_mode not in ai_modes.MODES:
+            raise ValueError(ai_modes.UNKNOWN)
+        # AI_MODE_SETTING_V1 (package oss-packaging): NO_AI_MODE_V1 admits every setup in the
+        # FIXED_EXIT arm (no AI maintains it); None or JEV_AI_MODE_V1 keeps the randomized arms.
+        self.no_ai = ai_mode == ai_modes.NO_AI_MODE
         if crypto_window is not None and not isinstance(
                 crypto_window, crypto_holding.CryptoWindowSetting):
             raise ValueError("EXPLICIT_CRYPTO_WINDOW_REQUIRED")
+        self.configure_research_schedule(research_schedule)
         self.store = ManagedStore(repository)
         self.repo, self.broker, self.policy, self.now = repository, broker, policy, clock
         self.review_store = review_store
@@ -205,18 +268,74 @@ class ManagedExecution:
         # exactly as before; a setting admits CRYPTO_WINDOW_REVIEW_V1 / CRYPTO_WINDOW_HOLD_V1
         # with its window. Each setup keeps what it recorded.
         self.crypto_window = crypto_window
+        # Coinbase's public market (``coinbase_feed.CoinbaseFeed``, read-only): with it, a
+        # report-V3 crypto pick of a coin with a Coinbase USD product is admitted under
+        # CRYPTO_COINBASE_TRIGGER_V1 and CRYPTO_STOP_BREACH_V3; the managed runtime reads the same
+        # feed. None (an engine without the feed) admits every setup exactly as before.
+        self.reference_feed = reference_feed
+        # CRYPTO_ENTRY_PACING_V1 (package risk-pacing, regime_gate.py): with it, new crypto
+        # admissions record the version and their entries are paced; None (an engine without it)
+        # admits every setup exactly as before. The managed runtime's factory configures it.
+        if entry_pacing is not None and not isinstance(entry_pacing, regime_gate.EntryPacing):
+            raise ValueError("EXPLICIT_ENTRY_PACING_REQUIRED")
+        self.entry_pacing = entry_pacing
+        # MANAGED_CRYPTO_EXECUTION_JSON (package exec-d, execution_setting.py): which phase-D
+        # execution versions new crypto admissions record (CRYPTO_STOP_EXECUTION_V1,
+        # CRYPTO_MAKER_ENTRY_V1). None is off: every setup is admitted exactly as before.
+        if crypto_execution is None:
+            crypto_execution = execution_setting.OFF
+        if not isinstance(crypto_execution, execution_setting.CryptoExecutionSetting):
+            raise ValueError("EXPLICIT_CRYPTO_EXECUTION_SETTING_REQUIRED")
+        self.crypto_execution = crypto_execution
+        # MANAGED_STRATEGIES_JSON (package plugin-c3, STRATEGY_PAPER_PATH_V1): the promoted
+        # strategies whose signal packets this engine admits. Empty (the default) admits none.
+        if not isinstance(paper_strategies, tuple) or any(
+                not isinstance(s, str) for s in paper_strategies):
+            raise ValueError("EXPLICIT_PAPER_STRATEGIES_REQUIRED")
+        self.paper_strategies = paper_strategies
         # New admissions use this MANAGED policy row; each setup keeps the one it was admitted
         # under (legacy setups without one are MUSE_JEV_MANAGED_TEST_V1).
         self._account_hash = None
+        # RISK_SESSION_BASELINE_V2: the New York date of this process's last clean reconciliation.
+        self._last_clean_day = None
         with repository.connect() as conn:
             self.risk_policy = load_policy(conn, risk_policy_id, engine="MANAGED")
             bound = conn.execute(
                 "SELECT account_hash FROM lab.ledger_account_binding WHERE venue=%s", (VENUE,)
             ).fetchone()
         self._risk_policies = {self.risk_policy.policy_id: self.risk_policy}
+        # CRYPTO_TRADE_PLAN_V1 (package trade-plan): report-V3 crypto admissions are planned only
+        # on a ledger whose reservation guard sizes planned risk on the plan's stop
+        # (trade_plan.PLANNED_STOP_FUNCTION). None follows the ledger; True requires it; False
+        # admits every setup exactly as before.
+        self.trade_plan_active = self._trade_plan_setting(trade_plan_enabled)
         if bound and bound["account_hash"] != self._account_binding_hash():
             # A ledger bound to one paper account never starts against another.
             raise ValueError("LEDGER_ACCOUNT_BINDING_MISMATCH")
+
+    def _trade_plan_setting(self, enabled):
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("EXPLICIT_TRADE_PLAN_SETTING_REQUIRED")
+        if enabled is False or (enabled is None and trade_plan.ADMITTED is None):
+            return False
+        with self.repo.connect() as conn:
+            supported = conn.execute(
+                "SELECT to_regprocedure(%s) IS NOT NULL AS supported",
+                (trade_plan.PLANNED_STOP_FUNCTION,),
+            ).fetchone()["supported"]
+        if enabled and not supported:
+            raise ValueError("TRADE_PLAN_MIGRATION_REQUIRED")
+        return bool(supported)
+
+    def configure_research_schedule(self, schedule):
+        """``MANAGED_RESEARCH_SCHEDULE_JSON`` as the app parsed it for report intake (package
+        research-loop-app; ``managed_app.create_application`` sets it before the runtime
+        starts). ``RESEARCH_SCHEDULE_V2`` selects ``RESEARCH_RUN_SUPERSESSION_V2`` for admission
+        and for the runtime's retirement pass; None or V1 keeps ``RESEARCH_RUN_SUPERSESSION_V1``
+        exactly as before."""
+        if schedule is not None and not isinstance(schedule, ResearchSchedule):
+            raise ValueError("EXPLICIT_RESEARCH_SCHEDULE_REQUIRED")
+        self.research_schedule = schedule
 
     def _account_binding_hash(self):
         """Domain-separated hash of the broker's opaque account identity, read once."""
@@ -252,7 +371,7 @@ class ManagedExecution:
         ).fetchone():
             persist_execution_halt(self.repo, conn, reason, details)
 
-    def admit(self, packet, *, live_quote=None):
+    def admit(self, packet, *, live_quote=None, hourly_range=None):
         """Accept only a locally recorded research-selection packet, never a Muse approval flag.
 
         Crypto levels must also sit on the broker's live price grid. That broker read
@@ -266,6 +385,12 @@ class ManagedExecution:
         supersession check (``system_check.py``); its admitted state records the check's
         evidence and entry type. Every other packet is admitted exactly as before and never
         reads a live price.
+
+        ``CRYPTO_TRADE_PLAN_V1`` (package trade-plan; ``trade_plan.py``), on an engine where it
+        is active: after the system check passes, ``hourly_range(symbol)`` (the runtime's
+        ``HourlyRangeReader``) gives the coin's hourly range and the plan sets the admitted
+        stop, target and 24-hour window; no range is ``HOURLY_RANGE_UNAVAILABLE`` (transient)
+        and a plan refusal is final for the receipt, recorded as the system check's.
         """
         required = {
             "cycle_id",
@@ -291,6 +416,15 @@ class ManagedExecution:
             # verify; lab.managed_review_failure binds the packet to its audited enrollment.
             if packet["receipt_id"] is not None or "enrollment_event_seq" not in packet:
                 raise ValueError("APP_REVIEWED_PACKET_REQUIRED")
+        elif strategies.is_signal_packet(packet):
+            # STRATEGY_PAPER_PATH_V1 (package plugin-c3): a promoted strategy's signal has no
+            # Jev receipt; lab.managed_review_failure binds the packet to its audited signal and
+            # the owner's promotion. The engine admits only the strategies it is configured for.
+            needed = {"signal_event_seq", "promotion_event_seq", "strategy_id"}
+            if packet["receipt_id"] is not None or not v3 or not needed <= set(packet):
+                raise ValueError("APP_REVIEWED_PACKET_REQUIRED")
+            if packet["strategy_id"] not in self.paper_strategies:
+                raise ValueError("STRATEGY_NOT_CONFIGURED")
         else:
             self.review_store.verify(packet["receipt_id"])
         now = self.now()
@@ -308,7 +442,8 @@ class ManagedExecution:
         crypto_deadline = day_policy.entry_deadline(now) if day_policy else None
         if crypto_deadline is not None and now >= crypto_deadline:
             raise ValueError("CRYPTO_ENTRY_WINDOW_CLOSED")
-        increment = check = None
+        increment = check = plan = None
+        planned = self.trade_plan_active and v3 and trade_plan.applies(packet)
         if packet["market"] == "CRYPTO":
             with self.repo.connect() as conn:
                 admitted = self._admitted(conn, packet)
@@ -326,6 +461,8 @@ class ManagedExecution:
                     self._refuse_crypto_admission(packet, now, increment, off_grid)
                 elif v3:
                     check = self._system_check(packet, live_quote)
+                    if check is not None and planned:
+                        plan = self._trade_plan(packet, check, increment, hourly_range)
         with self.store.transaction() as conn:
             old = self._admitted(conn, packet)
             if old:
@@ -340,6 +477,8 @@ class ManagedExecution:
                 self._v3_ledger_checks(conn, packet)
                 if check is None:  # Only a concurrently admitted receipt gets here.
                     raise AdmissionRefused(LIVE_PRICE_UNAVAILABLE)
+                if planned and plan is None:  # Likewise (CRYPTO_TRADE_PLAN_V1).
+                    raise AdmissionRefused(trade_plan.HOURLY_RANGE_UNAVAILABLE)
             sid = uuid4()
             strategy = (
                 "CATALYST_RETEST_V1"
@@ -368,18 +507,26 @@ class ManagedExecution:
             # The account-risk policy and the randomized control arm are fixed in the admitting
             # transaction and never change: FIXED_EXIT gets no management reviews (the original
             # bracket and mechanical exits only), JEV_MANAGED may be reviewed.
-            arm = assign_arm(sid, self.risk_policy.fixed_exit_arm_pct)
+            arm = (FIXED_EXIT_ARM if self.no_ai
+                   else assign_arm(sid, self.risk_policy.fixed_exit_arm_pct))
             # CRYPTO_24H_REVIEW_V1 (package day-review): the maintained arm's 24-hour
             # continue-or-exit review; the control arm keeps CRYPTO_24H_HOLD_V1 (plan 4.6.6).
             # With MANAGED_CRYPTO_WINDOW_JSON (package review-window): CRYPTO_WINDOW_REVIEW_V1
             # and CRYPTO_WINDOW_HOLD_V1, the window recorded beside the policy.
-            holding = crypto_holding.admission_policy(bool(hold), arm, self.crypto_window)
+            # CRYPTO_TRADE_PLAN_V1 pins its own 24-hour window (the window versions, 1,440
+            # minutes) whatever MANAGED_CRYPTO_WINDOW_JSON says.
+            holding = crypto_holding.admission_policy(
+                bool(hold), arm,
+                trade_plan.CRYPTO_TRADE_PLAN.window_setting() if plan else self.crypto_window)
             self.store.transition(
                 conn,
                 sid,
                 "WATCHING",
-                stop=str(s),
-                target=str(p),
+                # CRYPTO_TRADE_PLAN_V1: the plan's stop and target (the research levels stay in
+                # the packet and in ``trade_plan``); every other setup its research levels.
+                stop=plan["stop"] if plan else str(s),
+                target=plan["target"] if plan else str(p),
+                **({trade_plan.FIELD: plan} if plan else {}),
                 qty="0",
                 lifecycle_id=str(uuid4()),
                 admitted_at=now.isoformat(),
@@ -391,7 +538,8 @@ class ManagedExecution:
                 if day_policy else None,
                 risk_policy_id=self.risk_policy.policy_id,
                 arm=arm,
-                arm_method=ARM_METHOD,
+                # NO_AI_MODE_V1 (package oss-packaging) names itself as the arm's method.
+                arm_method=ai_modes.NO_AI_MODE if self.no_ai else ARM_METHOD,
                 fixed_exit_arm_pct=self.risk_policy.fixed_exit_arm_pct,
                 **({"holding_policy": holding.record()} if holding else {}),
                 # The window versions only: holding_window_seconds, so the trade keeps the
@@ -401,9 +549,11 @@ class ManagedExecution:
                 # trigger versions and measurement. Other packets' states are unchanged.
                 **({"system_check": check, "entry_type": check["entry_type"]} if v3 else {}),
                 # Crypto from report V3 only: CRYPTO_ALPACA_TRIGGER_V1 (package crypto-trigger)
-                # decides this setup's trigger; every other setup keeps today's trigger.
-                **({"trigger_version": crypto_trigger.CRYPTO_TRIGGER_VERSION}
-                   if crypto_trigger.applies(packet) else {}),
+                # decides this setup's trigger; every other setup keeps today's trigger. With the
+                # Coinbase reference feed and a coin with a Coinbase USD product (owner approval
+                # 2026-09-29): CRYPTO_COINBASE_TRIGGER_V1 and its ``reference_product`` instead.
+                **coinbase_trigger.trigger_fields(
+                    packet, reference_feed=self.reference_feed is not None),
                 # The same setups only: CRYPTO_GAP_RESUME_V1 (package gap-resume) holds the
                 # setup for a bar check on a market gap instead of revoking it.
                 **gap_resume.admission_fields(packet),
@@ -415,8 +565,47 @@ class ManagedExecution:
                 # handles a partial entry fill. The control arm and every other setup keep
                 # today's behaviour.
                 **crypto_maintenance.admission_fields(packet, arm),
+                # Every crypto setup (owner, 2026-09-29): CRYPTO_STOP_BREACH_V2 decides when the
+                # stop-limit fallback sells; setups admitted before it keep V1. The setups of
+                # CRYPTO_COINBASE_TRIGGER_V1 record CRYPTO_STOP_BREACH_V3 instead.
+                **(stop_breach.v3_admission_fields() if self._coinbase_reference(packet)
+                   else stop_breach.admission_fields(packet)),
+                # Every crypto setup (owner, 2026-10-02, plan A5): CRYPTO_STOP_BREACH_V4, the
+                # native stop-limit's limit 0.5% below the stop; detection stays V2's or V3's.
+                **stop_breach.limit_admission_fields(packet),
+                # Every setup (owner, 2026-09-29): OPERATOR_PAUSE_ENTRY_WAIT_V1, a trigger during
+                # an operator pause waits instead of ending the setup.
+                **pause_wait.admission_fields(packet),
+                # Every crypto setup (six-day operation, 2026-09-29): CRYPTO_ENTRY_WORKING_LIMIT_V1,
+                # an entry that fills nothing in 300 s, or whose stop trades first, is cancelled.
+                **entry_working.admission_fields(packet),
+                # Crypto setups of an engine with entry pacing (package risk-pacing):
+                # CRYPTO_ENTRY_PACING_V1 makes a trigger wait while entries are paced.
+                **regime_gate.admission_fields(packet, self.entry_pacing),
+                # Report-V3 crypto setups (STRATEGY_REGISTRY_V1, package strategy-c1): the
+                # proposal's strategy and its version; every other setup records nothing.
+                **strategies.admission_fields(packet),
+                # Package exec-d, on an engine with the version switched on only:
+                # CRYPTO_STOP_EXECUTION_V1 for a setup of CRYPTO_STOP_BREACH_V3 (the Coinbase
+                # reference), CRYPTO_MAKER_ENTRY_V1 for a report-V3 crypto PULLBACK entry.
+                **stop_execution.admission_fields(self.crypto_execution.stop_execution,
+                                                  self._coinbase_reference(packet)),
+                **(maker_entry.admission_fields(self.crypto_execution.maker_entry, packet,
+                                                check["entry_type"]) if v3 else {}),
             )
             return sid
+
+    def _coinbase_reference(self, packet):
+        """Whether ``packet`` is admitted under CRYPTO_COINBASE_TRIGGER_V1 and
+        CRYPTO_STOP_BREACH_V3: a report-V3 crypto pick of a coin with a Coinbase USD product, on
+        an engine with the Coinbase reference feed."""
+        return self.reference_feed is not None and coinbase_trigger.applies(packet)
+
+    def _reference_view(self, symbol, product, now):
+        """The coin's Coinbase ``ReferenceView`` at ``now``; unavailable (unhealthy) without the
+        feed or when its read fails, never an exception."""
+        return coinbase_feed.read_view(
+            self.reference_feed, product or coinbase_feed.product_id(symbol), now)
 
     def _admission_checks(self, conn, packet, now):
         """Raise the first ledger reason this packet cannot be admitted; never writes."""
@@ -509,7 +698,15 @@ class ManagedExecution:
     @staticmethod
     def _admitted(conn, packet):
         """The setup already admitted for this packet: by its Jev receipt, or for an operator
-        ENGINEERING_TEST enrollment, which has no receipt, by its enrollment event."""
+        ENGINEERING_TEST enrollment, which has no receipt, by its enrollment event (a strategy
+        signal, STRATEGY_PAPER_PATH_V1: by its signal event)."""
+        if strategies.is_signal_packet(packet):
+            return conn.execute(
+                """SELECT * FROM lab.managed_setups WHERE receipt_id IS NULL
+                AND record_json->>'selection_policy'=%s
+                AND record_json->>'signal_event_seq'=%s""",
+                (strategies.SIGNAL_SELECTION_POLICY, str(packet["signal_event_seq"])),
+            ).fetchone()
         if packet.get("selection_policy") == ENGINEERING_SELECTION_POLICY:
             return conn.execute(
                 """SELECT * FROM lab.managed_setups WHERE receipt_id IS NULL
@@ -521,7 +718,17 @@ class ManagedExecution:
         ).fetchone()
 
     @staticmethod
+    def _receipt_key(packet):
+        """The receipt part of a packet's final-refusal keys: its Jev receipt, or a strategy
+        signal's event (STRATEGY_PAPER_PATH_V1 has no receipt)."""
+        if strategies.is_signal_packet(packet):
+            return f"strategy-signal:{packet['signal_event_seq']}"
+        return str(packet["receipt_id"])
+
+    @staticmethod
     def _crypto_refusal_key(packet):
+        if strategies.is_signal_packet(packet):
+            return "crypto-admission-refused:" + ManagedExecution._receipt_key(packet)
         if packet.get("selection_policy") == ENGINEERING_SELECTION_POLICY:
             return f"crypto-admission-refused:engineering:{packet['enrollment_event_seq']}"
         return "crypto-admission-refused:" + str(packet["receipt_id"])
@@ -572,21 +779,51 @@ class ManagedExecution:
     def _recorded_system_check(conn, packet):
         row = conn.execute(
             "SELECT body FROM lab.managed_events WHERE idempotency_key=%s",
-            (REFUSED_KEY + str(packet["receipt_id"]),),
+            (REFUSED_KEY + ManagedExecution._receipt_key(packet),),
         ).fetchone()
         return row["body"] if row else None
 
+    @staticmethod
+    def _recorded_withdrawal(conn, packet):
+        """The selection's decline by AGENT_RESEARCH_WITHDRAWAL_V1, or None."""
+        row = conn.execute(
+            """SELECT body FROM lab.managed_events WHERE idempotency_key=%s
+            AND kind='RESEARCH_ADMISSION_DECLINED'""",
+            (ADMISSION_DECLINED_KEY + str(packet["selection_event_seq"]),),
+        ).fetchone()
+        return row["body"] if row and row["body"].get("reason") == WITHDRAWN_BY_RESEARCH else None
+
     def _v3_ledger_checks(self, conn, packet):
-        """Raise a V3 packet's recorded system-check refusal, or its run's supersession.
+        """Raise a V3 packet's withdrawal, its recorded system-check refusal, or its run's
+        supersession.
 
         Read under the shared lock in the admitting transaction, which also serializes
-        selection publication, so a pick from a run older than any published V3 selection is
-        never admitted (RESEARCH_RUN_SUPERSESSION_V1). Never writes.
+        selection publication and research withdrawals, so a pick from a run older than any
+        published V3 selection (RESEARCH_RUN_SUPERSESSION_V1; under a V2 schedule, a pick that
+        RESEARCH_RUN_SUPERSESSION_V2 supersedes) or a pick its agent withdrew
+        (AGENT_RESEARCH_WITHDRAWAL_V1, which may decline a selection the runtime is admitting)
+        is never admitted. Never writes.
         """
+        withdrawn = self._recorded_withdrawal(conn, packet)
+        if withdrawn is not None:
+            raise AdmissionRefused(WITHDRAWN_BY_RESEARCH,
+                                   {"withdrawal_id": withdrawn.get("withdrawal_id")})
         prior = self._recorded_system_check(conn, packet)
         if prior is not None:
             raise AdmissionRefused(prior["reason"], {"system_check": prior["system_check"]})
+        if strategies.is_signal_packet(packet):
+            return  # STRATEGY_PAPER_PATH_V1: a strategy signal answers no research run.
         _, slot = v3_facts(packet)
+        if supersession_version(self.research_schedule) == SUPERSESSION_VERSION_V2:
+            newest = superseding_run_slot(self.research_schedule, slot, packet["symbol"],
+                                          newer_v3_selections(conn, slot))
+            if newest is not None:
+                raise AdmissionRefused(SUPERSEDED_BY_NEW_RESEARCH, {
+                    "run_slot": packet["run_slot"],
+                    "superseded_by_run_slot": newest.isoformat(),
+                    "supersession_rule": SUPERSESSION_VERSION_V2,
+                })
+            return
         newest = newest_v3_run_slot(conn)
         if newest is not None and slot < newest:
             raise AdmissionRefused(SUPERSEDED_BY_NEW_RESEARCH, {
@@ -648,10 +885,35 @@ class ManagedExecution:
                         "run_slot": packet["run_slot"],
                         "system_check": evidence,
                     },
-                    key=REFUSED_KEY + str(packet["receipt_id"]),
+                    key=REFUSED_KEY + self._receipt_key(packet),
                 )
         recorded = prior or {"reason": evidence["code"], "system_check": evidence}
         raise AdmissionRefused(recorded["reason"], {"system_check": recorded["system_check"]})
+
+    def _trade_plan(self, packet, check, increment, hourly_range):
+        """The ``CRYPTO_TRADE_PLAN_V1`` record of a V3 pick that passed the system check.
+
+        No hourly range is the transient ``HOURLY_RANGE_UNAVAILABLE`` (with the check and the
+        reader's evidence; the next tick retries both). A plan refusal is final for the
+        receipt: recorded once as the system check's refusal, the plan's evidence inside it, so
+        a top-K pick is replaced as for any system-check refusal. None only when a concurrent
+        admission of the same receipt won.
+        """
+        try:
+            if hourly_range is None:
+                raise trade_plan.HourlyRangeUnavailable("HOURLY_RANGE_NOT_WIRED")
+            value, evidence = hourly_range(packet["symbol"])
+            return trade_plan.plan(packet["levels"], hourly_range=value,
+                                   range_evidence=evidence, increment=increment)
+        except trade_plan.HourlyRangeUnavailable as exc:
+            raise AdmissionRefused(trade_plan.HOURLY_RANGE_UNAVAILABLE, {
+                "system_check": check,
+                "trade_plan": {"policy": trade_plan.CRYPTO_TRADE_PLAN.record(),
+                               "code": exc.code, "hourly_range_evidence": exc.evidence},
+            }) from None
+        except trade_plan.PlanRefused as exc:
+            return self._refuse_system_check(packet, {
+                **check, "result": REFUSED, "code": exc.code, "trade_plan": exc.evidence})
 
     def revoke(self, setup_id, reason, *, watching_only=False, details=None, key=None):
         """Revoke a setup's research evidence: a WATCHING setup is INVALIDATED; a working one
@@ -659,24 +921,12 @@ class ManagedExecution:
 
         ``watching_only`` (research-run supersession) revokes only a setup still WATCHING under
         the shared lock and returns whether it did; ``details`` adds audit fields to the REVOKE
-        body and ``key`` makes the event idempotent. Existing callers are unchanged.
+        body and ``key`` makes the event idempotent. Existing callers are unchanged. The steps
+        are ``ManagedStore.revoke``, in this method's own transaction.
         """
         with self.store.transaction() as conn:
-            if watching_only and self.store.state(conn, setup_id).get("state") != "WATCHING":
-                return False
-            self.store.event(
-                conn, "REVOKE", {"reason": reason, **(details or {})}, setup_id=setup_id, key=key
-            )
-            state = self.store.state(conn, setup_id)
-            if state["state"] not in TERMINAL:
-                self.store.transition(
-                    conn,
-                    setup_id,
-                    "INVALIDATED" if state["state"] == "WATCHING" else state["state"],
-                    revoked=True,
-                    revocation_reason=reason,
-                )
-        return True
+            return self.store.revoke(conn, setup_id, reason, watching_only=watching_only,
+                                     details=details, key=key)
 
     def reconcile(self):
         """Every startup begins unready. Unknown broker inventory/orders block admission."""
@@ -784,6 +1034,10 @@ class ManagedExecution:
                 prior = num(account["last_equity"])
                 if prior <= 0:
                     raise ValueError("PREVIOUS_CLOSE_EQUITY_REQUIRED")
+                day = now.astimezone(NY).date()
+                prior_row = conn.execute(
+                    "SELECT * FROM lab.risk_sessions WHERE session_date=%s", (day,)
+                ).fetchone()
                 event = system_event(
                     self.repo,
                     conn,
@@ -809,6 +1063,13 @@ class ManagedExecution:
                         event["seq"],
                     ),
                 )
+                # RISK_SESSION_BASELINE_V2 (JEV_MANAGED_RISK_V4): the day's basis is the account
+                # equity now, recorded once; a row an earlier process wrote is corrected once.
+                risk_baseline.record(
+                    conn, self.store, policy=self.risk_policy, now=now, account=account,
+                    positions=positions, reconciliation_seq=event["seq"], prior_row=prior_row,
+                    last_clean_day=self._last_clean_day, cohort=COHORT)
+                self._last_clean_day = day
                 if not bound:  # Written once, at the ledger's first clean reconciliation.
                     conn.execute(
                         """INSERT INTO lab.ledger_account_binding(venue,account_hash,
@@ -821,9 +1082,8 @@ class ManagedExecution:
 
     def _account_halt(self, conn, account, positions, cashflow):
         day = self.now().astimezone(NY).date()
-        base = conn.execute(
-            "SELECT * FROM lab.risk_sessions WHERE session_date=%s", (day,)
-        ).fetchone()
+        # V4: RISK_SESSION_BASELINE_V2 (the V2 event); earlier policies: the risk_sessions row.
+        base = risk_baseline.session_baseline(conn, self.risk_policy, day)
         if not base:
             return "STARTUP_RECONCILIATION_REQUIRED"
         unrealized = sum((num(p["unrealized_pl"]) for p in positions), D(0))
@@ -831,7 +1091,11 @@ class ManagedExecution:
         already = conn.execute(
             "SELECT 1 FROM lab.daily_risk_halts WHERE session_date=%s", (day,)
         ).fetchone()
-        if total <= -D(".03") * base["day_start_equity"] and not already:
+        # The engine's policy's hard limit (JEV_MANAGED_RISK_V4, migration 026), else the 3%
+        # every earlier policy has always used; its soft limit is latched for the day below.
+        threshold = daily_loss_threshold(
+            base["day_start_equity"], self.risk_policy.daily_hard_loss_pct())
+        if total <= threshold and not already:
             event = system_event(
                 self.repo,
                 conn,
@@ -846,7 +1110,7 @@ class ManagedExecution:
                     day,
                     total - unrealized,
                     unrealized,
-                    -D(".03") * base["day_start_equity"],
+                    threshold,
                     event["seq"],
                 ),
             )
@@ -854,7 +1118,76 @@ class ManagedExecution:
             "SELECT 1 FROM lab.daily_risk_halts WHERE session_date=%s", (day,)
         ).fetchone():
             return "DAILY_RISK_HALT"
+        self._latch_soft_limit(conn, self.risk_policy, day, total, base)
         return None
+
+    def _latch_soft_limit(self, conn, policy, day, total, base):
+        """``JEV_MANAGED_RISK_V4``: once the day's realized plus unrealized P&L reaches the
+        policy's soft limit, one DAILY_SOFT_LOSS_LIMIT event latches it for the New York day (no
+        new entries under that policy until the next day). True when latched; nothing for a
+        policy without a soft limit."""
+        fraction = policy.daily_soft_loss_pct()
+        if fraction is None:
+            return False
+        day_start = base["day_start_equity"]
+        latch, key = risk_baseline.soft_latch(conn, policy, day)
+        reached = soft_limit_reached(policy, total, day_start)
+        if risk_baseline.pending_decision(conn, latch, base):
+            # RISK_SESSION_BASELINE_V2: a latch recorded on the old basis gets one decision on
+            # the new one (withdrawn above the soft limit, else kept for the day).
+            if risk_baseline.decide(
+                    conn, self.store, policy=policy, day=day, latch=latch, baseline=base,
+                    total=total, threshold=daily_loss_threshold(day_start, fraction),
+                    reached=reached, cohort=COHORT):
+                return True
+            latch, key = risk_baseline.soft_latch(conn, policy, day)
+        if latch is not None:
+            return True
+        if not reached:
+            return False
+        self.store.event(conn, SOFT_LIMIT_EVENT, {
+            "reason": SOFT_LIMIT_REASON, "action": "NO_NEW_ENTRIES",
+            "risk_policy_id": policy.policy_id, "session_date": day, "total_pnl": total,
+            "day_start_equity": day_start, "soft_loss_pct": fraction,
+            "threshold": daily_loss_threshold(day_start, fraction),
+            "protection": "UNCHANGED", "cohort": COHORT,
+        }, key=key)
+        return True
+
+    def _soft_limit_wait(self, conn, setup, policy, now, observation, pnl=None):
+        """``JEV_MANAGED_RISK_V4``: True, with one DAILY_SOFT_LOSS_ENTRY_WAIT per setup and
+        minute, while the setup's policy's soft limit is latched for the New York day. ``pnl``
+        ``(total, baseline)`` may latch it first. The setup keeps WATCHING; its open
+        positions elsewhere keep their protection."""
+        if policy.daily_soft_loss_pct() is None:
+            return False
+        day = now.astimezone(NY).date()
+        if pnl is not None:
+            latched = self._latch_soft_limit(conn, policy, day, *pnl)
+        elif conn.execute(
+            "SELECT 1 FROM lab.daily_risk_halts WHERE session_date=%s", (day,)
+        ).fetchone():
+            return False  # The hard limit stays terminal (DAILY_RISK_HALT), never a wait.
+        else:
+            # A latch awaiting its RISK_SESSION_BASELINE_V2 decision is decided by the full
+            # check under the lock (``pnl``), after the broker read; it is not a wait here.
+            latch = risk_baseline.soft_latch(conn, policy, day)[0]
+            latched = latch is not None and not risk_baseline.pending_decision(
+                conn, latch, risk_baseline.session_baseline(conn, self.risk_policy, day))
+        if not latched:
+            return False
+        key = soft_wait_key(setup["setup_id"], now)
+        if not conn.execute(
+            "SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s", (key,)
+        ).fetchone():
+            self.store.event(conn, SOFT_LIMIT_WAIT_EVENT, {
+                "reason": SOFT_LIMIT_REASON, "version": policy.policy_id,
+                "session_date": day,
+                "trigger": {k: (observation or {}).get(k) for k in regime_gate.TRIGGER_FIELDS
+                            if k in (observation or {})},
+                "waited_at": now.isoformat(),
+            }, setup_id=setup["setup_id"], key=key)
+        return True
 
     def _shared_snapshot(self, *, max_age=None):
         """The request-governed broker snapshot, or None for a directly used broker."""
@@ -991,7 +1324,8 @@ class ManagedExecution:
             with self.store.transaction() as conn:
                 self.store.transition(conn, setup_id, "EXPIRED_UNTRIGGERED", reason="SETUP_EXPIRED")
             return None
-        if crypto_trigger.active(state):
+        if crypto_trigger_rules(state) is not None:
+            # CRYPTO_ALPACA_TRIGGER_V1, or CRYPTO_COINBASE_TRIGGER_V1 (coinbase_trigger.py).
             return self._observe_crypto_trigger(setup, state, observation, now)
         levels = {k: num(v) for k, v in setup["record_json"]["levels"].items()}
         price = num(observation["trade_price"])
@@ -1043,7 +1377,7 @@ class ManagedExecution:
         return self.authorize_entry(setup_id, observation, session)
 
     def _trigger_failure(self, setup, state, observation, session, now):
-        if crypto_trigger.active(state):
+        if crypto_trigger_rules(state) is not None:
             return self._crypto_trigger_failure(setup, state, observation, now)
         try:
             levels = {k: num(v) for k, v in setup["record_json"]["levels"].items()}
@@ -1087,10 +1421,14 @@ class ManagedExecution:
             return "INVALID_MARKET_EVIDENCE"
 
     # --- CRYPTO_ALPACA_TRIGGER_V1 (package crypto-trigger; rules in crypto_trigger.py) --------
+    # CRYPTO_COINBASE_TRIGGER_V1 (coinbase_trigger.py) takes the same path
+    # (``crypto_trigger_rules``): its verdicts, wait record, lock re-check and decision quote
+    # times have V1's shape; only its evaluation (Coinbase touches and stops, Alpaca's
+    # confirmation) and its wait reasons differ.
 
     def _crypto_verdict(self, setup, state, observation, now):
         levels = {k: num(v) for k, v in setup["record_json"]["levels"].items()}
-        return crypto_trigger.evaluate(
+        return crypto_trigger_rules(state).evaluate(
             levels, observation, now=now, admitted_at=datetime.fromisoformat(state["admitted_at"])
         )
 
@@ -1174,7 +1512,8 @@ class ManagedExecution:
             {
                 "reason": verdict.reason,
                 "touch": verdict.touch,
-                "trigger_version": crypto_trigger.CRYPTO_TRIGGER_VERSION,
+                "trigger_version": verdict.evidence.get(
+                    "version", crypto_trigger.CRYPTO_TRIGGER_VERSION),
                 "crypto_trigger": verdict.evidence,
             },
             setup_id=setup_id,
@@ -1184,13 +1523,14 @@ class ManagedExecution:
     def _trigger_confirmed(self, setup, state, observation, now):
         """The TRIGGER_CONFIRMED body: the observation (today), or under this version the
         observation with ``trigger_version`` and the evaluation at confirmation."""
-        if not crypto_trigger.active(state):
+        rules = crypto_trigger_rules(state)
+        if rules is None:
             return observation
         try:
             verdict = self._crypto_verdict(setup, state, observation, now)
         except (KeyError, ValueError, TypeError, ArithmeticError):
             verdict = None
-        return crypto_trigger.body(observation, verdict)
+        return rules.body(observation, verdict)
 
     @staticmethod
     def _capacity_deferred(state, now):
@@ -1270,17 +1610,83 @@ class ManagedExecution:
                 equity,
                 planned,
             )
+            if capacity is None and policy.strategy_caps:
+                # JEV_MANAGED_RISK_V5 (migration 031, package plugin-c3): the per-strategy
+                # open-risk cap; the reservation trigger asks the same SQL question.
+                capacity = strategy_risk_failure(
+                    conn, policy.policy_id, setup["record_json"], equity, planned)
             if capacity is not None and capacity not in CAPACITY_REASONS:
                 reason, capacity = capacity, None
         return sizing.qty, planned, sizing.binding, evidence, ca, reason, capacity
+
+    def _pause_wait(self, conn, setup, state, observation, now):
+        """``OPERATOR_PAUSE_ENTRY_WAIT_V1`` (pause_wait.py): True, with the wait recorded once per
+        setup and minute, for a WATCHING setup of the version while every unreleased halt is an
+        operator pause and no daily-loss halt is recorded for the New York day. False leaves the
+        trigger to today's path, where a halt is the terminal RISK_HALT."""
+        if state.get("state") != "WATCHING" or not pause_wait.active(state):
+            return False
+        halts = pause_wait.pause_halts(conn)
+        if not halts or conn.execute(
+            "SELECT 1 FROM lab.daily_risk_halts WHERE session_date=%s",
+            (now.astimezone(NY).date(),),
+        ).fetchone():
+            return False
+        key = pause_wait.wait_key(setup["setup_id"], now)
+        if not conn.execute(
+            "SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s", (key,)
+        ).fetchone():
+            self.store.event(
+                conn, pause_wait.WAIT_EVENT, pause_wait.wait_body(halts, observation, now),
+                setup_id=setup["setup_id"], key=key,
+            )
+        return True
+
+    def _pacing_wait(self, conn, setup, state, observation, now):
+        """``CRYPTO_ENTRY_PACING_V1`` (regime_gate.py): True, with the wait recorded once per
+        setup and minute, for a WATCHING setup of the version while a pacing rule holds new
+        entries back. Never a refusal: the setup keeps WATCHING."""
+        if state.get("state") != "WATCHING" or not regime_gate.active(state):
+            return False
+        blocked = regime_gate.block(self.entry_pacing, conn, now)
+        if blocked is None:
+            return False
+        key = regime_gate.wait_key(setup["setup_id"], now)
+        if not conn.execute(
+            "SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s", (key,)
+        ).fetchone():
+            self.store.event(
+                conn, regime_gate.WAIT_EVENT, regime_gate.wait_body(*blocked, observation, now),
+                setup_id=setup["setup_id"], key=key,
+            )
+        return True
 
     def authorize_entry(self, setup_id, observation, session):
         setup, current = self._load(setup_id)
         if current.get("state") == "WATCHING" and self._capacity_deferred(current, self.now()):
             return None  # Capacity cooldown: triggers are skipped before any broker read.
+        if pause_wait.active(current):
+            # OPERATOR_PAUSE_ENTRY_WAIT_V1: while only operator pauses halt entries, a trigger
+            # waits before any broker read; the check repeats under the lock below.
+            with self.repo.connect() as conn:
+                paused = bool(pause_wait.pause_halts(conn))
+            if paused:
+                with self.store.transaction() as conn:
+                    if self._pause_wait(conn, setup, self.store.state(conn, setup_id),
+                                        observation, self.now()):
+                        return None
         # Each setup is evaluated under the policy recorded at its admission; setups admitted
         # before migration 016 carry none and keep the schema-13 numbers.
         policy = self._risk_policy(current.get("risk_policy_id") or LEGACY_MANAGED_POLICY_ID)
+        if regime_gate.active(current) or policy.daily_soft_loss_pct() is not None:
+            # CRYPTO_ENTRY_PACING_V1 and the V4 soft loss limit (package risk-pacing): a trigger
+            # waits before any broker read; both checks repeat under the lock below.
+            with self.store.transaction() as conn:
+                now, state = self.now(), self.store.state(conn, setup_id)
+                if self._pacing_wait(conn, setup, state, observation, now) or (
+                        state.get("state") == "WATCHING"
+                        and self._soft_limit_wait(conn, setup, policy, now, observation)):
+                    return None
         eligibility = validate_managed_eligibility(
             self.broker,
             setup["record_json"],
@@ -1302,8 +1708,13 @@ class ManagedExecution:
             now = self.now()
             if self._capacity_deferred(state, now):
                 return None
+            if self._pause_wait(conn, setup, state, observation, now):
+                return None  # A pause that began during the reads above.
+            if self._pacing_wait(conn, setup, state, observation, now):
+                return None  # CRYPTO_ENTRY_PACING_V1: an entry approved meanwhile, say.
             reason = self._trigger_failure(setup, state, observation, session, now)
-            if reason in crypto_trigger.WAIT_REASONS:  # CRYPTO_ALPACA_TRIGGER_V1 only.
+            rules = crypto_trigger_rules(state)  # The crypto trigger versions only.
+            if rules is not None and reason in rules.WAIT_REASONS:
                 return self._record_trigger_wait(conn, setup, state, observation, now)
             reservations = conn.execute("SELECT * FROM lab.account_risk_reservations").fetchall()
             classification = conn.execute(
@@ -1320,13 +1731,22 @@ class ManagedExecution:
             elif conn.execute("SELECT 1 FROM lab.execution_halts LIMIT 1").fetchone():
                 reason = "RISK_HALT"
             daily_failure = self._account_halt(conn, account, positions, cashflow)
+            if not daily_failure and policy.daily_soft_loss_pct() is not None:
+                base = risk_baseline.session_baseline(
+                    conn, self.risk_policy, now.astimezone(NY).date())
+                if base and self._soft_limit_wait(
+                        conn, setup, policy, now, observation,
+                        (equity - base["day_start_equity"] - cashflow, base)):
+                    return None  # JEV_MANAGED_RISK_V4: the soft loss limit; no new entry.
             review_failure = conn.execute(
                 "SELECT lab.managed_review_failure(%s) AS reason", (Jsonb(setup["record_json"]),)
             ).fetchone()["reason"]
             # ``reason`` is terminal. ``capacity`` (the account is full right now) keeps the
             # setup WATCHING under a policy with a cooldown, and only when nothing else fails.
             reason = daily_failure or reason or eligibility["reason"] or review_failure
-            levels = {k: num(v) for k, v in setup["record_json"]["levels"].items()}
+            # CRYPTO_TRADE_PLAN_V1: sized on the plan's stop (same dollars at risk, fewer coins).
+            levels = trade_plan.initial_levels(
+                {k: num(v) for k, v in setup["record_json"]["levels"].items()}, state)
             m, s = levels["max_entry_price"], levels["stop"]
             # JEV_MANAGED_RISK_V3 crypto (migration 022) sizes in equity slices and checks the
             # account on the actual planned risk (``_slice_entry``); other markets and policies
@@ -1385,10 +1805,13 @@ class ManagedExecution:
                     reason = reason or "CRYPTO_VENUE_PARTICIPATION_LIMIT"
                 self.store.event(conn, "CRYPTO_LIQUIDITY", liquidity, setup_id=setup_id)
             payload = {}
+            entry_execution = None  # CRYPTO_MAKER_ENTRY_V1 setups only.
             if setup["market"] == "CRYPTO" and terms is not None:
                 if not reason and not capacity:
                     try:  # Already on the coin's quantity increment (``_slice_entry``).
-                        payload = build_limit_entry(slice_asset, qty, m,
+                        price, entry_execution = self._entry_price(
+                            setup, state, slice_asset, m, observation)
+                        payload = build_limit_entry(slice_asset, qty, price,
                                                     operation_key=str(setup_id))
                     except CryptoExecutionError as error:
                         reason = str(error)
@@ -1407,7 +1830,9 @@ class ManagedExecution:
                         else:
                             reason = reason or "ZERO_SHARE_SIZE"
                     if not reason and not capacity:
-                        payload = build_limit_entry(ca, qty, m, operation_key=str(setup_id))
+                        price, entry_execution = self._entry_price(
+                            setup, state, ca, m, observation)
+                        payload = build_limit_entry(ca, qty, price, operation_key=str(setup_id))
                 except CryptoExecutionError as error:
                     # Venue metadata or precision refuses this entry; it never escapes the tick.
                     reason = reason or str(error)
@@ -1497,7 +1922,10 @@ class ManagedExecution:
                 )
             context = {
                 # CRYPTO_ALPACA_TRIGGER_V1: the read time, with both times; others unchanged.
-                **crypto_trigger.decision_quote(state, observation),
+                # CRYPTO_COINBASE_TRIGGER_V1: the same Alpaca read time and its Coinbase product.
+                **(coinbase_trigger.decision_quote(state, observation)
+                   if coinbase_trigger.active(state)
+                   else crypto_trigger.decision_quote(state, observation)),
                 "crypto_liquidity": liquidity,
                 "session_date": now.astimezone(NY).date(),
                 "entry_deadline": min(
@@ -1518,6 +1946,10 @@ class ManagedExecution:
                 "buying_power": buying_power.evidence if buying_power else None,
                 "account_margin": {k: account.get(k) for k in MARGIN_FIELDS},
                 "capacity_deferred_until": until,
+                # CRYPTO_ENTRY_PACING_V1 setups only: the engine-clock time the rate counts.
+                **regime_gate.decision_fields(state, now),
+                # CRYPTO_MAKER_ENTRY_V1 setups only: the resting entry's price and its basis.
+                **({"entry_execution": entry_execution} if entry_execution and payload else {}),
             }
             decision = self._decision(
                 conn,
@@ -1570,6 +2002,18 @@ class ManagedExecution:
             self._after_entry_dispatch(decision)
         return decision
 
+    @staticmethod
+    def _entry_price(setup, state, asset, max_entry, observation):
+        """The crypto entry's limit price: M (every setup), or under ``CRYPTO_MAKER_ENTRY_V1``
+        (maker_entry.py) the lower of the entry trigger and the fresh Alpaca bid, on the grid;
+        ``(price, evidence or None)``."""
+        if not maker_entry.active(state):
+            return max_entry, None
+        return maker_entry.entry_limit(
+            asset.price_increment,
+            entry_trigger=num(setup["record_json"]["levels"]["entry_trigger"]),
+            max_entry=max_entry, observation=observation, stop=num(state["stop"]))
+
     def _after_entry_dispatch(self, decision):
         """A broker margin refusal of an entry forces re-reconciliation before any further
         entry; it never latches a halt by itself (plan 2.3, recommended ruling 16)."""
@@ -1589,15 +2033,17 @@ class ManagedExecution:
                 key="margin-reconcile:" + str(decision["decision_id"]),
             )
 
-    def dispatch(self, decision):
+    def dispatch(self, decision, *, entry_orders=None):
         """Recover pending decisions without issuing a new client order ID.
 
         A gate refusal sent nothing: it is recorded as AUTHORIZATION_NOT_CLAIMED, never
         latches, and the next tick decides again from fresh broker state. A rejected price
         amendment reverts the desired levels to the broker-acknowledged ones and never
         requests an exit; only a rejected protective order (which is proposed solely for
-        inventory without protection) requests one. A rejected close schedules its retry
-        (``_exit_refused``).
+        inventory without protection) requests one, except under CRYPTO_PARTIAL_ENTRY_V1 while
+        an entry order still worked (``_partial_entry_protection_refused``). A rejected close
+        schedules its retry (``_exit_refused``). ``entry_orders``: the setup's entry orders not
+        yet terminal in the broker view the request was authorized on (None: not known).
         """
         if decision["outcome"] != "APPROVED":
             return None
@@ -1625,7 +2071,9 @@ class ManagedExecution:
             elif decision["action"] == "PROTECT":
                 with self.store.transaction() as conn:
                     current = self.store.state(conn, decision["setup_id"])
-                    if self._partial_entry_protection_refused(conn, decision, current, reason):
+                    if self._partial_entry_protection_refused(
+                        conn, decision, current, reason, entry_orders
+                    ):
                         return None
                     self.store.transition(
                         conn,
@@ -1641,12 +2089,20 @@ class ManagedExecution:
                     self.store.transition(conn, decision["setup_id"], "REJECTED", reason=reason)
                     self._release(conn, decision["setup_id"], "BROKER_REJECTED")
             return None
-        self._ack(decision, response)
+        self._ack(decision, response, entry_window=False)
         if decision["action"] == "ENTRY":
             with self.store.transaction() as conn:
                 state = self.store.state(conn, decision["setup_id"])
+                # CRYPTO_ENTRY_WORKING_LIMIT_V1: the fill window starts at the acknowledgement.
+                acknowledged = entry_working.acknowledgement_fields(state, self.now())
                 if state["state"] == "ENTRY_PENDING":
-                    self.store.transition(conn, decision["setup_id"], "ORDER_SUBMITTED")
+                    self.store.transition(
+                        conn, decision["setup_id"], "ORDER_SUBMITTED", **acknowledged
+                    )
+                elif acknowledged and state["state"] not in TERMINAL:
+                    self.store.transition(
+                        conn, decision["setup_id"], state["state"], **acknowledged
+                    )
         return response
 
     def _authorization_not_claimed(self, decision, exc):
@@ -1857,7 +2313,10 @@ class ManagedExecution:
                     amendment_context_hash=None,
                 )
 
-    def _ack(self, decision, response):
+    def _ack(self, decision, response, *, entry_window=True):
+        """Record the broker's acknowledgement of a decision once. For an entry, ``entry_window``
+        also records its ``entry_acknowledged_at`` (CRYPTO_ENTRY_WORKING_LIMIT_V1) here;
+        ``dispatch`` records it with the ORDER_SUBMITTED revision instead."""
         from catalyst_lab.managed_broker import sanitize_broker_payload
 
         safe, _ = sanitize_broker_payload(response)
@@ -1879,6 +2338,17 @@ class ManagedExecution:
         )
         if decision["action"] == "EXIT":
             self._exit_accepted(decision["setup_id"])
+        elif decision["action"] == "ENTRY" and entry_window:
+            self._entry_acknowledged(decision["setup_id"])
+
+    def _entry_acknowledged(self, setup_id):
+        """CRYPTO_ENTRY_WORKING_LIMIT_V1: an entry acknowledged outside ``dispatch`` (located after
+        a lost response, or recovered at a restart) starts its fill window now."""
+        with self.store.transaction() as conn:
+            state = self.store.state(conn, setup_id)
+            acknowledged = entry_working.acknowledgement_fields(state, self.now())
+            if acknowledged and state.get("state") not in TERMINAL:
+                self.store.transition(conn, setup_id, state["state"], **acknowledged)
 
     def _follow_replacement(self, order, fetch=None):
         seen = set()
@@ -2353,16 +2823,28 @@ class ManagedExecution:
         (``lookback`` widens that window defensively; nothing is read before the
         earliest recorded fill on the first run), and a failure here is recorded but
         never blocks trading, protection or reconciliation. Matching a fee to a fill
-        (by broker order id and time) and the append-only import happen in
+        (by broker order id and time, or ALPACA_FEE_MATCH_V2 for a row without an order
+        id) and the append-only import happen in
         ``managed_analytics.import_alpaca_fee_activities``; this method only owns the
         bounded broker read and the window.
 
         The completion event is appended only when this run's counts differ from the last
         recorded run's, or ``refresh`` (``FEE_BACKFILL_REFRESH``) after it, in database
-        time, so an idle account adds two an hour instead of one per run; the window stays
-        at most ``lookback`` plus ``refresh``.
+        time, so an idle account adds two an hour instead of one per run; the anchored
+        window stays at most ``lookback`` plus ``refresh``.
+
+        ALPACA_FEE_MATCH_V2 (2026-09-29): Alpaca filters the read by activity date and posts
+        some fees hours after their fill, so the window also reaches back to the earliest
+        fill still without fee evidence, less ``lookback``, at most ``FEE_PENDING_MAX_AGE``
+        (7 days); the anchored window is kept when it is earlier. The fills read reach 24
+        hours before the earliest activity read (``fee_match_fills_after``).
         """
-        from catalyst_lab.managed_analytics import import_alpaca_fee_activities
+        from catalyst_lab.managed_analytics import (
+            fee_match_fills,
+            fee_match_fills_after,
+            import_alpaca_fee_activities,
+            pending_fee_window_start,
+        )
 
         lookback = FEE_BACKFILL_LOOKBACK if lookback is None else lookback
         refresh = FEE_BACKFILL_REFRESH if refresh is None else refresh
@@ -2377,19 +2859,21 @@ class ManagedExecution:
                 anchor = conn.execute(
                     "SELECT min(filled_at) AS at FROM lab.managed_fills"
                 ).fetchone()["at"]
+            pending = pending_fee_window_start(conn, now=self.now(), lookback=lookback)
         after = anchor - lookback if anchor is not None else None
+        if pending is not None and (after is None or pending < after):
+            after = pending
         summary = {
             "window_after": after, "activities_read": 0, "matched": 0,
             "already_recorded": 0, "unmatched": 0, "invalid": 0, "conflicting": 0,
+            "ambiguous": 0,
         }
         if after is None:
             return summary  # No fill has ever been recorded; nothing to bind a fee to yet.
         with request_priority(RESEARCH):
             activities = self.broker.fee_activities_since(after)
         with self.repo.connect() as conn:
-            fills = conn.execute(
-                "SELECT * FROM lab.managed_fills WHERE filled_at>=%s", (after,)
-            ).fetchall()
+            fills = fee_match_fills(conn, fee_match_fills_after(after, activities))
         summary.update(
             import_alpaca_fee_activities(self.store, fills, activities, recorded_at=self.now())
         )
@@ -2468,7 +2952,7 @@ class ManagedExecution:
                 elif d["expires_at"] > self.now():
                     # Crash before sending: same unconsumed row, no new reservation or order ID.
                     if not read_only:
-                        self.dispatch(d)
+                        self.dispatch(d, entry_orders=working_entries(orders.values(), roles))
                     uncertain.append(client_id)
                 elif not read_only:
                     self._event(
@@ -2551,7 +3035,8 @@ class ManagedExecution:
                         or set(payload) != {"stop_price", "limit_price"}):
                     raise ValueError("OWNED_PROTECTION_REQUIRED")
                 native_stop, native_limit = native_stop_levels(
-                    CryptoAsset.from_broker(self.broker.asset(setup["symbol"])), num(state["stop"])
+                    CryptoAsset.from_broker(self.broker.asset(setup["symbol"])), num(state["stop"]),
+                    stop_breach.limit_cushion(state),  # CRYPTO_STOP_BREACH_V4's, else one tick.
                 )
                 desired = {"stop_price": native_stop, "limit_price": native_limit}
             else:
@@ -2615,7 +3100,9 @@ class ManagedExecution:
                 path=path,
                 reason=reason,
             )
-        return self.dispatch(decision)
+        # The entry orders working at the broker in the view this request was authorized on:
+        # a refused protection is judged on them, not on the state when the refusal arrives.
+        return self.dispatch(decision, entry_orders=working_entries(open_orders, roles))
 
     def _fresh_management_plan(self, setup, state, observation):
         if not state.get("amendment_expires_at") or not state.get("amendment_context_hash"):
@@ -2642,6 +3129,7 @@ class ManagedExecution:
             fresh = (
                 observation
                 and observation.get("feed_healthy")
+                and observation.get("quote_at")  # A print with no quote yet is not fresh.
                 and 0
                 <= (now - datetime.fromisoformat(observation["quote_at"])).total_seconds()
                 <= 5
@@ -2992,29 +3480,94 @@ class ManagedExecution:
                     "CLOSED",
                     qty="0",
                     closed_at=now.isoformat(),
-                    reason=state.get("exit_requested") or "BROKER_EXIT",
+                    # CRYPTO_ENTRY_WORKING_LIMIT_V1: an entry the version ended with nothing filled
+                    # closes under its reason (decided only while no exit was requested).
+                    reason=(entry_working.decided(state) if unfilled_entry else None)
+                    or state.get("exit_requested") or "BROKER_EXIT",
                 )
                 self._release(conn, setup_id, "BROKER_AND_ORDERS_FLAT")
+                if stop_execution.active(state) and not unfilled_entry:
+                    # CRYPTO_STOP_EXECUTION_V1: the exit's path and slippage, once per lifecycle.
+                    closed = self.store.state(conn, setup_id)
+                    try:
+                        with conn.transaction():  # A measurement never blocks the close.
+                            summary = execution_quality.exit_summary(conn, setup_id, closed)
+                    except Exception as exc:  # noqa: BLE001 - recorded as its code only.
+                        summary = {"version": stop_execution.VERSION,
+                                   "lifecycle_id": closed.get("lifecycle_id"),
+                                   "error": error_code(exc)}
+                    self.store.event(
+                        conn, stop_execution.RESULT_EVENT, summary,
+                        setup_id=setup_id,
+                        key=f"stop-execution-result:{setup_id}:{closed.get('lifecycle_id')}",
+                    )
             return self._load(setup_id)[1]
         if setup["market"] == "CRYPTO":
             asset = CryptoAsset.from_broker(self.broker.asset(setup["symbol"]))
             stop = num(state["stop"])
-            stop_limit = max(asset.price_increment, stop - asset.price_increment)
+            # One tick below the stop, or CRYPTO_STOP_BREACH_V4's recorded cushion below it.
+            stop_limit = stop_limit_price(asset, stop, stop_breach.limit_cushion(state))
+            # After a market gap the runtime's observation can hold a print and no quote (the
+            # coin's first message was a trade): no quote is no fresh quote.
             quote_fresh = (
                 observation
                 and observation.get("feed_healthy")
+                and observation.get("quote_at")
                 and 0
                 <= (now - datetime.fromisoformat(observation["quote_at"])).total_seconds()
                 <= 5
             )
             bid = num(observation["bid"]) if quote_fresh else None
-            breached_at = state.get("stop_breached_at")
-            if bid is not None and bid <= stop and not breached_at:
-                breached_at = now.isoformat()
-                with self.store.transaction() as conn:
-                    state = self.store.transition(
-                        conn, setup_id, state["state"], stop_breached_at=breached_at
-                    )
+            unfilled_cancel = None
+            if (entry_working.active(state) and qty == 0 and unfilled_entry
+                    and not state.get("exit_requested")):
+                # CRYPTO_ENTRY_WORKING_LIMIT_V1 (entry_working.py): an entry that has filled
+                # nothing is cancelled once its stop's evidence trades or its fill window ends.
+                state, unfilled_cancel = self._entry_working(
+                    setup, state, orders, roles, observation, bid, now
+                )
+            reference = None
+            if stop_execution.active(state):
+                # CRYPTO_STOP_EXECUTION_V1 (stop_execution.py): the breach is confirmed on
+                # Coinbase prints (two, or one held 3 s) and the app exits it itself (collared IOC,
+                # then market); while Coinbase is unhealthy V3's fallback and today's exit apply.
+                reference = self._reference_view(
+                    setup["symbol"], state.get("reference_product"), now)
+                if qty > 0:
+                    state = self._stop_breach_marks(setup_id, state, observation, bid, now,
+                                                    reference=reference)
+                # The app's own exit is requested at once; only a fallback breach waits for the
+                # native stop-limit's 5 s.
+                breached_at = (None if stop_execution.emulated(state)
+                               else state.get("stop_breached_at"))
+                protection_policy = stop_breach.PROTECTION_POLICY
+            elif stop_breach.active(state):
+                # CRYPTO_STOP_BREACH_V2 (stop_breach.py): a print or a held bid establishes the
+                # breach, the marks belong to their stop, and the fallback waits 5 s.
+                if qty > 0:
+                    state = self._stop_breach_marks(setup_id, state, observation, bid, now)
+                breached_at = state.get("stop_breached_at")
+                protection_policy = stop_breach.PROTECTION_POLICY
+            elif stop_breach.active_v3(state):
+                # CRYPTO_STOP_BREACH_V3 (stop_breach.py): a Coinbase print at or below the stop
+                # while Coinbase's feed is healthy for the coin; V2's Alpaca evidence while it is
+                # not. The fallback waits 5 s, as V2.
+                if qty > 0:
+                    reference = self._reference_view(
+                        setup["symbol"], state.get("reference_product"), now)
+                    state = self._stop_breach_marks(setup_id, state, observation, bid, now,
+                                                    reference=reference)
+                breached_at = state.get("stop_breached_at")
+                protection_policy = stop_breach.PROTECTION_POLICY
+            else:
+                breached_at = state.get("stop_breached_at")
+                if bid is not None and core.reaches_stop(bid, stop) and not breached_at:
+                    breached_at = now.isoformat()
+                    with self.store.transaction() as conn:
+                        state = self.store.transition(
+                            conn, setup_id, state["state"], stop_breached_at=breached_at
+                        )
+                protection_policy = CryptoProtectionPolicy(D(5), D(5), D(2))
             crypto_orders = tuple(
                 CryptoOrder(
                     o["id"],
@@ -3035,8 +3588,8 @@ class ManagedExecution:
                 for o in orders
             )
             # CRYPTO_PARTIAL_ENTRY_V1 and CRYPTO_MAINTENANCE_V1 (package maintenance) only; every
-            # other setup plans exactly as before (the planner's defaults).
-            retain, entry_reason, replace = False, "CANCEL_REMAINING_ENTRY", "CANCEL"
+            # other setup plans exactly as before (the planner's defaults: ``retain`` None).
+            retain, entry_reason, replace = None, "CANCEL_REMAINING_ENTRY", "CANCEL"
             if crypto_maintenance.active(state) and qty > 0:
                 self._maintenance_open_records(setup, state, crypto_orders, position, now)
                 state = self._maintenance_stop_watch(setup, state, crypto_orders, asset, bid, now)
@@ -3048,6 +3601,11 @@ class ManagedExecution:
                     setup, state, crypto_orders, observation if quote_fresh else None, now
                 )
             reserved = sum((o.remaining for o in crypto_orders if o.role != "ENTRY"), D(0))
+            exit_limit = cancel_exit = collar_basis = None
+            if stop_execution.active(state) and qty > 0 and (
+                    state.get("exit_requested") == stop_execution.EXIT_REASON):
+                state, exit_limit, cancel_exit, collar_basis = self._stop_collar(
+                    setup, state, crypto_orders, asset, reference, now)
             snap = CryptoSnapshot(
                 str(state["revision"]),
                 now,
@@ -3066,7 +3624,7 @@ class ManagedExecution:
             plan = plan_crypto_recovery(
                 asset,
                 snap,
-                CryptoProtectionPolicy(D(5), D(5), D(2)),
+                protection_policy,
                 now=now,
                 operation_key=str(setup_id),
                 stop=stop,
@@ -3082,6 +3640,9 @@ class ManagedExecution:
                 replace_stop=replace,
                 protect_after_entries=state.get("partial_entry_cancel")
                 == crypto_maintenance.PARTIAL_ENTRY_PROTECTION_REFUSED,
+                unfilled_entry_cancel=unfilled_cancel,
+                exit_limit=exit_limit,
+                cancel_exit=cancel_exit,
             )
             with self.store.transaction() as conn:
                 # Details (e.g. a stop raised to the broker grid) exist only for off-grid levels.
@@ -3132,6 +3693,11 @@ class ManagedExecution:
                         conn, setup_id, state["state"], exit_requested=plan.reason
                     )
             for proposal in plan.proposals:
+                if (proposal.action == "CRYPTO_EXIT"
+                        and proposal.reason == stop_execution.COLLAR_REASON
+                        and not self._record_collar(setup_id, proposal, collar_basis,
+                                                    reference, bid, now)):
+                    continue  # CRYPTO_STOP_EXECUTION_V1: recorded before it is authorized.
                 # A close follows the refused-close backoff and never reuses a spent ID.
                 if proposal.action == "CRYPTO_EXIT" and not self._close_permitted(
                     setup_id, proposal.payload["client_order_id"], int(snap.revision)
@@ -3147,6 +3713,123 @@ class ManagedExecution:
                 )
             return plan
         return self._manage_stock(setup, state, orders, roles, position, observation)
+
+    def _stop_collar(self, setup, state, orders, asset, reference, now):
+        """``CRYPTO_STOP_EXECUTION_V1``: what the emulated stop's exit sends this pass:
+        ``(state, exit_limit, cancel_exit, basis)`` for ``plan_crypto_recovery``.
+
+        Before any collar: the collar priced off the reference (``exit_limit``; ``basis`` is the
+        reference price and print it was set from). With the reference unhealthy once nothing
+        else works at the broker (the moment the exit would be sent), a recorded skip: the market
+        sell follows. A recorded collar never sent is offered again, same price and ID, until
+        its wait ends. A collar still working after its wait is cancelled (``cancel_exit``);
+        once no exit works the planner's market sell takes whatever remains."""
+        setup_id = setup["setup_id"]
+        collar = state.get(stop_execution.COLLAR_FIELD)
+        if not isinstance(collar, dict):
+            found = stop_execution.collar_reference(
+                reference, state.get("stop_breach_evidence"), now)
+            if found is None:
+                if any(o.active for o in orders):
+                    return state, None, None, None  # Cancels first; decide at the exit.
+                with self.store.transaction() as conn:
+                    current = self.store.state(conn, setup_id)
+                    if current.get("revision") != state.get("revision"):
+                        return current, None, None, None
+                    skipped = stop_execution.skipped_record(
+                        stop_execution.REFERENCE_UNHEALTHY_AT_EXIT, now)
+                    self.store.event(
+                        conn, stop_execution.COLLAR_EVENT,
+                        {**skipped, "lifecycle_id": state.get("lifecycle_id"),
+                         "stop": state.get("stop"),
+                         "reference": stop_execution.reference_record(reference)},
+                        setup_id=setup_id,
+                        key=f"stop-execution-collar:{setup_id}:{state.get('lifecycle_id')}")
+                    state = self.store.transition(
+                        conn, setup_id, current["state"],
+                        **{stop_execution.COLLAR_FIELD: skipped})
+                return state, None, None, None
+            limit = collar_price(asset, found[0], stop_execution.COLLAR_FRACTION)
+            return state, (limit, stop_execution.collar_key(setup_id, state),
+                           stop_execution.COLLAR_REASON), None, found
+        if collar.get("status") != "PLANNED":
+            return state, None, None, None
+        order = next((o for o in orders if o.client_order_id == collar["client_order_id"]), None)
+        waited = stop_execution.collar_waited(collar, now)
+        if order is None:
+            with self.repo.connect() as conn:
+                sent = conn.execute(
+                    """SELECT 1 FROM lab.managed_risk_decisions WHERE outcome='APPROVED'
+                    AND method='POST' AND payload->>'client_order_id'=%s""",
+                    (collar["client_order_id"],),
+                ).fetchone()
+            if sent or waited:
+                return state, None, None, None  # Sent and gone (refused), or too late: market.
+            return state, (D(collar["limit_price"]), stop_execution.collar_key(setup_id, state),
+                           stop_execution.COLLAR_REASON), None, None
+        if order.active and waited:
+            return state, None, stop_execution.COLLAR_CANCEL_REASON, None
+        return state, None, None, None
+
+    def _record_collar(self, setup_id, proposal, basis, reference, bid, now):
+        """Record the collar (``stop_execution_collar`` and ``STOP_EXECUTION_COLLAR``) before its
+        authorization, once; True for the recorded collar's own request, False when the setup
+        moved meanwhile."""
+        payload = proposal.payload
+        with self.store.transaction() as conn:
+            current = self.store.state(conn, setup_id)
+            if current.get("state") in TERMINAL or (
+                    current.get("exit_requested") != stop_execution.EXIT_REASON):
+                return False
+            recorded = current.get(stop_execution.COLLAR_FIELD)
+            if isinstance(recorded, dict):
+                return recorded.get("client_order_id") == payload["client_order_id"]
+            if basis is None:
+                return False
+            collar = stop_execution.collar_record(
+                limit=payload["limit_price"], reference_price=basis[0],
+                reference_print=basis[1], client_order_id=payload["client_order_id"],
+                qty=payload["qty"], bid=bid, now=now)
+            self.store.event(
+                conn, stop_execution.COLLAR_EVENT,
+                {**collar, "lifecycle_id": current.get("lifecycle_id"),
+                 "stop": current.get("stop"),
+                 "reference": stop_execution.reference_record(reference)},
+                setup_id=setup_id,
+                key=f"stop-execution-collar:{setup_id}:{current.get('lifecycle_id')}")
+            self.store.transition(conn, setup_id, current["state"],
+                                  **{stop_execution.COLLAR_FIELD: collar})
+        return True
+
+    def _stop_breach_marks(self, setup_id, state, observation, bid, now, *, reference=None):
+        """``CRYPTO_STOP_BREACH_V2``: this pass's breach marks (``stop_breach.evaluate``) for an
+        open position, recorded in one revision only when they change, with
+        ``STOP_BREACH_ESTABLISHED`` when the pass establishes the breach.
+        ``CRYPTO_STOP_BREACH_V3`` the same way (``stop_breach.evaluate_v3``, with the coin's
+        Coinbase ``reference``)."""
+        if stop_execution.active(state):
+            changes, breach = stop_execution.evaluate(
+                state, observation=observation, bid=bid, reference=reference, now=now)
+        elif stop_breach.active_v3(state):
+            changes, breach = stop_breach.evaluate_v3(
+                state, observation=observation, bid=bid, reference=reference, now=now)
+        else:
+            changes, breach = stop_breach.evaluate(state, observation=observation, bid=bid,
+                                                   now=now)
+        if not changes:
+            return state
+        with self.store.transaction() as conn:
+            current = self.store.state(conn, setup_id)
+            if current.get("revision") != state.get("revision") or current.get("state") in TERMINAL:
+                return current  # Moved meanwhile: the next pass measures again.
+            if current.get("stop") != state.get("stop"):
+                # The levels in force before a pending model amendment (``_fresh_management_plan``)
+                # are protected this pass but never recorded as the setup's marks.
+                return state
+            if breach is not None:
+                self.store.event(conn, stop_breach.ESTABLISHED_EVENT, breach, setup_id=setup_id,
+                                 key=stop_breach.established_key(setup_id, breach))
+            return self.store.transition(conn, setup_id, current["state"], **changes)
 
     def _authorized_levels(self, setup_id):
         """Every stop and target price this setup's own decisions put on its bracket legs."""
@@ -3279,7 +3962,8 @@ class ManagedExecution:
         if qty > 0 and observation and observation["feed_healthy"]:
             now = self.now()
             if (
-                not 0
+                not observation.get("quote_at")  # A print with no quote yet is not fresh.
+                or not 0
                 <= (now - datetime.fromisoformat(observation["quote_at"])).total_seconds()
                 <= 5
             ):
@@ -3324,7 +4008,9 @@ class ManagedExecution:
                    if (str(sid), lifecycle, kind) not in memo]
         if not pending:
             return
-        levels = {k: num(v) for k, v in setup["record_json"]["levels"].items()}
+        # CRYPTO_TRADE_PLAN_V1: the plan's stop and target are the trade's initial levels.
+        levels = trade_plan.initial_levels(
+            {k: num(v) for k, v in setup["record_json"]["levels"].items()}, state)
         risk = crypto_maintenance.r_per_coin(levels)
         with self.store.transaction() as conn:
             fills = conn.execute(
@@ -3378,6 +4064,65 @@ class ManagedExecution:
                     self.store.event(conn, kind, body, setup_id=sid, key=key)
                 memo.add((str(sid), lifecycle, kind))
 
+    def _entry_working(self, setup, state, orders, roles, observation, bid, now):
+        """CRYPTO_ENTRY_WORKING_LIMIT_V1 for an entry that has filled nothing: ``(state, reason)``,
+        the reason once the version has ended the entry (this pass or an earlier one), else None.
+
+        The stop's evidence is checked first (``entry_working.stop_crossed``, the setup's own stop
+        rule on the entry's marks), then the fill window. The decision is final for the lifecycle:
+        ``ENTRY_WORKING_CANCEL`` and ``entry_working_cancel`` in one revision. The marks, and an
+        acknowledgement time that a crash between the acknowledgement and its revision left
+        unrecorded (the window then starts at this pass), are recorded only when they change.
+        Nothing is sent here: the protection plan cancels the entry under its own authorization.
+        """
+        recorded = entry_working.decided(state)
+        if recorded:
+            return state, recorded
+        working = [
+            o for o in orders
+            if roles.get(o["id"]) == "ENTRY" and o["status"] not in BROKER_TERMINAL
+        ]
+        if not working:
+            return state, None
+        changes = {}
+        if not state.get("entry_acknowledged_at"):
+            changes["entry_acknowledged_at"] = now.isoformat()
+        view = {**state, **changes}
+        reference = None
+        if stop_breach.active_v3(state):
+            reference = self._reference_view(setup["symbol"], state.get("reference_product"), now)
+        marks, evidence = entry_working.stop_crossed(
+            view, observation=observation, bid=bid, reference=reference, now=now
+        )
+        if marks != entry_working.marks(view):
+            changes["entry_stop_marks"] = marks
+        reason = (
+            entry_working.STOP_CROSSED_BEFORE_FILL if evidence is not None
+            else entry_working.ENTRY_NOT_FILLED if now >= entry_working.window_ends_at(view)
+            else None
+        )
+        if not changes and reason is None:
+            return state, None
+        sid = setup["setup_id"]
+        with self.store.transaction() as conn:
+            current = self.store.state(conn, sid)
+            if current.get("revision") != state.get("revision") or current.get("state") in TERMINAL:
+                # Moved meanwhile: a recorded decision stands, otherwise the next pass decides.
+                return current, entry_working.decided(current)
+            if reason is not None:
+                filled = sum((num(o.get("filled_qty") or "0") for o in working), D(0))
+                ordered = sum((num(o["qty"]) for o in working), D(0))
+                self.store.event(
+                    conn, entry_working.CANCEL_EVENT,
+                    entry_working.cancel_body(
+                        view, reason, order_ids=[o["id"] for o in working], filled_qty=filled,
+                        remaining_qty=ordered - filled, now=now, evidence=evidence,
+                    ),
+                    setup_id=sid, key=entry_working.cancel_key(sid, view),
+                )
+                changes["entry_working_cancel"] = entry_working.decision(reason, now)
+            return self.store.transition(conn, sid, current["state"], **changes), reason
+
     def _partial_entry(self, setup, state, orders, observation, now):
         """CRYPTO_PARTIAL_ENTRY_V1: ``(state, retain, cancel reason)`` of a partly filled entry.
 
@@ -3386,6 +4131,11 @@ class ManagedExecution:
         zone (ask above the max entry, bid at or below the stop), and is then cancelled under its
         own one-use authorization (the planner's cancel, with the reason). Once decided, the
         cancel is final for the lifecycle; an exit cancels the remainder anyway.
+
+        CRYPTO_ENTRY_WORKING_LIMIT_V1 (entry_working.py): the rest works no longer than the
+        entry's fill window (``ENTRY_REMAINDER_NOT_FILLED``, also ``ENTRY_WORKING_CANCEL``), and an
+        entry the version ended before its first fill (a fill that raced that cancel) is
+        cancelled whole, under the decision's reason. The rule's own reasons come first.
         """
         working = [o for o in orders if o.role == "ENTRY" and o.active]
         if not working or state.get("state") != "OPEN" or state.get("exit_requested"):
@@ -3400,7 +4150,7 @@ class ManagedExecution:
                 bid=num(observation["bid"]) if observation else None,
                 ask=num(observation["ask"]) if observation else None,
                 max_entry=levels["max_entry_price"], stop=num(state["stop"]),
-            )
+            ) or entry_working.remainder_reason(state, now)
         if reason is None and state.get("partial_entry_retained_at"):
             return state, True, "CANCEL_REMAINING_ENTRY"  # Already recorded: nothing to write.
         if reason is not None and state.get("partial_entry_cancel") == reason:
@@ -3420,6 +4170,7 @@ class ManagedExecution:
             "ask": observation.get("ask") if observation else None,
             "quote_at": observation.get("quote_at") if observation else None,
             "decided_at": now,
+            **entry_working.partial_entry_fields(state),
         }
         with self.store.transaction() as conn:
             current = self.store.state(conn, sid)
@@ -3443,19 +4194,43 @@ class ManagedExecution:
                     setup_id=sid,
                     key=f"partial-entry-cancel:{sid}:{state.get('lifecycle_id')}:{reason}",
                 )
-                current = self.store.transition(
-                    conn, sid, current["state"], partial_entry_cancel=reason
-                )
+                changes = {"partial_entry_cancel": reason}
+                if (reason == entry_working.ENTRY_REMAINDER_NOT_FILLED
+                        and not entry_working.decided(current)):
+                    # CRYPTO_ENTRY_WORKING_LIMIT_V1: the fill window ended the rest of the entry.
+                    self.store.event(
+                        conn, entry_working.CANCEL_EVENT,
+                        entry_working.cancel_body(
+                            current, reason, order_ids=[o.broker_id for o in working],
+                            filled_qty=sum((o.filled_qty for o in working), D(0)),
+                            remaining_qty=remaining, now=now,
+                        ),
+                        setup_id=sid, key=entry_working.cancel_key(sid, current),
+                    )
+                    changes["entry_working_cancel"] = entry_working.decision(reason, now)
+                current = self.store.transition(conn, sid, current["state"], **changes)
         return current, False, reason
 
-    def _partial_entry_protection_refused(self, conn, decision, current, reason):
-        """A protection the broker refused while a retained entry remainder worked: the
-        remainder is cancelled first and protection is sent again once it is gone, instead of
-        today's PROTECTION_REJECTED flatten (which still applies when no remainder works)."""
+    def _partial_entry_protection_refused(self, conn, decision, current, reason,
+                                          entry_orders=None):
+        """A protection the broker refused while an entry order of the setup still worked (a
+        remainder, or one whose cancel was in flight): the entry is cancelled first and
+        protection is sent again once it is gone, instead of today's PROTECTION_REJECTED flatten
+        (which still applies when no entry order worked).
+
+        Judged on ``entry_orders``, the broker view the POST was authorized on, never on the
+        state when the refusal is handled: PEPE/USD's refusal (2026-09-30 19:15 UTC) arrived
+        after its pass had recorded the remainder's cancel, and the test of that state (a
+        retained remainder, no cancel decided) flattened the position. That test remains only
+        for a dispatch without the view (None). A cancel reason already recorded is kept (it is
+        recorded once); either way the new revision gives the next protection a fresh client
+        order ID."""
+        working = bool(entry_orders) if entry_orders is not None else bool(
+            current.get("partial_entry_retained_at") and not current.get("partial_entry_cancel")
+        )
         if not (
-            crypto_maintenance.partial_entry_active(current)
-            and current.get("partial_entry_retained_at")
-            and not current.get("partial_entry_cancel")
+            working
+            and crypto_maintenance.partial_entry_active(current)
             and current.get("state") not in TERMINAL
         ):
             return False
@@ -3464,11 +4239,12 @@ class ManagedExecution:
             "decision_id": decision_id, "reason": reason,
             "requested_qty": decision["payload"].get("qty"),
             "fallback": "CANCEL_ENTRY_REMAINDER_THEN_PROTECT",
+            "entry_orders": entry_orders,
         }, setup_id=sid, key="partial-entry-protection-refused:" + decision_id)
-        self.store.transition(
-            conn, sid, current["state"],
-            partial_entry_cancel=crypto_maintenance.PARTIAL_ENTRY_PROTECTION_REFUSED,
-        )
+        changes = {} if current.get("partial_entry_cancel") else {
+            "partial_entry_cancel": crypto_maintenance.PARTIAL_ENTRY_PROTECTION_REFUSED
+        }
+        self.store.transition(conn, sid, current["state"], **changes)
         return True
 
     def _maintenance_stop_watch(self, setup, state, orders, asset, bid, now):
@@ -3486,7 +4262,8 @@ class ManagedExecution:
         if not replace or state.get("state") != "OPEN" or state.get("exit_requested"):
             return state
         sid = setup["setup_id"]
-        native_stop, native_limit = native_stop_levels(asset, num(state["stop"]))
+        native_stop, native_limit = native_stop_levels(asset, num(state["stop"]),
+                                                       stop_breach.limit_cushion(state))
         protection = [o for o in orders if o.role == "PROTECT" and o.active]
         position = num(state.get("qty") or "0")
         settled = bool(protection) and all(

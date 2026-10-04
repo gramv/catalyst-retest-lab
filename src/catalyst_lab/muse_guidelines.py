@@ -372,6 +372,14 @@ post-mortems and lessons never reach Jev and change no trade.
 MUSE_GUIDELINES_V6 = MUSE_GUIDELINES_V5 + MUSE_GUIDELINES_V6_LEARNING
 MUSE_GUIDELINES_V6_SHA256 = sha256(MUSE_GUIDELINES_V6.encode("utf-8")).hexdigest()
 
+# The research guidelines report-V3 agents follow: the research context names them in its
+# report_format, and GET /api/v1/lab/research-guidelines serves this text with that version and
+# SHA-256 (RESEARCH_GUIDELINES_ROUTE_V1, package agent-api). The text is part of the package, so
+# the Railway image (which copies src/ only) serves it.
+RESEARCH_GUIDELINES_VERSION = MUSE_GUIDELINES_V6_VERSION
+RESEARCH_GUIDELINES = MUSE_GUIDELINES_V6
+RESEARCH_GUIDELINES_SHA256 = MUSE_GUIDELINES_V6_SHA256
+
 # The active version injected into every provider job.
 MUSE_GUIDELINES_VERSION = MUSE_GUIDELINES_V2_VERSION
 MUSE_GUIDELINES = MUSE_GUIDELINES_V2

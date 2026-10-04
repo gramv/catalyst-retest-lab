@@ -22,7 +22,15 @@ import httpx
 import psycopg
 from psycopg.types.json import Jsonb
 
-from catalyst_lab import crypto_holding, crypto_maintenance, crypto_trigger, gap_resume
+from catalyst_lab import (
+    crypto_holding,
+    crypto_maintenance,
+    crypto_trigger,
+    gap_resume,
+    regime_gate,
+    stop_breach,
+    trade_plan,
+)
 from catalyst_lab.account_risk import ARM_METHOD
 from catalyst_lab.authorization import RiskRepository
 from catalyst_lab.jev_contract import SKEPTIC, digest, encoded
@@ -212,8 +220,11 @@ class ExperimentLedger:
         assert result.status == "RECORDED"
         return result.receipt_ids[0]
 
-    def setup(self, pick, *, arm, admitted_at, record=None, cycle_id=None):
-        """A report-V3 setup (``record`` overrides the admission record, e.g. a V2 packet)."""
+    def setup(self, pick, *, arm, admitted_at, record=None, cycle_id=None, rules=None):
+        """A report-V3 setup (``record`` overrides the admission record, e.g. a V2 packet).
+        ``rules="PHASE_A"`` admits it as the engine does since 2026-10-03: JEV_MANAGED_RISK_V4,
+        CRYPTO_TRADE_PLAN_V1's plan (its stop and target in the state), entry pacing and the
+        stop-limit cushion (package public-page fixtures)."""
         sid = uuid4()
         receipt_id = self.receipt(pick.symbol, admitted_at)
         record = dict(record if record is not None else (pick.selection or pick.body))
@@ -228,14 +239,25 @@ class ExperimentLedger:
                  record["evidence_hash"], record["expires_at"], Jsonb(json_safe(record))))
             v3 = crypto_trigger.applies(record)
             holding = crypto_holding.admission_policy(v3, arm)
+            stop, target, extra, policy = str(levels["stop"]), str(levels["target"]), {}, (
+                "JEV_MANAGED_RISK_V3")
+            if rules == "PHASE_A":
+                plan = phase_a_plan(levels)
+                stop, target, policy = plan["stop"], plan["target"], "JEV_MANAGED_RISK_V4"
+                holding = crypto_holding.admission_policy(
+                    v3, arm, trade_plan.CRYPTO_TRADE_PLAN.window_setting())
+                extra = {trade_plan.FIELD: plan,
+                         regime_gate.STATE_FIELD: regime_gate.VERSION,
+                         **stop_breach.limit_admission_fields(record),
+                         **crypto_holding.window_fields(holding)}
             self.store.transition(
-                conn, sid, "WATCHING", stop=str(levels["stop"]), target=str(levels["target"]),
+                conn, sid, "WATCHING", stop=stop, target=target,
                 qty="0", lifecycle_id=str(uuid4()), admitted_at=admitted_at.isoformat(),
                 receipt_id=str(receipt_id), exit_requested=None, crypto_day_policy=None,
                 crypto_entry_deadline=None, crypto_flat_deadline=None,
-                risk_policy_id="JEV_MANAGED_RISK_V3", arm=arm, arm_method=ARM_METHOD,
+                risk_policy_id=policy, arm=arm, arm_method=ARM_METHOD,
                 fixed_exit_arm_pct=30,
-                **({"holding_policy": holding.record()} if holding else {}),
+                **({"holding_policy": holding.record()} if holding else {}), **extra,
                 **({"system_check": {"version": SYSTEM_CHECK_VERSION, "result": "PASSED",
                                      "entry_type": "PULLBACK"},
                     "entry_type": "PULLBACK"} if v3 else {}),
@@ -293,18 +315,24 @@ class ExperimentLedger:
 
     def trade(self, pick, *, arm, entry_at, exit_at=None, exit_price=None, reason=None,
               qty=D("10"), fees="ALPACA_PAPER_ACTIVITY", changes=(), early_exit=False,
-              continuations=0):
+              continuations=0, rules=None, before_entry=None):
         """A whole trade: admitted, filled at the max entry (coin fee 0.25%), optionally
         changed by Jev, and closed with a USD sell fee of 0.25% of proceeds."""
         levels = pick.levels
         m = D(levels["max_entry_price"])
-        sid = self.setup(pick, arm=arm, admitted_at=entry_at - timedelta(minutes=20))
+        sid = self.setup(pick, arm=arm, admitted_at=entry_at - timedelta(minutes=20),
+                         rules=rules)
+        if before_entry is not None:  # E.g. entry waits recorded while the setup watched.
+            before_entry(sid)
         buy = self.open(sid, qty=qty, price=m, at=entry_at, arm=arm)
         coin_fee = (qty * TAKER).quantize(D("0.000000001"))
         if fees is not None:
             self.fee(buy, fee_usd=coin_fee * m, base_qty=coin_fee, base_value=coin_fee * m,
                      source=fees)
         stop, target = D(levels["stop"]), D(levels["target"])
+        if rules == "PHASE_A":
+            plan = phase_a_plan(levels)
+            stop, target = D(plan["stop"]), D(plan["target"])
         for at, new_stop, new_target in changes:
             self.maintenance_raise(sid, at=at, before=(stop, target), after=(new_stop, new_target))
             stop, target = new_stop, new_target
@@ -517,6 +545,158 @@ class ExperimentLedger:
         self.fee(sell, fee_usd="1.39", source="ALPACA_PAPER_ACTIVITY")
         return sid
 
+    # --- Page V2 (package public-page): entry waits, the day's baseline, limits, regimes -----
+
+    def pacing_wait(self, sid, *, at, reason="MARKET_DROP", detail=None):
+        """One CRYPTO_ENTRY_PACING_WAIT as regime_gate records it (one per setup and minute)."""
+        detail = detail if detail is not None else {
+            "median_1h_return": "-0.0234", "coins": 12, "min_coins": 3, "returns": {},
+            "threshold": "-0.02"}
+        with self.store.transaction() as conn:
+            return self.event(conn, regime_gate.WAIT_EVENT,
+                              regime_gate.wait_body(reason, detail, {}, at),
+                              setup_id=sid, key=regime_gate.wait_key(sid, at), at=at)
+
+    def soft_wait(self, sid, *, at, day):
+        with self.store.transaction() as conn:
+            return self.event(conn, "DAILY_SOFT_LOSS_ENTRY_WAIT", {
+                "reason": "DAILY_SOFT_LOSS_LIMIT", "version": "JEV_MANAGED_RISK_V4",
+                "session_date": day, "trigger": {}, "waited_at": at.isoformat()},
+                setup_id=sid, key=f"daily-soft-loss-entry-wait:{sid}:{at.isoformat()}", at=at)
+
+    def day_start(self, day, equity, *, at):
+        """The New York day's starting equity, written as the engine's clean startup
+        reconciliation writes it (lab.risk_sessions needs that reconciliation run)."""
+        from catalyst_lab.execution import system_event
+
+        with self.store.transaction() as conn:
+            event = system_event(self.store.repo, conn, "MANAGED_STARTUP_RECONCILIATION",
+                                 {"clean": True, "baseline_source": "ALPACA_LAST_EQUITY"})
+            conn.execute(
+                """INSERT INTO lab.reconciliation_runs(event_seq,process_run_id,session_date,
+                started_at,completed_at,startup,clean,discrepancies,broker_snapshot)
+                VALUES(%s,%s,%s,%s,%s,true,true,'[]','{}')""",
+                (event["seq"], uuid4(), day, at, at))
+            conn.execute(
+                """INSERT INTO lab.risk_sessions(session_date,day_start_equity,source,
+                observed_at,event_seq,reconciliation_seq) VALUES(%s,%s,'ALPACA_LAST_EQUITY',
+                %s,%s,%s)""", (day, str(equity), at, event["seq"], event["seq"]))
+
+    def maintenance_v5(self, sid, *, at, levels, bid, invalidation, news=None,
+                       outcome="HELD", action="HOLD"):
+        """A CRYPTO_MAINTENANCE_V5 review as trade_maintenance records it: each asked question
+        ``(p, verdict, effect, streak)``; no level changes."""
+        def answer(value):
+            p, verdict, effect, streak = value
+            return {"p": str(p), "verdict": verdict, "effect": effect, "streak": streak}
+
+        verdicts = {"invalidation_met": answer(invalidation)}
+        if news is not None:
+            verdicts["news_contradicts"] = answer(news)
+        body = {
+            "policy_id": "CRYPTO_MAINTENANCE_V5", "outcome": outcome, "code": None,
+            "action": action, "answer_rule": "MAINTENANCE_ANSWER_RULE_V3",
+            "answers": {k: {"p": v["p"], "verdict": v["verdict"]} for k, v in verdicts.items()},
+            "verdicts": verdicts, "questions": sorted(verdicts),
+            "levels_before": {"stop": str(levels[0]), "target": str(levels[1])},
+            "decided_at": at.isoformat(), "quote": self.quote(bid, at),
+            "receipt_ids": [str(uuid4())], "trigger_reasons": ["BAR_15M"],
+            "state_hash": "5" * 64,
+        }
+        with self.store.transaction() as conn:
+            self.event(conn, "MAINTENANCE_DECISION", body, setup_id=sid,
+                       key=f"maintenance-decision:{uuid4()}", at=at)
+
+    def baseline_v2(self, day, equity, *, at, row_equity=None):
+        """RISK_SESSION_BASELINE_V2's event (package baseline), and with ``row_equity`` the
+        day's RISK_SESSION_BASELINE_CORRECTED from the lab.risk_sessions row's basis."""
+        with self.store.transaction() as conn:
+            event = self.event(conn, "RISK_SESSION_BASELINE_V2", {
+                "rule": "RISK_SESSION_BASELINE_V2", "source": "ACCOUNT_EQUITY_AT_NY_MIDNIGHT_V2",
+                "session_date": day.isoformat(), "day_start_equity": str(equity),
+                "observed_at": at.isoformat(), "risk_policy_id": "JEV_MANAGED_RISK_V4",
+                "cohort": COHORT}, key=f"risk-session-baseline-v2:{day.isoformat()}", at=at)
+            if row_equity is not None:
+                self.event(conn, "RISK_SESSION_BASELINE_CORRECTED", {
+                    "session_date": day.isoformat(), "rule": "RISK_SESSION_BASELINE_V2",
+                    "reason": "ALPACA_LAST_EQUITY_NOT_ROLLED",
+                    "old_basis": {"day_start_equity": str(row_equity),
+                                  "source": "ALPACA_LAST_EQUITY"},
+                    "new_basis": {"day_start_equity": str(equity),
+                                  "source": "ACCOUNT_EQUITY_AT_NY_MIDNIGHT_V2",
+                                  "baseline_event_seq": event["event_seq"]},
+                    "cohort": COHORT},
+                    key=f"risk-session-baseline-corrected:{day.isoformat()}", at=at)
+        return event
+
+    def latch_decision(self, latch, *, kept, at):
+        """DAILY_SOFT_LOSS_LIMIT_KEPT or _WITHDRAWN for a soft latch recorded before the V2
+        basis (one decision per latch)."""
+        kind = "DAILY_SOFT_LOSS_LIMIT_KEPT" if kept else "DAILY_SOFT_LOSS_LIMIT_WITHDRAWN"
+        with self.store.transaction() as conn:
+            return self.event(conn, kind, {
+                "latch_event_seq": latch["event_seq"], "risk_policy_id": "JEV_MANAGED_RISK_V4",
+                "reason": "RISK_SESSION_BASELINE_CORRECTED", "cohort": COHORT},
+                key=f"daily-soft-loss-limit-correction:{latch['event_seq']}", at=at)
+
+    def soft_limit(self, day, *, at, total, day_start, key_suffix=""):
+        with self.store.transaction() as conn:
+            return self.event(conn, "DAILY_SOFT_LOSS_LIMIT", {
+                "reason": "DAILY_SOFT_LOSS_LIMIT", "action": "NO_NEW_ENTRIES",
+                "risk_policy_id": "JEV_MANAGED_RISK_V4", "session_date": day,
+                "total_pnl": str(total), "day_start_equity": str(day_start),
+                "soft_loss_pct": "0.02", "threshold": str(D("-0.02") * D(str(day_start))),
+                "protection": "UNCHANGED", "cohort": COHORT},
+                key=f"daily-soft-loss-limit:JEV_MANAGED_RISK_V4:{day}{key_suffix}", at=at)
+
+    def daily_halt(self, day, *, realized, unrealized, threshold):
+        from catalyst_lab.execution import system_event
+
+        with self.store.transaction() as conn:
+            event = system_event(self.store.repo, conn, "DAILY_RISK_HALT",
+                                 {"total_pnl": str(D(str(realized)) + D(str(unrealized))),
+                                  "action": "CANCEL_AND_FLATTEN", "cohort": COHORT})
+            conn.execute("""INSERT INTO lab.daily_risk_halts(session_date,realized_pnl,
+                unrealized_pnl,threshold,event_seq) VALUES(%s,%s,%s,%s,%s)""",
+                         (day, str(realized), str(unrealized), str(threshold), event["seq"]))
+
+    def market_regime(self, day, tag, *, worst_hour_start, worst_pct, at=None):
+        """A MARKET_REGIME_V1 day record with the fields the public view reads."""
+        with self.store.transaction() as conn:
+            return self.event(conn, "MARKET_REGIME", {
+                "regime_version": "MARKET_REGIME_V1", "day": day, "timezone": "America/New_York",
+                "tag": tag, "btc_trend": {"label": tag.split("/")[0]},
+                "btc_volatility": {"label": tag.split("/")[1]},
+                "alt_breadth": {"label": tag.split("/")[2], "share": "0.61"},
+                "selloff": {"label": tag.split("/")[3],
+                            "worst_hour_median_return_pct": str(worst_pct),
+                            "worst_hour_start": worst_hour_start.isoformat(),
+                            "hours_measured": 24},
+                "limitations": ["LAB_FIXTURE"]}, key=f"market-regime:{day}", at=at)
+
+    def trade_regime(self, sid, *, entry_at, day_tag, median_pct="-1.3", bucket="DOWN"):
+        with self.store.transaction() as conn:
+            return self.event(conn, "TRADE_REGIME", {
+                "regime_version": "MARKET_REGIME_V1", "setup_id": str(sid),
+                "entry_at": entry_at.isoformat(), "btc_1h": "FLAT", "btc_4h": "UP",
+                "median_coin_1h": bucket, "median_coin_1h_return_pct": median_pct,
+                "day_tag": day_tag, "prior_day_tag": day_tag}, key=f"trade-regime:{sid}")
+
+    def equity_snapshot(self, at, equity, *, cash=None, long_market_value=None,
+                        unrealized=None, positions=0):
+        """ACCOUNT_EQUITY_SNAPSHOT_V1 as the account safety tick records it (package
+        public-page-v3), back-dated to ``at``."""
+        from catalyst_lab.equity_snapshot import SNAPSHOT_EVENT, snapshot_body, snapshot_key
+
+        account = {"equity": str(equity), "cash": None if cash is None else str(cash),
+                   "long_market_value": None if long_market_value is None else
+                   str(long_market_value), "last_equity": "10000"}
+        rows = [{"unrealized_pl": str(unrealized)}] * positions if unrealized is not None \
+            else []
+        body = snapshot_body(account, rows, at)
+        with self.store.transaction() as conn:
+            return self.event(conn, SNAPSHOT_EVENT, body, key=snapshot_key(at), at=at)
+
     def classify(self, symbol, sector="CRYPTO", theme="MEME"):
         from catalyst_lab.execution import system_event
 
@@ -525,6 +705,16 @@ class ExperimentLedger:
                                  {"ticker": symbol, "source": "LAB_FIXTURE"})
             conn.execute("INSERT INTO lab.risk_classifications VALUES(%s,%s,%s,%s,%s)",
                          (event["seq"], symbol, sector, theme, "LAB_FIXTURE"))
+
+
+def phase_a_plan(levels, hourly_fraction=D("0.02")):
+    """CRYPTO_TRADE_PLAN_V1's record for research ``levels`` and an hourly range of
+    ``hourly_fraction`` of the entry trigger (the real trade_plan.plan)."""
+    t = D(levels["entry_trigger"])
+    increment = D(1).scaleb(t.adjusted() - 5)
+    return json_safe(trade_plan.plan(
+        levels, hourly_range=(t * hourly_fraction).quantize(increment),
+        range_evidence={"bars": 24, "source": "LAB_FIXTURE"}, increment=increment))
 
 
 def enable_public_login(cluster_root):
@@ -669,3 +859,107 @@ def build_demo_experiment(ledger, now):
     ledger.equity_reading(trades[-1]["setup_id"], equity="10084.27")
     ledger.heartbeat()
     return runs, trades
+
+
+def build_demo_v2(ledger, now):
+    """The demo experiment plus what page V2 (package public-page) shows: each earlier day's
+    MARKET_REGIME_V1 tag (one sell-off day), today's starting equity, and two trades admitted
+    under the current rules (JEV_MANAGED_RISK_V4 and CRYPTO_TRADE_PLAN_V1) after entry waits:
+    one closed at its plan stop, one open. Returns ``(runs, trades, extra)``."""
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    runs, trades = build_demo_experiment(ledger, now)
+    today = now.astimezone(ny).date()
+    tags = ("UP/HIGH/BROAD/SELLOFF", "UP/NORMAL/BROAD/NO_SELLOFF", "UP/HIGH/NARROW/NO_SELLOFF")
+    for back, tag in zip((3, 2, 1), tags, strict=True):
+        day = today - timedelta(days=back)
+        worst = datetime(day.year, day.month, day.day, 14, tzinfo=ny).astimezone(UTC)
+        ledger.market_regime(day.isoformat(), tag, worst_hour_start=worst,
+                             worst_pct="-3.2" if tag.endswith("/SELLOFF") else "-0.8",
+                             at=worst + timedelta(hours=14))
+    midnight = datetime(today.year, today.month, today.day, tzinfo=ny).astimezone(UTC)
+    ledger.day_start(today, D("10000"), at=midnight + timedelta(minutes=3))
+    # RISK_SESSION_BASELINE_V2: the account's equity at the first clean reconciliation after
+    # midnight; the row's Alpaca last_equity was stale, so the day was re-based once.
+    ledger.baseline_v2(today, D("9950"), at=midnight + timedelta(minutes=5),
+                       row_equity=D("10000"))
+    run = runs[-1]
+    extra = []
+    for rank, outcome, after in ((3, "STOP", 50), (4, None, 100)):
+        pick = next(p for p in run.picks.values() if p.jev_rank == rank)
+        plan = phase_a_plan(pick.levels)
+        m = D(pick.levels["max_entry_price"])
+        entry_at = min(run.run_slot + timedelta(minutes=after), now - timedelta(minutes=30))
+        qty = (D("1000") / m).quantize(D("0.0001") if m > 1 else D("1"))
+        reason = "MARKET_DROP" if outcome else "ENTRY_RATE_LIMIT"
+
+        def waits(sid, entry_at=entry_at, reason=reason):
+            for minutes in (14, 13, 12, 11):
+                ledger.pacing_wait(sid, at=entry_at - timedelta(minutes=minutes), reason=reason,
+                                   detail=None if reason == "MARKET_DROP" else
+                                   {"entries": 2, "max_entries": 2, "window_seconds": 1800})
+
+        if outcome is None:
+            sid = ledger.trade(pick, arm="JEV_MANAGED", entry_at=entry_at, qty=qty,
+                               rules="PHASE_A", before_entry=waits)[0]
+            bid = (m * D("1.006")).quantize(D(plan["stop"]))
+            held = qty - (qty * TAKER).quantize(D("0.000000001"))
+            # CRYPTO_MAINTENANCE_V5: six plain holds, then a counted yes (a streak running).
+            levels = (D(plan["stop"]), D(plan["target"]))
+            for minutes, p in zip(range(26, 20, -1), ("0.04", "0.08", "0.05", "0.12", "0.03",
+                                                       "0.07"), strict=True):
+                ledger.maintenance_v5(sid, at=now - timedelta(minutes=minutes), levels=levels,
+                                      bid=bid, invalidation=(p, "NO", "RESET", 0))
+            ledger.maintenance_v5(sid, at=now - timedelta(minutes=19), levels=levels, bid=bid,
+                                  invalidation=("0.86", "YES", "COUNTED", 1),
+                                  news=("0.11", "NO", "RESET", 0), action="CONFIRMING")
+            ledger.position_sample(sid, at=now - timedelta(seconds=30), bid=bid, qty=held)
+        else:
+            exit_at = min(entry_at + timedelta(minutes=45), now - timedelta(minutes=5))
+            exit_price = (D(plan["stop"]) * D("0.998")).quantize(D(plan["stop"]))
+            sid = ledger.trade(pick, arm="FIXED_EXIT", entry_at=entry_at, exit_at=exit_at,
+                               exit_price=exit_price, reason="STOP_LIMIT_NOT_FILLED", qty=qty,
+                               rules="PHASE_A", before_entry=waits)[0]
+        ledger.trade_regime(sid, entry_at=entry_at, day_tag=tags[-1])
+        extra.append({"setup_id": sid, "pick": pick, "plan": plan, "entry_at": entry_at,
+                      "outcome": outcome})
+    ledger.heartbeat()
+    return runs, trades, extra
+
+
+def build_demo_v3(ledger, now):
+    """The V2 demo plus what page V3 (package public-page-v3) charts: each earlier day's
+    starting equity (the reconstructed curve), equity snapshots every five minutes from noon
+    yesterday (UTC) to now, a soft-limit latch three days ago and a STATS_EXCLUSION_V1 record
+    for the day two days ago. Returns ``(runs, trades, extra, info)``."""
+    import math
+    from zoneinfo import ZoneInfo
+
+    from catalyst_lab.stats_exclusion import record_exclusion
+
+    ny = ZoneInfo("America/New_York")
+    runs, trades, extra = build_demo_v2(ledger, now)
+    today = now.astimezone(ny).date()
+    starts = {3: D("10000"), 2: D("10021.40"), 1: D("9987.65")}
+    for back, equity in starts.items():
+        day = today - timedelta(days=back)
+        midnight = datetime(day.year, day.month, day.day, tzinfo=ny).astimezone(UTC)
+        ledger.day_start(day, equity, at=midnight + timedelta(minutes=4))
+    first = (now - timedelta(hours=30)).replace(second=0, microsecond=0)
+    first -= timedelta(minutes=first.minute % 5)
+    count = int((now - timedelta(minutes=1) - first).total_seconds() // 300) + 1
+    for i in range(count):  # Ends near the demo's last recorded equity (10084.27).
+        wave = D(str(round(18 * math.sin(i / 23) + 7 * math.sin(i / 5.3), 2)))
+        drift = D(str(round(0.25 * (i - count), 2)))
+        ledger.equity_snapshot(first + timedelta(minutes=5 * i), D("10080.10") + wave + drift,
+                               cash=D("7500"), long_market_value=D("2400") + wave,
+                               unrealized=wave, positions=1)
+    day3 = today - timedelta(days=3)
+    latch_at = datetime(day3.year, day3.month, day3.day, 15, 12, tzinfo=ny).astimezone(UTC)
+    ledger.soft_limit(day3.isoformat(), at=latch_at, total=D("-201.5"), day_start=D("10000"))
+    excluded_day = today - timedelta(days=2)
+    exclusion = record_exclusion(ledger.store, excluded_day, "UNMONITORED_OPERATION_FIXTURE",
+                                 now=now, ruling="owner 2026-10-03 (fixture)")
+    ledger.heartbeat()
+    return runs, trades, extra, {"excluded_day": excluded_day, "exclusion": exclusion}

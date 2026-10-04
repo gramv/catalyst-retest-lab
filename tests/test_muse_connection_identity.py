@@ -46,6 +46,7 @@ from tests.day_review_fixtures import (
     state,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_jev_b1_admission as pre_jev_b1_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 from tests.test_research_report_v3 import lab as lab
@@ -174,6 +175,7 @@ def test_muses_token_sees_and_answers_the_24_hour_review_of_its_trade(mt):
     assert pending(web, MUSE) == []  # Answered.
 
 
+@pytest.mark.usefixtures("pre_jev_b1_admission")  # V4's maintenance (before jev-b1).
 @pytest.mark.usefixtures("managed_arm")
 def test_muses_token_answers_a_jev_exit_flag_on_its_trade_with_the_guides_example(mt):
     from tests.test_early_exit import jev_flags
@@ -234,13 +236,13 @@ def test_muses_token_posts_news_and_raises_an_exit_flag_on_its_trade(mt):
 
 def test_muses_token_reaches_the_research_agent_routes_and_no_other():
     """Probes every authenticated route of the app with Muse's token. The routes Muse may use
-    are exactly the ones docs/MUSE-CONNECTION.md lists (tests/test_muse_connection_examples.py
-    checks that table against this same set)."""
-    from tests.test_muse_connection_examples import documented_routes, reachable_routes
+    are exactly ``MUSE_ROUTES``, the set docs/MUSE-CONNECTION.md lists
+    (tests/test_muse_connection_examples.py checks that table against it)."""
+    from tests.test_muse_connection_examples import MUSE_ROUTES, reachable_routes
 
     reachable, refused = reachable_routes(MUSE, status=STATUS, operator=OPERATOR,
                                           legacy=LEGACY, agent_tokens={"muse": MUSE})
-    assert reachable == documented_routes()
+    assert reachable == MUSE_ROUTES
     # Among the refused reads: the picks and results readbacks and analytics (open item).
     for route in (("GET", "/api/v1/lab/status"), ("GET", "/api/v1/lab/cycles"),
                   ("GET", "/api/v1/lab/cycles/{cycle_id}/picks"),

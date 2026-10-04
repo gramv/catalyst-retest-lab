@@ -632,9 +632,9 @@ post-mortems and lessons never reach Jev and change no trade.
 ## Implementation references
 
 - [Muse/application boundary](MUSE-RESEARCH-BOUNDARY.md)
-- [Frozen mechanics and precedence](V4.2-BUILD.md)
+- Frozen mechanics and precedence
 - [API contract](API-CONTRACT.md)
-- [Jev validation findings and limitations](JEV-VALIDATION-2026-09-20.md)
+- Jev validation findings and limitations
 - [Forward validation protocol](JEV-VALIDATION-PROTOCOL.md)
 
 This document and prompt binding are research tooling. They do not activate the

@@ -61,6 +61,15 @@ ENV_NAMES = frozenset({
     # when MANAGED_MANAGEMENT_REVIEWS is ENABLED; price and bytes per token default (0.042, 3).
     # The Railway profile requires all three (cloud_config.CLOUD_REQUIRED_OPTIONAL).
     "JEV_MONTHLY_BUDGET_USD", "JEV_PRICE_PER_MILLION_INPUT_TOKENS_USD", "JEV_BYTES_PER_TOKEN",
+    # The phase-D execution versions (package exec-d, execution_setting.py); optional: absent,
+    # neither CRYPTO_STOP_EXECUTION_V1 nor CRYPTO_MAKER_ENTRY_V1 is admitted.
+    "MANAGED_CRYPTO_EXECUTION_JSON",
+    # STRATEGY_PAPER_PATH_V1 (package plugin-c3, strategy_paper.py): the promoted strategies the
+    # runtime trades on paper; optional: absent or empty, none.
+    "MANAGED_STRATEGIES_JSON",
+    # AI_MODE_SETTING_V1 (package oss-packaging, ai_mode.py): JEV_AI_MODE_V1 (absent: the
+    # reference deployment) or NO_AI_MODE_V1; optional.
+    "CATALYST_AI_MODE",
 })
 OPTIONAL_ENV = frozenset({"MANAGED_CRYPTO_DAY_POLICY_JSON", "MANAGED_MONITOR_TRIGGER_POLICY_JSON",
                           "MANAGED_SELECTION_RULE", "MANAGED_SELECTION_QUALITY_FLOOR",
@@ -69,7 +78,8 @@ OPTIONAL_ENV = frozenset({"MANAGED_CRYPTO_DAY_POLICY_JSON", "MANAGED_MONITOR_TRI
                           "MANAGED_CRYPTO_WINDOW_JSON",
                           "TYPESAFE_ENV_FILE", "TYPESAFE_API_KEY", "CATALYST_ENVIRONMENT",
                           "JEV_MONTHLY_BUDGET_USD", "JEV_PRICE_PER_MILLION_INPUT_TOKENS_USD",
-                          "JEV_BYTES_PER_TOKEN"})
+                          "JEV_BYTES_PER_TOKEN", "MANAGED_CRYPTO_EXECUTION_JSON",
+                          "MANAGED_STRATEGIES_JSON", "CATALYST_AI_MODE"})
 REQUIRED_ENV = ENV_NAMES - OPTIONAL_ENV
 LIMIT = 131072
 
@@ -614,6 +624,29 @@ def environment_findings(env, *, api_port=None):
             parse_window_setting(env[WINDOW_ENV])
         except ValueError:
             invalid.append(WINDOW_ENV)
+    # The phase-D execution switch exactly as startup parses it (package exec-d).
+    from catalyst_lab.execution_setting import ENV as EXECUTION_ENV
+    from catalyst_lab.execution_setting import parse as parse_execution_setting
+
+    if EXECUTION_ENV in env and EXECUTION_ENV not in missing and EXECUTION_ENV not in invalid:
+        try:
+            parse_execution_setting(env[EXECUTION_ENV])
+        except ValueError:
+            invalid.append(EXECUTION_ENV)
+    # AI_MODE_SETTING_V1 exactly as startup checks it (package oss-packaging): a half-configured
+    # AI mode names every variable involved as invalid.
+    from catalyst_lab import ai_mode
+
+    for _, names in ai_mode.findings(env):
+        invalid.extend(names)
+    # STRATEGY_PAPER_PATH_V1's list exactly as startup parses it (package plugin-c3).
+    from catalyst_lab.strategy_paper import STRATEGIES_ENV, configured_strategies
+
+    if STRATEGIES_ENV in env and STRATEGIES_ENV not in missing:
+        try:
+            configured_strategies(env)
+        except ValueError:
+            invalid.append(STRATEGIES_ENV)
     for key, constructor, decimals in (
         ("MANAGED_CRYPTO_LIQUIDITY_POLICY_JSON", CryptoLiquidityPolicy,
          ("minimum_dollar_volume", "maximum_participation", "assumed_round_trip_cost_bps",
@@ -875,6 +908,7 @@ def status_alarms(status, now, policy):
     alarms += maintenance_alarms(status.get("trade_maintenance"))
     alarms += day_review_alarms(status.get("day_reviews"))
     alarms += gap_resume_alarms(status.get("gap_resume"), now)
+    alarms += reference_feed_alarms(status.get("reference_feed"), now)
     alarms += jev_budget_alarms(status.get("jev_budget"), now)
     return sorted(set(alarms))
 
@@ -1047,6 +1081,84 @@ def gap_resume_alarms(section, now):
     if since.tzinfo is None or not 0 <= age <= GAP_RESUME_OVERDUE_SECONDS:
         return [GAP_RESUME_OVERDUE_ALARM]
     return []
+
+
+REFERENCE_FEED_ALARM = "REFERENCE_FEED_UNHEALTHY"
+REFERENCE_FEED_UNAVAILABLE_ALARM = "REFERENCE_FEED_STATUS_UNAVAILABLE"
+REFERENCE_FEED_UNHEALTHY_SECONDS = 300
+
+
+def reference_feed_alarms(section, now):
+    """CRYPTO_COINBASE_TRIGGER_V1 / CRYPTO_STOP_BREACH_V3 (owner approval 2026-09-29):
+    REFERENCE_FEED_UNHEALTHY once a Coinbase product a setup or offered pick needs has not been
+    healthy for more than 300 s (``unhealthy_since``): its picks cannot be admitted or enter, and
+    an open trade's stop breach reads CRYPTO_STOP_BREACH_V2's Alpaca evidence meanwhile. An app
+    without the field or the feed raises nothing; an unreadable section or time, or one in the
+    future, fails closed."""
+    if section is None:
+        return []
+    if not isinstance(section, dict) or section.get("available") is not True:
+        return [REFERENCE_FEED_UNAVAILABLE_ALARM]
+    since = section.get("unhealthy_since")
+    if since is None:
+        return []
+    try:
+        at = datetime.fromisoformat(since)
+        age = (now - at).total_seconds()
+    except (TypeError, ValueError):
+        return [REFERENCE_FEED_ALARM]
+    if at.tzinfo is None or not 0 <= age <= REFERENCE_FEED_UNHEALTHY_SECONDS:
+        return [REFERENCE_FEED_ALARM]
+    return []
+
+
+# The Railway ops service's own checks (package ops-alarms, 2026-09-29), beside its audit and
+# backup alarms: the nightly jobs' daily record, the ledger's size and the ops volume's free
+# space. The ops watchdog measures them itself (``cloud_runtime.OpsLoop``); the trader's status
+# carries none of them, and the Mac watchdog has no nightly jobs to check.
+LEARNING_JOBS_MISSED_ALARM = "LEARNING_JOBS_MISSED"
+# The jobs start at 05:30 UTC (after the New York midnight all year) and end by 06:00 UTC at the
+# latest (their 30-minute stop), recording the previous New York day: due from 07:00 UTC.
+LEARNING_JOBS_DUE_AFTER = timedelta(hours=7)
+DATABASE_SIZE_HIGH_ALARM = "DATABASE_SIZE_HIGH"
+# 3 GB: 60% of the 5 GB Postgres volume (RAILWAY-DEPLOYMENT.md 4), where DATA-RETENTION.md starts
+# archiving. Decimal bytes, the earlier alarm of the two readings of "GB".
+DATABASE_SIZE_HIGH_BYTES = 3 * 10**9
+OPS_VOLUME_LOW_ALARM = "OPS_VOLUME_LOW"
+OPS_VOLUME_MIN_FREE_PERCENT = 20  # Of the ops volume's total: the backups and checkpoints.
+LEDGER_CHECK_FAILED_ALARM = "LEDGER_CHECK_FAILED"
+
+
+def scorecard_due_day(now):
+    """The New York day whose ``DAILY_SCORECARD_V1`` must be recorded at ``now``: from 07:00 UTC
+    the previous New York day; before 07:00 UTC the day before it, which the run of the night
+    before recorded."""
+    return (now.astimezone(UTC) - LEARNING_JOBS_DUE_AFTER).date() - timedelta(days=1)
+
+
+def ledger_alarms(section):
+    """The ops watchdog's ledger check, read as catalyst_app: LEARNING_JOBS_MISSED while the due
+    day's ``DAILY_SCORECARD_V1`` (``scorecard_due_day``) is not recorded, DATABASE_SIZE_HIGH
+    while ``pg_database_size`` of the ledger is at least 3 GB. A fact that could not be read
+    fails closed as LEDGER_CHECK_FAILED: unknown, never healthy."""
+    section = section if isinstance(section, dict) else {}
+    recorded, size = section.get("scorecard_recorded"), section.get("database_bytes")
+    alarms = [LEARNING_JOBS_MISSED_ALARM] if recorded is False else []
+    if type(size) is int and size >= DATABASE_SIZE_HIGH_BYTES:
+        alarms.append(DATABASE_SIZE_HIGH_ALARM)
+    if type(recorded) is not bool or type(size) is not int or size < 0:
+        alarms.append(LEDGER_CHECK_FAILED_ALARM)
+    return alarms
+
+
+def ops_volume_alarms(section):
+    """OPS_VOLUME_LOW while the ops volume (backups, audit checkpoints) has less than 20% of its
+    total free (``shutil.disk_usage`` of its mount path); an unreadable usage fails closed."""
+    section = section if isinstance(section, dict) else {}
+    total, free = section.get("total_bytes"), section.get("free_bytes")
+    if type(total) is not int or type(free) is not int or not 0 <= free <= total or total <= 0:
+        return [OPS_VOLUME_LOW_ALARM]
+    return [OPS_VOLUME_LOW_ALARM] if free * 100 < total * OPS_VOLUME_MIN_FREE_PERCENT else []
 
 
 # Muse provider jobs by lane (the job ID prefix) and the ``runs.kind`` values each lane logs:
@@ -1636,6 +1748,61 @@ def clear_protection_latch(config, reason, *, repository=None, operator="LOCAL_O
             "ledger_head_event_seq": head, "scope": body["scope"]}
 
 
+def exclude_from_stats(config, day, reason, *, repository=None, now=None):
+    """``STATS_EXCLUSION_V1`` (package public-page-v3; owner ruling 2026-10-03): one audited
+    record leaving the New York ``day``'s trades out of the performance statistics; no trade
+    or event changes (``stats_exclusion.record_exclusion``). The Railway form is
+    ``cloud_runtime exclude-from-stats``."""
+    from datetime import date
+
+    from catalyst_lab.authorization import RiskRepository
+    from catalyst_lab.managed_store import ManagedStore
+    from catalyst_lab.stats_exclusion import record_exclusion
+
+    try:
+        parsed = date.fromisoformat(day or "")
+    except ValueError:
+        raise ValueError("STATS_EXCLUSION_DAY_INVALID") from None
+    repo = repository or RiskRepository(config["environment"]["MANAGED_DATABASE_URL"])
+    return {"action": "exclude-from-stats", "mode": "PAPER_ONLY", **record_exclusion(
+        ManagedStore(repo), parsed, reason, now=now or datetime.now(UTC))}
+
+
+def _strategy_store(config, repository):
+    from catalyst_lab.authorization import RiskRepository
+    from catalyst_lab.managed_store import ManagedStore
+
+    return ManagedStore(
+        repository or RiskRepository(config["environment"]["MANAGED_DATABASE_URL"]))
+
+
+def promote_strategy(config, strategy_id, history_report, owner_ruling, *,
+                     owner_override_reason=None, repository=None, now=None):
+    """``STRATEGY_PROMOTION_V1`` (package plugin-c3): the owner's audited promotion of a mechanical
+    strategy plug-in to the paper path. Refused unless ``history_test.promotion_check`` on the
+    named history report and the ledger's shadow cell meets the paper rung, except with an
+    explicit ``owner_override_reason`` (recorded). Trading also needs the runtime's
+    ``MANAGED_STRATEGIES_JSON`` to list it. The Railway form is ``cloud_runtime
+    promote-strategy``."""
+    from catalyst_lab.strategy_paper import promote
+
+    if not history_report:
+        raise ValueError("PROMOTION_HISTORY_REPORT_REQUIRED")
+    return promote(_strategy_store(config, repository), strategy_id,
+                   history_report=Path(history_report), owner_ruling_ref=owner_ruling,
+                   owner_override_reason=owner_override_reason,
+                   now=now or datetime.now(UTC))
+
+
+def demote_strategy(config, strategy_id, reason, owner_ruling, *, repository=None, now=None):
+    """``STRATEGY_DEMOTION_V1``: the strategy's packets are refused from now on, its setups still
+    waiting for an entry are revoked, open positions keep their protection."""
+    from catalyst_lab.strategy_paper import demote
+
+    return demote(_strategy_store(config, repository), strategy_id, reason=reason,
+                  owner_ruling_ref=owner_ruling, now=now or datetime.now(UTC))
+
+
 def role_token(path):
     """One owner-only role token; the value is never logged, reported or put in argv."""
     try:
@@ -1984,7 +2151,9 @@ def main(argv=None):
     )
     parser.add_argument("command", choices=("preflight", "render-supervisor", "template",
                                              "watchdog-once", "verify-checkpoint", "restore-audit",
-                                             "clear-protection-latch", "backup"))
+                                             "clear-protection-latch", "backup",
+                                             "exclude-from-stats", "promote-strategy",
+                                             "demote-strategy"))
     parser.add_argument("--config")
     parser.add_argument("--checkout", help="ignored: code identity is the imported package")
     parser.add_argument("--destination")
@@ -1992,6 +2161,15 @@ def main(argv=None):
     parser.add_argument("--expected-head")
     parser.add_argument("--check-database", action="store_true")
     parser.add_argument("--reason")
+    parser.add_argument("--day", help="exclude-from-stats: the New York day (YYYY-MM-DD)")
+    parser.add_argument("--strategy", help="promote-strategy, demote-strategy: the strategy id")
+    parser.add_argument("--history-report",
+                        help="promote-strategy: the history test's results.json")
+    parser.add_argument("--owner-ruling", help="promote-strategy, demote-strategy: the owner's "
+                        "ruling reference (e.g. 'CONTRACT-RESOLUTIONS 2026-10-10')")
+    parser.add_argument("--owner-override-reason",
+                        help="promote-strategy: only if the owner insists past the ladder; "
+                        "recorded in the promotion")
     args = parser.parse_args(argv)
     try:
         if args.command == "template":
@@ -2014,6 +2192,14 @@ def main(argv=None):
                 result = render_supervisor(args.config, config, args.destination)
             elif args.command == "clear-protection-latch":
                 result = clear_protection_latch(config, args.reason)
+            elif args.command == "exclude-from-stats":
+                result = exclude_from_stats(config, args.day, args.reason)
+            elif args.command == "promote-strategy":
+                result = promote_strategy(config, args.strategy, args.history_report,
+                                          args.owner_ruling,
+                                          owner_override_reason=args.owner_override_reason)
+            elif args.command == "demote-strategy":
+                result = demote_strategy(config, args.strategy, args.reason, args.owner_ruling)
             elif args.command == "backup":
                 result = backup_once(config)
             else:

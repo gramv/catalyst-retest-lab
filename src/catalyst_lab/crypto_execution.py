@@ -7,12 +7,13 @@ come from broker reconciliation, including fees; cumulative fills are not invent
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_FLOOR, Decimal, localcontext
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from catalyst_lab.config import PAPER_ENDPOINT
 from catalyst_lab.market import NY
+from catalyst_lab.strategies import core
 
 TERMINAL = frozenset({"filled", "canceled", "cancelled", "expired", "rejected", "replaced"})
 PENDING = frozenset({"pending_cancel", "pending_replace"})
@@ -206,12 +207,70 @@ def build_market_exit(asset, qty_available, *, operation_key):
     return _body(asset, qty_available, "sell", "market", operation_key)
 
 
-def native_stop_levels(asset, stop):
-    """The native stop-limit prices protection sends for a desired ``stop``: the stop and its
-    limit one increment below (never below one increment), each raised to the broker grid,
-    exactly as ``ManagedExecution.manage`` and ``plan_crypto_recovery`` derive them."""
+def build_collared_exit(asset, qty_available, limit, *, operation_key):
+    """``CRYPTO_STOP_EXECUTION_V1`` (stop_execution.py) only: a marketable limit sell with a price
+    collar, immediate-or-cancel. Alpaca documents GTC and IOC durations for crypto orders
+    (docs/CRYPTO-EXECUTION-CONTRACT.md, "Confirmed venue mechanics"); IOC fills what it can at
+    or above ``limit`` and cancels the rest, so the order never rests on the book."""
+    payload = _body(asset, qty_available, "sell", "limit", operation_key)
+    payload.update(limit_price=text(asset.price(limit)), time_in_force="ioc")
+    return payload
+
+
+def collar_price(asset, reference_price, fraction):
+    """The collar of a stop-emulation sell: ``reference_price`` times one minus ``fraction``,
+    rounded down to the broker grid, never below one increment."""
+    reference_price = decimal(reference_price, positive=True)
+    fraction = decimal(fraction, positive=True)
+    if fraction >= 1:
+        raise CryptoExecutionError("INVALID_COLLAR_FRACTION")
+    increment = asset.price_increment
+    try:
+        with localcontext() as context:
+            context.prec = 80
+            lots = (reference_price * (1 - fraction) / increment).to_integral_value(
+                rounding=ROUND_FLOOR)
+    except ArithmeticError:
+        raise CryptoExecutionError("PRICE_GRID_UNAVAILABLE") from None
+    return max(increment, lots * increment)
+
+
+def stop_limit_price(asset, stop, cushion=None):
+    """The limit of the native stop-limit protecting a desired ``stop``: the one derivation
+    ``ManagedExecution.manage`` (the plan's ``stop_limit``), its PATCH authorization and the
+    raised-stop watch all use (``native_stop_levels``).
+
+    ``cushion`` None (every setup before ``CRYPTO_STOP_BREACH_V4``): one increment below the
+    stop, never below one increment; ``plan_crypto_recovery`` raises it to the grid.
+    ``cushion`` a fraction (``CRYPTO_STOP_BREACH_V4``, ``stop_breach.limit_cushion``): the stop
+    raised to the grid (the native stop), times one minus the cushion, rounded down to the
+    grid, never above one increment below the native stop and never below one increment. On
+    the grid already, so raising it to the grid leaves it unchanged.
+    """
     stop = decimal(stop, positive=True)
-    limit = max(asset.price_increment, stop - asset.price_increment)
+    increment = asset.price_increment
+    if cushion is None:
+        return max(increment, stop - increment)
+    cushion = decimal(cushion, positive=True)
+    if cushion >= 1:
+        raise CryptoExecutionError("INVALID_STOP_LIMIT_CUSHION")
+    native = asset.price_at_or_above(stop)
+    try:
+        with localcontext() as context:
+            context.prec = 80  # Exact for every price and increment the venue lists.
+            lots = (native * (1 - cushion) / increment).to_integral_value(rounding=ROUND_FLOOR)
+    except ArithmeticError:
+        raise CryptoExecutionError("PRICE_GRID_UNAVAILABLE") from None
+    return max(increment, min(lots * increment, native - increment))
+
+
+def native_stop_levels(asset, stop, cushion=None):
+    """The native stop-limit prices protection sends for a desired ``stop``: the stop and its
+    limit (``stop_limit_price``: one increment below, or under ``CRYPTO_STOP_BREACH_V4`` the
+    recorded cushion below), each raised to the broker grid, exactly as
+    ``ManagedExecution.manage`` and ``plan_crypto_recovery`` derive them."""
+    stop = decimal(stop, positive=True)
+    limit = stop_limit_price(asset, stop, cushion)
     return asset.price_at_or_above(stop), asset.price_at_or_above(limit)
 
 
@@ -355,10 +414,13 @@ def plan_crypto_recovery(
     exit_requested: bool,
     exit_deadline: datetime,
     time_exit_reason: str = "TIME_EXIT",
-    retain_entry: bool = False,
+    retain_entry: bool | None = None,
     entry_cancel_reason: str = "CANCEL_REMAINING_ENTRY",
     replace_stop: str = "CANCEL",
     protect_after_entries: bool = False,
+    unfilled_entry_cancel: str | None = None,
+    exit_limit: tuple | None = None,
+    cancel_exit: str | None = None,
 ):
     """Plan recovery from broker truth without submitting or changing authoritative state.
 
@@ -379,13 +441,39 @@ def plan_crypto_recovery(
     ``HOLD_24H_EXIT`` for a setup under ``CRYPTO_24H_HOLD_V1`` (crypto_holding.py).
 
     ``CRYPTO_PARTIAL_ENTRY_V1`` and ``CRYPTO_MAINTENANCE_V1`` (crypto_maintenance.py) only; the
-    defaults are every other setup's plan, unchanged. ``retain_entry``: a partly filled entry
-    keeps working while its filled quantity is protected (an exit still cancels it);
-    ``entry_cancel_reason`` names the cancel of an entry remainder outside an exit.
-    ``replace_stop="PATCH"``: a raised stop replaces each resting stop-limit in place (one
-    price-only PATCH each, ``REPLACE_STOP``) instead of cancelling it (``TIGHTEN_STOP``).
-    ``protect_after_entries``: new protection waits until a working entry remainder is
-    cancelled (after the broker refused protection while it worked).
+    defaults are every other setup's plan, unchanged. ``retain_entry`` (a bool only for a setup
+    recording ``CRYPTO_PARTIAL_ENTRY_V1``; None is every other setup's plan): True keeps a partly
+    filled entry working while its filled quantity is protected (an exit still cancels it);
+    False cancels its remainder. ``entry_cancel_reason`` names the cancel of an entry remainder
+    outside an exit. ``replace_stop="PATCH"``: a raised stop replaces each resting stop-limit in
+    place (one price-only PATCH each, ``REPLACE_STOP``) instead of cancelling it
+    (``TIGHTEN_STOP``). ``protect_after_entries``: new protection waits until a working entry
+    remainder is cancelled (after the broker refused protection while it worked).
+
+    Under ``CRYPTO_PARTIAL_ENTRY_V1`` (and with ``protect_after_entries``) new protection is never
+    proposed in the plan that cancels an entry order, nor while an entry order's cancel is in
+    flight (``PENDING``): the plan is ``CANCELING`` / ``CANCEL_ENTRY_BEFORE_PROTECT`` with only
+    the cancels, and protection follows on a later pass once the broker shows no such order.
+    Alpaca refuses a sell while a buy of the coin works (its wash-trade guard: CRV and PEPE,
+    2026-09-30). Only a retained remainder that works is protected at once, as the version
+    says. Meanwhile the app watches the stop (exits are planned before protection). Every other
+    setup keeps its recorded plan: protection with the cancel, even while a cancel is pending
+    (docs/CRYPTO-EXECUTION-CONTRACT.md).
+
+    ``CRYPTO_ENTRY_WORKING_LIMIT_V1`` (entry_working.py) only: ``unfilled_entry_cancel`` names why
+    the version ended an entry that has filled nothing (``ENTRY_NOT_FILLED``,
+    ``STOP_CROSSED_BEFORE_FILL``). Where the entry would keep working (``ENTRY_WORKING``) it is
+    cancelled instead (``CANCELING``, one cancel per working entry order under that reason); any
+    inventory is planned exactly as without it, so a fill that races the cancel is protected.
+
+    ``CRYPTO_STOP_EXECUTION_V1`` (stop_execution.py) only; the defaults are every other setup's
+    plan, unchanged. ``exit_limit`` = ``(limit, operation_key, reason)``: once an exit is due and
+    nothing else works (entries and protection cancelled first, exactly as for the market
+    exit; Alpaca refuses a sell while a buy of the coin works and the stop-limit reserves the
+    inventory), the exit is an IOC limit sell at ``limit`` under ``operation_key`` instead of
+    the market sell. ``cancel_exit``: the working exit order (the collar, still working past its
+    wait) is cancelled under that reason; the market sell follows on a later pass for whatever
+    remains, exactly as after any exit order ends.
     """
     if replace_stop not in {"CANCEL", "PATCH"}:
         raise CryptoExecutionError("INVALID_STOP_REPLACE_MODE")
@@ -437,6 +525,10 @@ def plan_crypto_recovery(
     if snapshot.position_qty == 0:
         has_fills = any(o.filled_qty > 0 for o in snapshot.orders)
         if entries and not sells and not has_fills and not exit_requested and now < exit_deadline:
+            if unfilled_entry_cancel:
+                return RecoveryPlan("CANCELING", unfilled_entry_cancel, tuple(
+                    _cancel(o, unfilled_entry_cancel) for o in entries if o.status not in PENDING
+                ))
             return RecoveryPlan("ENTRY_WORKING", "AWAIT_FIRST_FILL")
         if active:
             cancels = tuple(
@@ -447,7 +539,8 @@ def plan_crypto_recovery(
 
     quote_age = _age(now, snapshot.quote_at)
     fresh_quote = quote_age is not None and 0 <= quote_age <= policy.quote_max_age_seconds
-    target_touched = fresh_quote and snapshot.bid is not None and snapshot.bid >= target
+    target_touched = (fresh_quote and snapshot.bid is not None
+                      and core.reaches_target(snapshot.bid, target))
     breach_age = _age(now, snapshot.stop_breached_at)
     stop_stuck = breach_age is not None and breach_age >= policy.stop_limit_timeout_seconds
     protection_rejected = any(
@@ -486,24 +579,41 @@ def plan_crypto_recovery(
                 snapshot.position_qty,
             )
         if any(o.role == "EXIT" for o in sells):
+            if cancel_exit:
+                cancels = tuple(
+                    _cancel(o, cancel_exit)
+                    for o in sells if o.role == "EXIT" and o.status not in PENDING
+                )
+                return RecoveryPlan(
+                    "CANCELING", cancel_exit, cancels, snapshot.position_qty
+                )
             return RecoveryPlan(
                 "EXIT_WORKING", "AWAIT_EXISTING_EXIT", residual_qty=snapshot.position_qty
             )
         if snapshot.qty_available != snapshot.position_qty:
             return RecoveryPlan("RECONCILE_REQUIRED", "SELL_RESERVATION_NOT_RELEASED")
+        exit_proposal_reason = exit_reason
         try:
-            payload = build_market_exit(
-                asset,
-                snapshot.qty_available,
-                operation_key=operation_key + ":exit:" + snapshot.revision,
-            )
+            if exit_limit is not None:
+                limit, limit_key, exit_proposal_reason = exit_limit
+                payload = build_collared_exit(
+                    asset, snapshot.qty_available, decimal(limit, positive=True),
+                    operation_key=limit_key,
+                )
+            else:
+                payload = build_market_exit(
+                    asset,
+                    snapshot.qty_available,
+                    operation_key=operation_key + ":exit:" + snapshot.revision,
+                )
         except CryptoExecutionError as error:
             if str(error) != "QUANTITY_BELOW_BROKER_MINIMUM":
                 raise
             return RecoveryPlan(
                 "HALTED", "RESIDUAL_BELOW_BROKER_MINIMUM", residual_qty=snapshot.position_qty
             )
-        proposal = MutationProposal("CRYPTO_EXIT", "POST", "/v2/orders", payload, exit_reason)
+        proposal = MutationProposal(
+            "CRYPTO_EXIT", "POST", "/v2/orders", payload, exit_proposal_reason)
         return RecoveryPlan("EXIT_REQUIRED", exit_reason, (proposal,), snapshot.position_qty)
 
     if any(o.role == "EXIT" for o in sells):
@@ -597,9 +707,12 @@ def plan_crypto_recovery(
         )
     if unsnappable:
         return RecoveryPlan("HALTED", "CRYPTO_STOP_UNSNAPPABLE", cancel_entries, uncovered, details)
-    if protect_after_entries and entries:
-        # CRYPTO_PARTIAL_ENTRY_V1: the broker refused protection while the entry remainder
-        # worked, so the remainder is cancelled first and protection follows once it is gone.
+    if (retain_entry is not None or protect_after_entries) and any(
+        not retain_entry or o.status in PENDING for o in entries
+    ):
+        # CRYPTO_PARTIAL_ENTRY_V1: no protection while an entry order it does not retain still
+        # works or has a cancel in flight; the broker would refuse the sell. The remainder is
+        # cancelled first and protection follows once the broker shows it gone.
         return RecoveryPlan(
             "CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT", cancel_entries, uncovered, details
         )

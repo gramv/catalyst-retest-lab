@@ -1,0 +1,292 @@
+# Catalyst Lab: the one-command local stack (package oss-packaging, LOCAL_STACK_V1).
+# PAPER TRADING ONLY. Start: `docker compose up` (docs/QUICKSTART.md).
+#
+# What runs:
+#   secrets    one-shot: generates the stack's passwords (Postgres superuser, one per role)
+#   db         PostgreSQL on a disposable volume; no port published to the host
+#   provision  one-shot: the ledger, its roles and grants (cloud_provision, platform LOCAL_COMPOSE)
+#   trader     the simulated venue: strategies in shadow on public bars; no key, no order, no AI
+#   page       the public page, read-only, at http://127.0.0.1:8080
+#   jobs       one-shot: the nightly learning jobs (run again: docker compose run --rm jobs)
+#   catalyst   tools, profile "tools": docker compose run --rm catalyst history-test ...
+#   trader-alpaca  opt-in, profile "alpaca-paper": the managed engine on YOUR Alpaca PAPER key,
+#              read from a .env.paper you create (never shipped); see docs/QUICKSTART.md.
+#
+# Least privilege: only secrets, db and provision see the Postgres superuser password (volume
+# admin-secret); each app container mounts only the password folder of each role it logs in as.
+# Reset everything (the ledger is disposable): docker compose down -v
+#
+# Written in plain block YAML (no anchors) so it reads top to bottom; tests/test_local_stack.py
+# parses it and checks these rules.
+name: "catalyst-local"
+services:
+  secrets:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: false
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    command: ["python", "-m", "catalyst_lab.local_stack", "secrets"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+    volumes:
+      - "admin-secret:/run/catalyst-admin"
+      - "role-secrets:/run/catalyst-roles"
+    restart: "no"
+
+  db:
+    image: "postgres:18"
+    environment:
+      POSTGRES_PASSWORD_FILE: "/run/catalyst-admin/postgres-password"
+    volumes:
+      - "pgdata:/var/lib/postgresql"
+      - "admin-secret:/run/catalyst-admin:ro"
+    depends_on:
+      secrets:
+        condition: "service_completed_successfully"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres -q"]
+      interval: "3s"
+      timeout: "3s"
+      retries: 40
+    restart: "unless-stopped"
+
+  provision:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    command: ["python", "-m", "catalyst_lab.local_stack", "provision"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+    volumes:
+      - "admin-secret:/run/catalyst-admin:ro"
+      - "role-secrets:/run/catalyst-roles:ro"
+    depends_on:
+      db:
+        condition: "service_healthy"
+    restart: "no"
+
+  trader:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    command: ["python", "-m", "catalyst_lab.local_stack", "trader"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+      CATALYST_VENUE: "simulated"
+      # public: Alpaca's keyless public crypto bars (network); synthetic: generated sample bars
+      # (offline; never evidence). docs/CONFIGURATION.md lists every setting.
+      CATALYST_SIM_BARS: "public"
+      CATALYST_SIM_SYMBOLS: "BTC/USD,ETH/USD,SOL/USD,DOGE/USD"
+      CATALYST_STRATEGY_PLUGINS_DIR: "/app/examples/strategies:/my-strategies"
+    volumes:
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/risk"
+        read_only: true
+        volume:
+          subpath: "risk"
+      - "./my-strategies:/my-strategies:ro"
+    depends_on:
+      provision:
+        condition: "service_completed_successfully"
+    healthcheck:
+      test: ["CMD", "python", "-m", "catalyst_lab.local_stack", "health", "http://127.0.0.1:8081/health"]
+      interval: "15s"
+      timeout: "8s"
+      retries: 5
+      start_period: "120s"
+    restart: "unless-stopped"
+
+  page:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    command: ["python", "-m", "catalyst_lab.local_stack", "page"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/public"
+        read_only: true
+        volume:
+          subpath: "public"
+    depends_on:
+      provision:
+        condition: "service_completed_successfully"
+    healthcheck:
+      test: ["CMD", "python", "-m", "catalyst_lab.local_stack", "health", "http://127.0.0.1:8080/health"]
+      interval: "15s"
+      timeout: "8s"
+      retries: 5
+      start_period: "30s"
+    restart: "unless-stopped"
+
+  jobs:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    command: ["python", "-m", "catalyst_lab.local_stack", "jobs"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+      CATALYST_SIM_BARS: "public"
+      CATALYST_STRATEGY_PLUGINS_DIR: "/app/examples/strategies:/my-strategies"
+    volumes:
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/risk"
+        read_only: true
+        volume:
+          subpath: "risk"
+      - "./my-strategies:/my-strategies:ro"
+    depends_on:
+      provision:
+        condition: "service_completed_successfully"
+    restart: "no"
+
+  catalyst:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    profiles:
+      - "tools"
+    entrypoint: ["catalyst-lab"]
+    command: ["history-test", "--help"]
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+      CATALYST_STRATEGY_PLUGINS_DIR: "/app/examples/strategies:/my-strategies"
+    volumes:
+      - "history:/data"
+      - "./my-strategies:/my-strategies"
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/risk"
+        read_only: true
+        volume:
+          subpath: "risk"
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/app"
+        read_only: true
+        volume:
+          subpath: "app"
+    depends_on:
+      provision:
+        condition: "service_completed_successfully"
+
+  trader-alpaca:
+    build:
+      context: "."
+      dockerfile: "Dockerfile.local"
+    image: "catalyst-lab-local:dev"
+    read_only: true
+    tmpfs:
+      - "/tmp"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    profiles:
+      - "alpaca-paper"
+    command: ["python", "-m", "catalyst_lab.local_stack", "trader"]
+    # Your own Alpaca PAPER key and any engine overrides (docs/CONFIGURATION.md). Create
+    # .env.paper from deploy/local/alpaca-paper.env.example; git ignores it.
+    env_file:
+      - path: ".env.paper"
+        required: true
+    environment:
+      CATALYST_DB_HOST: "db"
+      CATALYST_DB_PORT: "5432"
+      CATALYST_VENUE: "alpaca-paper"
+      CATALYST_STRATEGY_PLUGINS_DIR: "/app/examples/strategies:/my-strategies"
+    volumes:
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/risk"
+        read_only: true
+        volume:
+          subpath: "risk"
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/jev"
+        read_only: true
+        volume:
+          subpath: "jev"
+      - type: "volume"
+        source: "role-secrets"
+        target: "/run/catalyst-roles/trader-tokens"
+        read_only: true
+        volume:
+          subpath: "trader-tokens"
+      - "./my-strategies:/my-strategies:ro"
+    depends_on:
+      provision:
+        condition: "service_completed_successfully"
+    healthcheck:
+      test: ["CMD", "python", "-m", "catalyst_lab.local_stack", "health", "http://127.0.0.1:8780/health"]
+      interval: "15s"
+      timeout: "8s"
+      retries: 5
+      start_period: "120s"
+    restart: "unless-stopped"
+
+volumes:
+  pgdata:
+  admin-secret:
+  role-secrets:
+  history:

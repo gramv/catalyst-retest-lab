@@ -21,6 +21,7 @@ packages = ["src/catalyst_lab"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["trade_plan: the engine follows its schema-27 ledger and plans report-V3 crypto picks"]
 
 [tool.ruff]
 line-length = 100

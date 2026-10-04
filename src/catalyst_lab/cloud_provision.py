@@ -252,8 +252,17 @@ def _release():
             "source_sha256": identity["source_sha256"]}
 
 
-def provision(admin_url, environ, *, now=None):
-    """Create and provision the cloud ledger on an empty database; see the module docstring."""
+PLATFORMS = ("RAILWAY", "LOCAL_COMPOSE")
+
+
+def provision(admin_url, environ, *, now=None, platform="RAILWAY"):
+    """Create and provision the cloud ledger on an empty database; see the module docstring.
+
+    ``platform`` is recorded in ``CLOUD_LEDGER_PROVISIONED``: ``RAILWAY`` (the reference
+    deployment) or ``LOCAL_COMPOSE`` (package oss-packaging: the disposable ledger of the local
+    Docker stack, ``local_stack provision``; the same roles, grants and checks)."""
+    if platform not in PLATFORMS:
+        raise ProvisionError("PROVISION_PLATFORM_UNKNOWN")
     now = (now or datetime.now(UTC)).astimezone(UTC)
     version = latest_version()
     roles = login_roles(version)
@@ -336,7 +345,7 @@ def provision(admin_url, environ, *, now=None):
         ledger_id = conn.execute("SELECT gen_random_uuid()::text").fetchone()[0]
         payload = {
             "kind": LEDGER_EVENT, "role": "ACCOUNT_LEDGER", "ledger_id": ledger_id,
-            "platform": "RAILWAY", "database": DATABASE, "schema_version": schema,
+            "platform": platform, "database": DATABASE, "schema_version": schema,
             "login_roles": sorted(roles), "nologin_roles": nologin,
             "skipped_roles": skipped, "owner_role": OWNER_ROLE, "owner_login": False,
             "provisioned_at": now.isoformat(), "provisioner": PROVISIONER, **_release(),

@@ -698,3 +698,21 @@ def test_a_quote_less_print_above_the_trigger_is_quiet_for_this_version_only(mx,
     run._flush_print_summaries(force=True)
     [summary] = rows(engine, "MARKET_PRINT_SUMMARY")
     assert summary["body"]["setup_ids"] == [str(v3)] and summary["body"]["count"] == 1
+
+
+def test_a_stream_message_stamped_up_to_three_seconds_ahead_of_our_clock_is_current(mx, market):
+    """2026-09-29: Alpaca stamps stream messages on its servers and the container's clock ran a
+    little behind them; with no tolerance every such message ended the crypto stream session
+    (INVALID_MARKET_TIMESTAMP, 18 drops in 22 minutes). Up to 3 s ahead is current; beyond is
+    refused as before."""
+    engine, venue, _ = mx
+    v3_setups(mx, ["AAA/USD"])
+    run = system_runtime(mx, market, ["AAA/USD"])
+    ahead = venue.now + timedelta(seconds=2)
+    run.market_message("CRYPTO", {"T": "t", "S": "AAA/USD", "p": "100", "i": 7,
+                                  "t": ahead.isoformat()})
+    too_far = venue.now + timedelta(seconds=4)
+    with pytest.raises(ValueError, match="INVALID_MARKET_TIMESTAMP"):
+        run.market_message("CRYPTO", {"T": "t", "S": "AAA/USD", "p": "100", "i": 8,
+                                      "t": too_far.isoformat()})
+

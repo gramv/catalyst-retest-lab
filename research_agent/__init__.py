@@ -26,4 +26,13 @@ moved over a New York day), ``outlook`` (the morning outlook worksheet and
 helper and ``POST_MORTEM_V1``), ``checklist`` (Muse's own research checklist, kept outside
 the app), ``lessons`` (the context's lessons and ordering hints for ``build``) and
 ``records`` (what the outlook and post-mortem sends share).
+
+Research loop V2 (package research-loop-kit, 2026-09-29; ``docs/RESEARCH-LOOP-V2.md`` 3.5 and
+3.6): ``update`` (the update run of ``RESEARCH_SCHEDULE_V2``: the review of the agent's own
+WATCHING setups and ``AGENT_RESEARCH_WITHDRAWAL_V1``) and ``derivatives`` (OKX open interest
+and Hyperliquid funding as cited context for the daily run's picks).
+
+Answers (package kit-answers, 2026-09-29): ``answers`` (``MUSE_ANSWER_RULES_V1``, the agent's
+answers to the app's window reviews and Jev early-exit flags, decided from Coinbase's 5-minute
+candles; the ``answer`` command).
 """

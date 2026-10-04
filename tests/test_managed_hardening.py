@@ -73,6 +73,26 @@ def test_accepted_but_unstarted_management_expires_without_changing_protection(m
     assert verify_events(engine.repo.export_events())["valid"]
 
 
+@pytest.mark.parametrize("symbol", ["SPY", "BTC/USD"])
+def test_a_print_with_no_quote_defers_an_accepted_amendment(mx, symbol):
+    """After a market gap the runtime's observation can hold a print and no quote. An accepted
+    amendment then waits, as for a stale quote, with the earlier levels in force."""
+    engine, venue, _ = mx
+    sid = opened(mx, symbol)
+    accept_amendment(mx, sid)
+    now = venue.now.isoformat()
+    engine.manage(sid, {"trade_price": "108", "trade_at": now, "trade_id": "7",
+                        "feed_healthy": True, "data_provider": "ALPACA",
+                        "data_feed": "CRYPTO_US", "retrieved_at": now})
+    assert not event_bodies(engine, "MANAGEMENT_STARTED", sid)
+    assert not event_bodies(engine, "MANAGEMENT_EXPIRED", sid)
+    assert engine._load(sid)[1]["amendment_expires_at"]
+    assert not any(method == "PATCH" for method, _, _ in venue.calls)
+    engine.manage(sid, observation(mx, bid="108", ask="108.01"))
+    [started] = event_bodies(engine, "MANAGEMENT_STARTED", sid)
+    assert started["reason"] == "FRESH_STATE_REVALIDATED"
+
+
 def test_fresh_premarket_print_cannot_trigger_after_regular_session_opens(mx, monkeypatch):
     engine, venue, _ = mx
     p = packet(mx, "SPY")
@@ -146,13 +166,15 @@ def test_freshly_started_crypto_replacement_completes_after_model_deadline(mx):
     observed = accept_amendment(mx, sid)
     original = venue.orders_of("sell", "stop_limit")[0]
     venue.defer_cancel = True
-    engine.manage(sid, observed)
+    # The market prints at 108, as it quotes: under CRYPTO_STOP_BREACH_V2 the fixture's default
+    # print (100, below the raised stop of 102) would be a breach.
+    engine.manage(sid, {**observed, "trade_price": "108"})
     assert original["status"] == "pending_cancel"
     assert len(event_bodies(engine, "MANAGEMENT_STARTED", sid)) == 1
     venue.now += timedelta(seconds=11)
     original["status"] = "canceled"
     venue.defer_cancel = False
-    engine.manage(sid, observation(mx, bid="108", ask="108.01"))
+    engine.manage(sid, observation(mx, trade_price="108", bid="108", ask="108.01"))
     replacements = venue.orders_of("sell", "stop_limit")
     assert len(replacements) == 2 and D(replacements[-1]["stop_price"]) == D(102)
     assert replacements[-1]["status"] == "new"

@@ -221,6 +221,38 @@ def test_the_scorecard_records_the_day_once_with_counts_beside_every_rate(mx):  
     assert "items" not in body["windows"]["7d"]["overall"]["maintenance"]
 
 
+def test_the_nightly_replays_measure_every_change_in_the_trades_own_r(mx):  # noqa: F811
+    """Three raises, the last made after the stop had passed the max entry (100.10): each is
+    recorded, walked on the levels in force before it and measured against the admitted stop
+    (95). Before 2026-09-29 the later ones used the raised stop as the risk, and the third
+    refused NONPOSITIVE_RISK_DENOMINATOR, so the trade's replays were never recorded."""
+    engine, venue, _ = mx
+    sid, _ = close_attributed(mx, "BTC/USD")
+    change_at = venue.now
+    steps = [("95", "99"), ("99", "100.50"), ("100.50", "101")]
+    with engine.store.transaction() as conn:
+        for minute, (before, after) in enumerate(steps):
+            engine.store.event(conn, "MAINTENANCE_DECISION", {
+                "outcome": "APPLIED", "action": "RAISE_STOP",
+                "decided_at": (change_at + timedelta(minutes=minute)).isoformat(),
+                "levels_before": {"stop": before, "target": "111"},
+                "levels_after": {"stop": after, "target": "111"}}, setup_id=sid)
+    bars = FakeBars(minutes={"BTC/USD": [
+        {"t": (change_at + timedelta(minutes=5)).isoformat(), "o": "104", "h": "112",
+         "l": "103", "c": "111", "v": "1"}]})
+    summary = record_replays(engine.store, bars, now=change_at + timedelta(hours=1))
+    assert (summary["recorded"], summary["failed"], summary["invalid"]) == (3, 0, 0)
+    with engine.repo.connect() as conn:
+        recorded = [r["body"] for r in conn.execute(
+            "SELECT body FROM lab.managed_events WHERE kind=%s ORDER BY event_seq",
+            (REPLAY_EVENT,)).fetchall()]
+    assert [r["original_stop"] for r in recorded] == ["95", "99", "100.50"]
+    one_r = D("111") - D("100.10")
+    for record in recorded:
+        assert record["initial_stop"] == "95" and record["exit_reason"] == "TARGET"
+        assert D(record["unchanged_gross_r"]) == one_r / (D("100.10") - D("95"))
+
+
 def test_the_nightly_replays_record_only_complete_counterfactuals(mx):  # noqa: F811
     engine, venue, _ = mx
     sid, _ = close_attributed(mx, "BTC/USD")

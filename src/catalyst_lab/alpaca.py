@@ -366,9 +366,10 @@ class AlpacaReadOnly:
         Package fees-net-r (plan phase 0): Alpaca charges crypto fees on what is
         received (a buy's fee comes out of the coin, a sell's out of the USD proceeds)
         and reports them as ``CFEE``/``FEE`` account activities (docs.alpaca.markets/us/
-        docs/crypto-fees). The exact wire shape of an in-kind (coin) fee activity is not
-        independently confirmed in this environment; ``managed_analytics.normalize_fee_activity``
-        documents the assumed fields. Paging mirrors ``fill_activities_since``.
+        docs/crypto-fees). The live paper account's rows, read on 2026-09-29, carry no order
+        id and no transaction time; ``managed_analytics.normalize_fee_activity`` documents
+        both shapes (ALPACA_FEE_MATCH_V2). ``after`` filters by activity date there, so a
+        read returns the whole day of ``after``. Paging mirrors ``fill_activities_since``.
         """
         from datetime import UTC, datetime
 

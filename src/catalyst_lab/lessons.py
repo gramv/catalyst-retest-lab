@@ -10,6 +10,15 @@ same for every agent) and its trades and movers still without an accepted post-m
 Sanitized: never another agent's lines, grades, notes or trades; never a Jev answer, receipt,
 the randomized arm, costs or an ``ENGINEERING_TEST`` setup. Lessons are served to research agents
 only and never reach Jev.
+
+Package learning-loop2 (2026-10-03), additive: ``daily_brief`` (the latest ``DAILY_BRIEF_V1``
+as an agent may see it, ``daily_brief.agent_view``: the market summary, the movers with their
+pre-move facts and simulated mechanical entries, the sector clusters and tomorrow's research
+focus -- research attention only, never the account's picks or trades) and
+``post_mortem_queue`` (every mover of the last 7 recorded days, and the agent's own notable
+trades, still without its post-mortem, each marked ``AGENT_WEB_RESEARCH``; what the cloud jobs
+computed without an agent is listed beside). The 2-hourly ``update`` runs of the research kit
+read the same lessons (``update --lessons``).
 """
 
 from datetime import UTC, date, datetime, timedelta
@@ -261,6 +270,44 @@ def safe_lessons(repository, agent_id, *, legacy=False, now):
                           "code": "LESSONS_UNAVAILABLE"})
 
 
+QUEUE_DAYS = 7
+MAX_QUEUE_MOVERS = 100
+
+
+def post_mortem_queue(days, agent_id, noted, trades, brief):
+    """The agent-dependent post-mortems still owed over the last ``QUEUE_DAYS`` recorded days
+    (package learning-loop2, plan L7): movers and the agent's notable trades."""
+    from catalyst_lab.daily_brief import COMPUTED_IN_CLOUD, NEEDS_AGENT
+
+    facts = {}
+    if brief is not None:
+        facts = {(brief["day"], m["symbol"]): m.get("pre_move")
+                 for m in brief["movers"]["items"]}
+    movers = []
+    for day in days[:QUEUE_DAYS]:
+        for m in day["movers"] or []:
+            if f"MOVER:{day['day']}:{m['symbol']}" in noted:
+                continue
+            movers.append({"symbol": m["symbol"], "day": day["day"],
+                           "return_pct": m["return_pct"], "move_start_at": m["move_start_at"],
+                           "was_miss": was_miss(m, agent_id, day["outlook_agents"]),
+                           "needs": "AGENT_WEB_RESEARCH",
+                           "pre_move_facts": facts.get((day["day"], m["symbol"]))})
+    return {"days": QUEUE_DAYS, "movers": movers[:MAX_QUEUE_MOVERS],
+            "movers_total": len(movers),
+            "trades": [{"setup_id": t["setup_id"], "symbol": t["symbol"],
+                        "notable_reasons": t["notable_reasons"], "needs": "AGENT_WEB_RESEARCH"}
+                       for t in trades if t["notable_reasons"]],
+            "needs_agent": list(NEEDS_AGENT), "computed_in_cloud": list(COMPUTED_IN_CLOUD)}
+
+
+def latest_brief(repository):
+    from catalyst_lab.daily_brief import recorded_brief
+
+    row = recorded_brief(repository)
+    return row["body"] if row else None
+
+
 def lessons_for(repository, agent_id, *, legacy=False, now):
     """The caller's ``RESEARCH_LESSONS_V1`` section as of ``now``."""
     now = _aware(now)
@@ -270,6 +317,9 @@ def lessons_for(repository, agent_id, *, legacy=False, now):
         days = reality_days(conn, agent_id, since)
         noted = noted_subjects(conn, agent_id)
         trades = pending_trades(repository, conn, agent_id, legacy, noted, now)
+    from catalyst_lab.daily_brief import agent_view
+
+    brief = latest_brief(repository)
     return json_safe({
         "lessons_version": LESSONS_VERSION, "agent_id": agent_id, "as_of": now,
         "available": True, "scorecard_day": day, "windows": windows,
@@ -277,6 +327,8 @@ def lessons_for(repository, agent_id, *, legacy=False, now):
         "recent_days": recent_days_section(days),
         "pending_post_mortems": {"trades": trades,
                                  "movers": pending_movers(days, agent_id, noted)},
+        "daily_brief": agent_view(brief),
+        "post_mortem_queue": post_mortem_queue(days, agent_id, noted, trades, brief),
     })
 
 

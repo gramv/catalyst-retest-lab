@@ -634,9 +634,22 @@ def test_populated_schema18_ledger_migrates_ddl_only_and_keeps_its_pending_reque
                 conn.execute(MIGRATION.with_name("023_selection_topk_v2.sql").read_text())
                 conn.execute(MIGRATION.with_name("024_public_experiment.sql").read_text())
                 conn.execute(MIGRATION.with_name("025_jev_review_policy_v2.sql").read_text())
+            # 026 (JEV_MANAGED_RISK_V4) appends exactly its three audited rows.
+            from tests.test_risk_v4 import V4_AUDIT_EVENTS, apply_migration_026
+
+            apply_migration_026(root)
+            # 027 (the trade plan's planned-stop guard) adds no row.
+            from tests.test_trade_plan_migration import apply_migration_027
+
+            apply_migration_027(root)
+            # 028, 029 (public page views) and 030 (JEV_TOP_K_SELECTION_V3) add no row.
+            from tests.test_selection_topk_v3 import apply_migrations_after_027
+
+            apply_migrations_after_027(root)
             after, _, _, version_after = audit_state(root)
-            assert version_after == SCHEMA_VERSION == 25 and after["valid"]
-            assert after["event_count"] == before["event_count"] + 2
+            # apply_migrations_after_027 ends with 031's four audited V5 rows (package plugin-c3).
+            assert version_after == SCHEMA_VERSION == 31 and after["valid"]
+            assert after["event_count"] == before["event_count"] + 2 + len(V4_AUDIT_EVENTS) + 4
             assert {t: v for t, v in audited_after.items() if t in audited} == audited
             assert audited_after["operator_flatten_completions"] == (0, 0)
             assert held_after == held and request_rows() == requests  # The 015 row, exactly.

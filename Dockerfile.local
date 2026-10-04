@@ -1,0 +1,41 @@
+# Catalyst Lab: the local Docker stack (package oss-packaging, LOCAL_STACK_V1). PAPER TRADING ONLY.
+# One image for every service of compose.yaml; each service's command picks its component
+# (python -m catalyst_lab.local_stack secrets|provision|trader|page|jobs, or catalyst-lab ...).
+# No secret is a build argument or a file in this image: the stack generates its passwords at
+# first start (local_stack secrets) and a broker key exists only in the user's own .env.paper,
+# read by the opt-in alpaca-paper profile. Dockerfile.local.dockerignore admits only what the
+# image needs.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=UTC \
+    HOME=/home/catalyst \
+    CATALYST_HISTORY_TEST_OUT=/data/history-tests \
+    CATALYST_HISTORY_CACHE_DIR=/data/history-cache
+
+WORKDIR /app
+
+# The locked runtime dependencies, every file pinned by hash (uv export of uv.lock).
+COPY deploy/requirements.managed.txt /tmp/requirements.txt
+RUN set -eux; \
+    pip install --require-hashes --only-binary=:all: -r /tmp/requirements.txt; \
+    rm /tmp/requirements.txt; \
+    groupadd --gid 10001 catalyst; \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/catalyst \
+        --shell /usr/sbin/nologin catalyst; \
+    install -d -o 10001 -g 10001 -m 0700 /run/catalyst-admin /run/catalyst-roles; \
+    install -d -o 10001 -g 10001 -m 0755 /data /my-strategies; \
+    printf '#!/bin/sh\nexec python -m catalyst_lab.cli "$@"\n' > /usr/local/bin/catalyst-lab; \
+    chmod 0755 /usr/local/bin/catalyst-lab
+
+# The code stays root-owned and read-only to the runtime user.
+COPY src /app/src
+COPY deploy/local /app/deploy/local
+COPY examples /app/examples
+
+USER 10001:10001
+CMD ["python", "-m", "catalyst_lab.local_stack", "trader"]

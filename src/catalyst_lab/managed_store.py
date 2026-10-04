@@ -69,6 +69,27 @@ class ManagedStore:
         self.event(conn, "STATE", body, setup_id=setup_id)
         return body
 
+    def revoke(self, conn, setup_id, reason, *, watching_only=False, details=None, key=None):
+        """The revoke path in the caller's ledger transaction (``ManagedExecution.revoke``
+        opens its own; a research withdrawal revokes inside its one transaction): the REVOKE
+        event, then a WATCHING setup becomes INVALIDATED and a working one keeps its state marked
+        revoked. ``watching_only`` revokes only a setup still WATCHING and returns whether it
+        did."""
+        if watching_only and self.state(conn, setup_id).get("state") != "WATCHING":
+            return False
+        self.event(conn, "REVOKE", {"reason": reason, **(details or {})}, setup_id=setup_id,
+                   key=key)
+        state = self.state(conn, setup_id)
+        if state["state"] not in TERMINAL:
+            self.transition(
+                conn,
+                setup_id,
+                "INVALIDATED" if state["state"] == "WATCHING" else state["state"],
+                revoked=True,
+                revocation_reason=reason,
+            )
+        return True
+
     def active(self):
         with self.repo.connect() as conn:
             rows = conn.execute("""SELECT s.*,t.body AS state FROM lab.managed_setups s

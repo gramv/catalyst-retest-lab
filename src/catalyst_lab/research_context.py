@@ -16,7 +16,12 @@ from this list. The context carries, as of one instant:
   the last 7 days, the last run's picks);
 * from ``RESEARCH_CONTEXT_V2`` (package learning-app, 2026-09-28) the caller's ``lessons``
   (``lessons.RESEARCH_LESSONS_V1``): its own scorecard lines, graded outlooks, the recent
-  movers and its pending post-mortems, read from the ledger; ``null`` for the status credential.
+  movers and its pending post-mortems, read from the ledger; ``null`` for the status credential;
+* from ``RESEARCH_CONTEXT_V3`` (package research-loop-app, 2026-09-29) the caller's own
+  ``watching_setups`` (report-V3 setups still WATCHING, which ``open_trades`` never lists: it
+  lists filled trades only), the setups an update run reviews and may withdraw or adjust, and
+  under ``RESEARCH_SCHEDULE_V2`` the schedule's ``daily`` run and the kind of the current and
+  next runs. Under ``RESEARCH_SCHEDULE_V1`` the schedule block is exactly V2's.
 
 Read-only and GET-only. Asset metadata is one ``GET /v2/assets`` (crypto, active) through the
 read-only paper transport and the account's request-budget governor, as a research read,
@@ -54,6 +59,7 @@ from catalyst_lab.research_report_v3 import (
     UniverseSnapshot,
     V3Intake,
 )
+from catalyst_lab.research_schedule import SCHEDULE_VERSION_V2
 from catalyst_lab.research_selection_topk import (
     NOT_RANKED,
     RANKED,
@@ -68,8 +74,10 @@ from catalyst_lab.scan_sources import CRYPTO_PATHS, ScanSourceError
 from catalyst_lab.system_check import SUPERSEDED_BY_NEW_RESEARCH
 
 # RESEARCH_CONTEXT_V2 (package learning-app, 2026-09-28): every V1 field unchanged plus
-# ``lessons``; V1 was served before this release.
-CONTEXT_VERSION = "RESEARCH_CONTEXT_V2"
+# ``lessons``; V1 was served before that release. RESEARCH_CONTEXT_V3 (package
+# research-loop-app, 2026-09-29): every V2 field unchanged plus ``watching_setups``, and the
+# V2 schedule's fields while RESEARCH_SCHEDULE_V2 is configured.
+CONTEXT_VERSION = "RESEARCH_CONTEXT_V3"
 # Owner list of 2026-09-26: USD-pegged and euro stablecoins are never picks; PAXG (gold) stays.
 STABLECOINS = frozenset({"USDC", "USDT", "USDG", "DAI", "PYUSD", "USDP", "TUSD", "FDUSD", "EURC"})
 ASSET_SOURCE = "ALPACA_PAPER_V2_ASSETS_CRYPTO_ACTIVE"
@@ -86,6 +94,7 @@ UNIVERSE_UNAVAILABLE = "RESEARCH_UNIVERSE_UNAVAILABLE"
 _USD_PAIR = re.compile(r"([A-Z0-9]{1,16})/USD")
 _ASSET_FIELDS = ("symbol", "class", "status", "tradable", "price_increment",
                  "min_order_size", "min_trade_increment")
+LEVEL_KEYS = ("entry_trigger", "max_entry_price", "stop", "target")
 CENT = Decimal("0.01")
 D = Decimal
 
@@ -289,6 +298,22 @@ class ResearchContextService:
         """Report-V3 intake dependencies; the universe is read only for a V3 body."""
         return V3Intake(self.schedule, self.universe_snapshot)
 
+    def admission_view(self):
+        """``RESEARCH_REPORT_VALIDATE_V1``'s view of the universe (package agent-api):
+        ``({symbol: coin}, market)``, each coin with its price increment, and the latest quotes
+        and trades of every coin (``market``: this service's quote cache, ``quotes``,
+        ``trades``, ``fetched_at``). Both come through the caches the context itself uses (the
+        asset list at most an hour old, quotes and trades under 5 seconds), so a validation
+        right after a context read costs no request. ``market`` is None when market data cannot
+        be read: the caller then evaluates no live-price check. Read-only."""
+        universe = self._universe()
+        symbols = [coin["symbol"] for coin in universe["coins"]]
+        try:
+            market = self._market(symbols)
+        except Exception:  # A market-data fault is a missing price, never a pass.
+            market = None
+        return {coin["symbol"]: coin for coin in universe["coins"]}, market
+
     # --- Quotes and trades (at most 5 seconds old) ------------------------------------------
 
     def _market(self, symbols):
@@ -433,6 +458,9 @@ class ResearchContextService:
                 "issues": issues,
             },
             "open_trades": self._open_trades(agent_id, legacy, market),
+            # RESEARCH_CONTEXT_V3 (package research-loop-app): the caller's own report-V3
+            # setups still WATCHING (no fill yet, so never in ``open_trades``).
+            "watching_setups": self._watching_setups(agent_id, legacy),
             # Package day-review: the caller's pending 24-hour reviews and Jev exit flags.
             "pending_reviews": self.reviews.pending(principal)["items"]
             if self.reviews is not None else [],
@@ -448,11 +476,22 @@ class ResearchContextService:
         if schedule is None:
             return None
         current = schedule.latest_at_or_before(now)
+        runs = schedule.next_runs(now)
+        if schedule.version != SCHEDULE_VERSION_V2:
+            return {
+                **schedule.as_dict(),
+                "current_run_slot": schedule.local(current),
+                "current_run_valid_until_limit": schedule.local(schedule.validity_limit(current)),
+                "next_runs": [schedule.local(run) for run in runs],
+            }
+        # RESEARCH_SCHEDULE_V2 (``as_dict`` adds ``daily``): each run's kind, FULL or UPDATE.
         return {
             **schedule.as_dict(),
             "current_run_slot": schedule.local(current),
+            "current_run_kind": schedule.run_kind(current),
             "current_run_valid_until_limit": schedule.local(schedule.validity_limit(current)),
-            "next_runs": [schedule.local(run) for run in schedule.next_runs(now)],
+            "next_runs": [schedule.local(run) for run in runs],
+            "next_run_kinds": [schedule.run_kind(run) for run in runs],
         }
 
     @staticmethod
@@ -545,6 +584,48 @@ class ResearchContextService:
                 "holding_window_seconds": state.get("holding_window_seconds"),
             })
         return trades
+
+    def _watching_setups(self, agent_id, legacy):
+        """RESEARCH_CONTEXT_V3: the caller's own report-V3 setups still WATCHING, by symbol.
+
+        Each row: ``setup_id``, ``symbol``, the admitted ``levels``, the ``run_slot`` it answers
+        (in the schedule's zone when one is configured, else as recorded), ``expires_at`` and
+        ``signal_id``. The owner is the packet's recorded ``agent`` block, as for
+        ``open_trades`` and the research withdrawals; ``[]`` for the status credential.
+        """
+        if agent_id is None and not legacy:
+            return []
+        with self.repo.connect() as conn:
+            rows = conn.execute(
+                f"""SELECT s.setup_id,s.symbol,s.expires_at,s.record_json->'levels' AS levels,
+                s.record_json->>'run_slot' AS run_slot,
+                s.record_json->>'signal_id' AS signal_id
+                FROM lab.managed_setups s JOIN lab.managed_states t USING(setup_id)
+                WHERE t.body->>'state'='WATCHING'
+                AND s.record_json->>'report_schema_version'=%(v3)s
+                AND coalesce(s.record_json->>'purpose','')<>%(engineering)s
+                AND {self._owned('s.record_json')}
+                ORDER BY s.symbol COLLATE "C",s.event_seq""",
+                {"agent": agent_id, "legacy": legacy, "engineering": ENGINEERING_PURPOSE,
+                 "v3": REPORT_SCHEMA_V3},
+            ).fetchall()
+        return [{
+            "setup_id": row["setup_id"],
+            "symbol": row["symbol"],
+            "levels": {key: (row["levels"] or {}).get(key) for key in LEVEL_KEYS},
+            "run_slot": self._local_slot(row["run_slot"]),
+            "expires_at": row["expires_at"],
+            "signal_id": row["signal_id"],
+        } for row in rows]
+
+    def _local_slot(self, value):
+        """A recorded run slot in the schedule's zone (as recorded without a schedule)."""
+        if self.schedule is None or value is None:
+            return value
+        try:
+            return self.schedule.local(datetime.fromisoformat(value))
+        except ValueError:
+            return value
 
     def _recent_outcomes(self, agent_id, legacy, now):
         since = now - timedelta(days=RECENT_DAYS)

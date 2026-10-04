@@ -14,6 +14,8 @@ from uuid import UUID, uuid4, uuid5
 
 from catalyst_lab import research_selection_b2 as b2_rule
 from catalyst_lab import research_selection_topk as topk_rule
+from catalyst_lab import research_selection_topk_v3 as topk_v3
+from catalyst_lab import strategies
 from catalyst_lab.agent_identity import agent_cycle_id
 from catalyst_lab.jev_contract import (
     INSUFFICIENT,
@@ -68,6 +70,7 @@ from catalyst_lab.research_report_v3 import (
     is_v3,
     parse_report_v3,
 )
+from catalyst_lab.research_schedule import FULL_RUN, SCHEDULE_VERSION_V2, ResearchSchedule
 from catalyst_lab.research_selection_b1 import (
     ACTIVATION_KIND,
     B1_POLICY,
@@ -81,7 +84,7 @@ from catalyst_lab.research_selection_b1 import (
     started_rule,
 )
 from catalyst_lab.setup_scan import _evidence_hash
-from catalyst_lab.system_check import SUPERSEDED_BY_NEW_RESEARCH, newest_v3_run_slot
+from catalyst_lab.system_check import NOT_REPLACED, newer_v3_selections, newest_v3_run_slot
 from catalyst_lab.technical_evidence import TechnicalEvidence
 
 SELECTION_POLICY = "MUSE_JEV_RESEARCH_SELECTION_V2"
@@ -148,6 +151,25 @@ class TopKReview:
     result: ReviewResult
     decimal_answers: dict | None
     receipt_seq: int | None
+
+
+@dataclass(frozen=True)
+class ReportCheck:
+    """``ResearchIntake.validate_report``'s result (``RESEARCH_REPORT_VALIDATE_V1``): the parsed
+    report V3, the 202 body intake would return for it, and the instant of that verdict."""
+
+    intake: object  # research_report_v3.ReportIntakeV3
+    receipt: dict
+    checked_at: datetime
+
+
+@dataclass(frozen=True)
+class BreakerHeld:
+    """A top-K review not started because the shared Jev breaker was not CLOSED just before
+    its call (RESEARCH_REVIEW_BREAKER_GATE_V1): nothing was sent or recorded, so the pick
+    waits. ``breaker`` is the state that was read."""
+
+    breaker: dict
 
 
 def _answer_bearing_result(result):
@@ -624,135 +646,27 @@ class ResearchIntake:
         configured selection rule, exactly as a V2 cycle. The universe is read (cached, at most
         one broker read an hour) before the ledger transaction; an exact retry of a recorded
         report returns the stored response without reading it.
+
+        ``validate_report`` (``RESEARCH_REPORT_VALIDATE_V1``) runs these same steps, in this
+        order and through the same methods, and writes nothing.
         """
-        if v3 is None:
-            raise ResearchCapabilityUnavailable("RESEARCH_V3_INTAKE_NOT_CONFIGURED")
-        intake = parse_report_v3(raw, schedule=v3.schedule)
-        if type(max_seconds) is not int or not 1 <= max_seconds <= 86400:
-            raise ValueError("EXPLICIT_REPORT_DEADLINE_REQUIRED")
-        agent = intake.agent
-        cycle_id = agent_cycle_id(agent["agent_id"], intake.report_id)
+        intake, cycle_id = self._v3_intake(raw, max_seconds=max_seconds, v3=v3)
         with self.repo.connect() as conn:
             prior = self._started(self._rows(conn, cycle_id))
         if prior:
             return self._replay(cycle_id, prior, intake)
         universe = v3.snapshot()
-        now, generated = _utc(self.clock()), _utc(intake.generated_at)
+        now = _utc(self.clock())
         with self.store.transaction() as conn:
             prior = self._started(self._rows(conn, cycle_id))
             if prior:
                 return self._replay(cycle_id, prior, intake)
             # B1, B2 and top-K without their activation store nothing.
             rule_fields = self._started_rule_fields(v3=True)
-            if not 0 <= (now - generated).total_seconds() <= self.policy.max_packet_age_seconds:
-                raise ValueError("RESEARCH_REPORT_STALE_OR_FUTURE")
-            expires = min(_utc(intake.valid_until), generated + timedelta(seconds=max_seconds))
-            if expires <= now:
-                raise ValueError("RESEARCH_REPORT_EXPIRED")
-            outcomes, results = [], []
-            for item in intake.picks:
-                item, pick_expiry = check_pick(
-                    item, intake=intake, universe=universe, expires_at=expires, now=now
-                )
-                dossier = None
-                if item.code is None:
-                    try:
-                        dossier = compile_pick_dossier(
-                            item, now=now, agent_id=agent["agent_id"],
-                            valid_until=item.canonical["valid_until"]
-                            or intake.canonical["valid_until"],
-                        )
-                    except DossierRejected as exc:
-                        item = item.rejected(exc.code, exc.errors)
-                    except ValueError as exc:
-                        if str(exc) != "SENSITIVE_EVIDENCE_REJECTED":
-                            raise
-                        raise ResearchReportRejected(
-                            "SENSITIVE_EVIDENCE_REJECTED",
-                            errors=[{"path": item.path, "code": "SENSITIVE_EVIDENCE_REJECTED"}],
-                        ) from None
-                if item.code is not None:
-                    outcomes.append((item, None, None))
-                    results.append({
-                        "index": item.index, "signal_id": item.signal_id, "status": "REJECTED",
-                        "code": item.code, "errors": list(item.errors),
-                    })
-                    continue
-                pick, data = item.pick, item.canonical
-                packet = {
-                    "cycle_id": cycle_id,
-                    "item_key": V3_MARKET + ":" + pick.symbol,
-                    "asset_id": pick.symbol,
-                    "signal_id": pick.signal_id,
-                    "market": V3_MARKET,
-                    "symbol": pick.symbol,
-                    "revision": 1,
-                    "rank": item.index + 1,
-                    "research_origin": AGENT_REPORT_ORIGIN,
-                    # Attribution only: kept outside ``state``, so never reviewed.
-                    "agent": agent,
-                    "selection_policy": rule_fields["selection_policy"],
-                    "execution_scope": "PAPER_ONLY",
-                    "levels": data["levels"],
-                    "state": dossier.state,
-                    "created_at": generated.isoformat(),
-                    "received_at": now.isoformat(),
-                    "expires_at": _utc(pick_expiry).isoformat(),
-                    "evidence_hash": dossier.evidence_hash,
-                    "source_content_hash": self._source_content_hash(dossier.state["sources"]),
-                    # Full block incl. its agent_confidence for analytics; the reviewed state
-                    # carries it without the confidence.
-                    "selection_rationale": stored_rationale(data["selection_rationale"]),
-                    # Report V3, outside the reviewed state: the review lasts until expiry.
-                    "report_schema_version": REPORT_SCHEMA_V3,
-                    "dossier_version": DOSSIER_VERSION_V3,
-                    "review_validity": REVIEW_VALIDITY,
-                    "run_slot": intake.canonical["run_slot"],
-                    "agent_confidence": data["agent_confidence"],  # Analytics only.
-                }
-                outcomes.append((item, dossier, packet))
-                results.append({
-                    "index": item.index, "signal_id": item.signal_id, "status": "ACCEPTED",
-                    "item_key": packet["item_key"], "revision": 1,
-                    "evidence_hash": packet["evidence_hash"],
-                    "dossier_bytes": dossier.manifest["state_bytes"],
-                    "expires_at": packet["expires_at"],
-                })
-            accepted = [packet for _, _, packet in outcomes if packet is not None]
-            if not accepted:
-                code = results[0]["code"]
-                raise ResearchReportRejected(
-                    "INVALID_MUSE_REPORT" if code == "INVALID_RESEARCH_ITEM" else code,
-                    item_results=results,
-                )
-            body = {
-                "expires_at": expires.isoformat(),
-                "policy": asdict(self.policy),
-                **rule_fields,
-                "contender_count": len(accepted),
-                "submitted_count": len(results),
-                "rejected_count": len(results) - len(accepted),
-                "target_minimum_met": len(accepted) >= TARGET_PICKS,
-                "purpose": "ENGINEERING_TEST",
-                "research_origin": AGENT_REPORT_ORIGIN,
-                "agent": agent,
-                "report_schema_version": REPORT_SCHEMA_V3,
-                "dossier_version": DOSSIER_VERSION_V3,
-                "review_validity": REVIEW_VALIDITY,
-                "report_hash": intake.report_hash,
-                "report": intake.canonical,
-                "item_results": results,
-                "run_slot": intake.canonical["run_slot"],
-                "context_as_of": intake.canonical["context_as_of"],
-                "skipped_count": len(intake.skipped),
-                "research_schedule": intake.schedule,
-                # The tradable universe the picks were checked against.
-                "universe": {
-                    "source": universe.source,
-                    "fetched_at": _utc(universe.fetched_at).isoformat(),
-                    "symbols": sorted(universe.symbols),
-                },
-            }
+            body, outcomes = self._v3_verdict(
+                intake, cycle_id, rule_fields, universe=universe, now=now,
+                max_seconds=max_seconds,
+            )
             self._event(conn, cycle_id, "STARTED", body, "research:" + cycle_id + ":start")
             for item, dossier, packet in outcomes:
                 if packet is None:
@@ -777,6 +691,169 @@ class ResearchIntake:
                     f"research:{cycle_id}:{key}:1:dossier",
                 )
         return self._report_response(cycle_id, body, replay=False)
+
+    def _v3_intake(self, raw, *, max_seconds, v3):
+        """The parsed report V3 and its cycle ID; no clock, ledger or broker read."""
+        if v3 is None:
+            raise ResearchCapabilityUnavailable("RESEARCH_V3_INTAKE_NOT_CONFIGURED")
+        intake = parse_report_v3(raw, schedule=v3.schedule)
+        if type(max_seconds) is not int or not 1 <= max_seconds <= 86400:
+            raise ValueError("EXPLICIT_REPORT_DEADLINE_REQUIRED")
+        return intake, agent_cycle_id(intake.agent["agent_id"], intake.report_id)
+
+    def _v3_verdict(self, intake, cycle_id, rule_fields, *, universe, now, max_seconds):
+        """What report-V3 intake decides once the report is new: its age and expiry, then each
+        pick's checks and REVIEW_DOSSIER_V3 in order, then the refusal when no pick is
+        acceptable. Returns the RESEARCH_STARTED body and ``(item, dossier, packet)`` per pick
+        (dossier and packet None for a refused pick). Reads and writes nothing: the caller has
+        read the clock and the universe. Shared by intake and ``validate_report``.
+        """
+        agent, generated = intake.agent, _utc(intake.generated_at)
+        if not 0 <= (now - generated).total_seconds() <= self.policy.max_packet_age_seconds:
+            raise ValueError("RESEARCH_REPORT_STALE_OR_FUTURE")
+        expires = min(_utc(intake.valid_until), generated + timedelta(seconds=max_seconds))
+        if expires <= now:
+            raise ValueError("RESEARCH_REPORT_EXPIRED")
+        outcomes, results = [], []
+        for item in intake.picks:
+            item, pick_expiry = check_pick(
+                item, intake=intake, universe=universe, expires_at=expires, now=now
+            )
+            dossier = None
+            if item.code is None:
+                try:
+                    dossier = compile_pick_dossier(
+                        item, now=now, agent_id=agent["agent_id"],
+                        valid_until=item.canonical["valid_until"]
+                        or intake.canonical["valid_until"],
+                    )
+                except DossierRejected as exc:
+                    item = item.rejected(exc.code, exc.errors)
+                except ValueError as exc:
+                    if str(exc) != "SENSITIVE_EVIDENCE_REJECTED":
+                        raise
+                    raise ResearchReportRejected(
+                        "SENSITIVE_EVIDENCE_REJECTED",
+                        errors=[{"path": item.path, "code": "SENSITIVE_EVIDENCE_REJECTED"}],
+                    ) from None
+            if item.code is not None:
+                outcomes.append((item, None, None))
+                results.append({
+                    "index": item.index, "signal_id": item.signal_id, "status": "REJECTED",
+                    "code": item.code, "errors": list(item.errors),
+                })
+                continue
+            pick, data = item.pick, item.canonical
+            packet = {
+                "cycle_id": cycle_id,
+                "item_key": V3_MARKET + ":" + pick.symbol,
+                "asset_id": pick.symbol,
+                "signal_id": pick.signal_id,
+                "market": V3_MARKET,
+                "symbol": pick.symbol,
+                "revision": 1,
+                "rank": item.index + 1,
+                "research_origin": AGENT_REPORT_ORIGIN,
+                # Attribution only: kept outside ``state``, so never reviewed.
+                "agent": agent,
+                "selection_policy": rule_fields["selection_policy"],
+                "execution_scope": "PAPER_ONLY",
+                "levels": data["levels"],
+                "state": dossier.state,
+                "created_at": generated.isoformat(),
+                "received_at": now.isoformat(),
+                "expires_at": _utc(pick_expiry).isoformat(),
+                "evidence_hash": dossier.evidence_hash,
+                "source_content_hash": self._source_content_hash(dossier.state["sources"]),
+                # Full block incl. its agent_confidence for analytics; the reviewed state
+                # carries it without the confidence.
+                "selection_rationale": stored_rationale(data["selection_rationale"]),
+                # Report V3, outside the reviewed state: the review lasts until expiry.
+                "report_schema_version": REPORT_SCHEMA_V3,
+                "dossier_version": DOSSIER_VERSION_V3,
+                "review_validity": REVIEW_VALIDITY,
+                "run_slot": intake.canonical["run_slot"],
+                "agent_confidence": data["agent_confidence"],  # Analytics only.
+                # STRATEGY_REGISTRY_V1: a declared strategy only (absent reads as PULLBACK_V1).
+                **({"strategy_id": data["strategy_id"]} if data.get("strategy_id") else {}),
+            }
+            outcomes.append((item, dossier, packet))
+            results.append({
+                "index": item.index, "signal_id": item.signal_id, "status": "ACCEPTED",
+                "item_key": packet["item_key"], "revision": 1,
+                "evidence_hash": packet["evidence_hash"],
+                "dossier_bytes": dossier.manifest["state_bytes"],
+                "expires_at": packet["expires_at"],
+            })
+        accepted = [packet for _, _, packet in outcomes if packet is not None]
+        if not accepted:
+            code = results[0]["code"]
+            raise ResearchReportRejected(
+                "INVALID_MUSE_REPORT" if code == "INVALID_RESEARCH_ITEM" else code,
+                item_results=results,
+            )
+        body = {
+            "expires_at": expires.isoformat(),
+            "policy": asdict(self.policy),
+            **rule_fields,
+            "contender_count": len(accepted),
+            "submitted_count": len(results),
+            "rejected_count": len(results) - len(accepted),
+            "target_minimum_met": len(accepted) >= TARGET_PICKS,
+            "purpose": "ENGINEERING_TEST",
+            "research_origin": AGENT_REPORT_ORIGIN,
+            "agent": agent,
+            "report_schema_version": REPORT_SCHEMA_V3,
+            "dossier_version": DOSSIER_VERSION_V3,
+            "review_validity": REVIEW_VALIDITY,
+            "report_hash": intake.report_hash,
+            "report": intake.canonical,
+            "item_results": results,
+            "run_slot": intake.canonical["run_slot"],
+            "context_as_of": intake.canonical["context_as_of"],
+            "skipped_count": len(intake.skipped),
+            "research_schedule": intake.schedule,
+            # The tradable universe the picks were checked against.
+            "universe": {
+                "source": universe.source,
+                "fetched_at": _utc(universe.fetched_at).isoformat(),
+                "symbols": sorted(universe.symbols),
+            },
+        }
+        return body, outcomes
+
+    def validate_report(self, raw, *, max_seconds, v3):
+        """``RESEARCH_REPORT_VALIDATE_V1`` (package agent-api): what report-V3 intake would
+        answer ``raw`` now, with nothing written.
+
+        The steps of ``_start_report_v3`` in its order and through its own methods: parsing
+        (envelope, identity, schedule, duplicates, the credential screen, each pick's schema),
+        the replay check of a recorded ``report_id`` (its stored receipt for an exact resend,
+        REPORT_IDEMPOTENCY_CONTENT_MISMATCH for changed content), the universe, the selection
+        rule's activation, the report's age and expiry, then each pick's checks and its
+        REVIEW_DOSSIER_V3 with the byte budgets. A refusal raises exactly what intake raises.
+        The ledger is read once (the replay check), outside any transaction and without the
+        shared lock; no event, cycle, packet or idempotency record is written, and nothing here
+        can reach Jev (``ResearchIntake`` holds no reviewer). A body that is not report V3 is
+        refused REPORT_V3_REQUIRED. Returns a ``ReportCheck``: the parsed report, the 202 body
+        intake would return (``idempotent_replay`` true when already recorded) and the instant
+        of the verdict.
+        """
+        if not is_v3(raw):
+            raise ResearchReportRejected(topk_rule.REPORT_V3_REQUIRED)
+        intake, cycle_id = self._v3_intake(raw, max_seconds=max_seconds, v3=v3)
+        with self.repo.connect() as conn:
+            prior = self._started(self._rows(conn, cycle_id))
+        if prior:
+            receipt = self._replay(cycle_id, prior, intake)
+            return ReportCheck(intake, receipt, _utc(self.clock()))
+        universe = v3.snapshot()
+        now = _utc(self.clock())
+        rule_fields = self._started_rule_fields(v3=True)
+        body, _ = self._v3_verdict(
+            intake, cycle_id, rule_fields, universe=universe, now=now, max_seconds=max_seconds,
+        )
+        return ReportCheck(intake, self._report_response(cycle_id, body, replay=False), now)
 
     @staticmethod
     def _started(rows):
@@ -1229,9 +1306,13 @@ class ResearchIntake:
 class ResearchCycle(ResearchIntake):
     """The independently running app worker evaluates the durable research queue."""
 
-    def __init__(self, repository, reviewer, policy, *, clock, selection=None):
+    def __init__(self, repository, reviewer, policy, *, clock, selection=None,
+                 comparison_facts=None):
         super().__init__(repository, policy, clock=clock, selection=selection)
         self.reviewer = reviewer
+        # JEV_TOP_K_SELECTION_V3: the read-only fact reader of its comparative review
+        # (selection_facts_v3.ComparisonFacts); without one every bucket is UNKNOWN.
+        self.comparison_facts = comparison_facts
         repository.require_same_database(reviewer.store)
         if reviewer.policy.deadline_seconds > policy.review_deadline_seconds:
             raise ValueError("REVIEWER_DEADLINE_EXCEEDS_CYCLE_POLICY")
@@ -1265,6 +1346,8 @@ class ResearchCycle(ResearchIntake):
         """B2 packets are reviewed with SKEPTIC_QUESTIONS_V2, top-K packets with their pick
         kind's question set; every other packet keeps V1."""
         policy = packet.get("selection_policy")
+        if topk_rule.is_v3(policy):
+            return topk_v3.pick_checks_set(packet.get("state") or {})
         if policy in topk_rule.TOPK_POLICIES:
             return topk_rule.question_set((packet.get("state") or {}).get("kind"), policy)
         return SKEPTIC_V2 if packet.get("selection_policy") == B2_POLICY else SKEPTIC
@@ -2030,7 +2113,8 @@ class ResearchCycle(ResearchIntake):
         return tuple(
             r["event_seq"]
             for r in rows
-            if r["kind"] in ("RESEARCH_PACKET", "RESEARCH_DECISION", "RESEARCH_QUALITY")
+            if r["kind"] in ("RESEARCH_PACKET", "RESEARCH_DECISION", "RESEARCH_QUALITY",
+                             topk_v3.COMPARISON_STATE_KIND, topk_v3.COMPARISON_KIND)
         )
 
     async def _topk_tick(self, cycle_id):
@@ -2038,18 +2122,36 @@ class ResearchCycle(ResearchIntake):
 
         Each pick is reviewed once (no evidence task); nothing is reviewed after the cycle's
         ranking is recorded or past a pick's ranking deadline. Returns the kind decisions.
+
+        RESEARCH_REVIEW_BREAKER_GATE_V1: a review whose request is not recorded yet starts only
+        while the shared Jev breaker is CLOSED, read here and again just before each call.
+        While it is OPEN or HALF_OPEN such a review is neither claimed nor sent, so its pick
+        waits, and the cycle records one RESEARCH_REVIEWS_DEFERRED per breaker opening. A
+        review whose request is already recorded (its tick was interrupted before recording
+        the outcome) is still read back from its receipts, which sends nothing.
         """
         now = _utc(self.clock())
         with self.repo.connect() as conn:
             rows = self._rows(conn, cycle_id)
-        self._cycle(rows)
+        started = self._cycle(rows)
         if self._topk_ranking_row(rows) is not None:
             return []
+        if topk_rule.is_v3(started.get("selection_policy")):
+            return await self._topk3_tick(cycle_id, rows, now)
 
         def reviewable(packet):
             return now < self._topk_deadline(packet)
 
-        claims = self._claim(cycle_id, eligible=reviewable)
+        unreviewed = self._topk_unreviewed(rows, reviewable)
+        held = self._breaker_hold() if unreviewed else None
+        recorded = self._topk_recorded(unreviewed) if held is not None else frozenset()
+
+        def may_start(packet, request_id):
+            return reviewable(packet) and (held is None or request_id in recorded)
+
+        claims = self._claim(
+            cycle_id, eligible=lambda p: may_start(p, self._topk_decision_request(p))
+        )
         scored = {
             (r["body"]["item_key"], r["body"]["revision"])
             for r in rows
@@ -2058,13 +2160,114 @@ class ResearchCycle(ResearchIntake):
         work = [
             packet
             for packet in sorted(self._latest(rows).values(), key=lambda p: p["rank"])
-            if (packet["item_key"], packet["revision"]) not in scored and reviewable(packet)
+            if (packet["item_key"], packet["revision"]) not in scored
+            and may_start(packet, self._topk_quality_request(packet))
         ][: self.policy.max_inflight]
         results = await asyncio.gather(
             *(self._review_topk(packet, claim) for packet, claim in claims),
             *(self._quality_topk(packet) for packet in work),
         )
-        return list(results[: len(claims)])
+        if held is None:
+            # The breaker opened after the check above: those reviews were not sent.
+            held = next((r.breaker for r in results if isinstance(r, BreakerHeld)), None)
+        if held is not None:
+            self._topk_defer(cycle_id, held, reviewable, rows)
+        return [r for r in results[: len(claims)] if not isinstance(r, BreakerHeld)]
+
+    # --- RESEARCH_REVIEW_BREAKER_GATE_V1 ---------------------------------------------------
+
+    def _breaker_hold(self):
+        """The shared Jev breaker's state while it is not CLOSED (a top-K review may not
+        start), else None.
+
+        Read through the reviewer's own Gate1Runtime (``lab.review_breaker_state``): the one
+        scope the managed runtime's research, position, maintenance and day reviews share. A
+        reviewer without one (fixtures only; the managed runtime always wires one) has no shared
+        breaker, so its reviews are never held. A failed read raises: the tick then starts
+        nothing and the runtime records the cycle's fault, as for any other failed read.
+        """
+        runtime = getattr(self.reviewer, "runtime", None)
+        if runtime is None:
+            return None
+        state = runtime.state()
+        return None if state["state"] == "CLOSED" else state
+
+    @staticmethod
+    def _topk_decision_request(packet):
+        """A pick's kind-review request ID, exactly as ``_claim`` derives it."""
+        return str(
+            uuid5(UUID(str(packet["cycle_id"])), f"{packet['item_key']}:{packet['revision']}")
+        )
+
+    def _topk_unreviewed(self, rows, reviewable):
+        """The request ID of each review a reviewable pick still lacks (its kind review with no
+        RESEARCH_DECISION, its QUALITY_V3 review with no RESEARCH_QUALITY), mapped to the pick."""
+        decided, scored = set(), set()
+        for row in rows:
+            key = (row["body"].get("item_key"), row["body"].get("revision"))
+            if row["kind"] == "RESEARCH_DECISION":
+                decided.add(key)
+            elif row["kind"] == "RESEARCH_QUALITY":
+                scored.add(key)
+        unreviewed = {}
+        for packet in self._latest(rows).values():
+            key = (packet["item_key"], packet["revision"])
+            if not reviewable(packet):
+                continue
+            if key not in decided:
+                unreviewed[self._topk_decision_request(packet)] = packet
+            # JEV_TOP_K_SELECTION_V3 has no per-pick quality review.
+            if key not in scored and not topk_rule.is_v3(packet.get("selection_policy")):
+                unreviewed[self._topk_quality_request(packet)] = packet
+        return unreviewed
+
+    def _topk_recorded(self, request_ids):
+        """Those of ``request_ids`` already recorded in ``lab.jev_requests``: a review that
+        started before, read back from its receipts without a new call."""
+        with self.reviewer.store.connect() as conn:
+            found = conn.execute(
+                "SELECT request_id::text AS request_id FROM lab.jev_requests "
+                "WHERE request_id=ANY(%s::uuid[])",
+                (list(request_ids),),
+            ).fetchall()
+        return frozenset(row["request_id"] for row in found)
+
+    def _topk_defer(self, cycle_id, breaker, reviewable, rows):
+        """Record the cycle's RESEARCH_REVIEWS_DEFERRED for this breaker opening, once, with the
+        number of its picks still waiting for a review. Nothing is recorded when no pick waits
+        or the cycle is already ranked. ``rows`` are the tick's: an event they already hold
+        needs no ledger transaction on the ticks that follow it."""
+        runtime = self.reviewer.runtime
+        key = topk_rule.deferral_key_for(cycle_id, runtime.scope_id, breaker["epoch"])
+        if any(r["idempotency_key"] == key for r in rows):
+            return
+        with self.store.transaction() as conn:
+            rows = self._rows(conn, cycle_id)
+            if self._topk_ranking_row(rows) is not None or any(
+                r["idempotency_key"] == key for r in rows
+            ):
+                return
+            waiting = {
+                packet["item_key"]: packet
+                for packet in self._topk_unreviewed(rows, reviewable).values()
+            }
+            if not waiting:
+                return
+            self.store.event(
+                conn,
+                topk_rule.DEFERRED_KIND,
+                topk_rule.deferral_body(
+                    cycle_id=cycle_id,
+                    breaker=breaker,
+                    scope_id=runtime.scope_id,
+                    review_policy=runtime.inputs["version"],
+                    waiting_picks=len(waiting),
+                    review_deadline=min(
+                        self._topk_deadline(packet) for packet in waiting.values()
+                    ).isoformat(),
+                ),
+                key=key,
+            )
 
     def _topk_verified(self, packet, request_id, questions, identity, *, fresh=None):
         """A top-K review read back from its retained request and receipts only.
@@ -2152,7 +2355,8 @@ class ResearchCycle(ResearchIntake):
     async def _review_topk(self, packet, claim):
         """One pick's review with its kind's question set. The decision records the veto
         codes, the uncertain components and the verdict as dissent; there is no evidence
-        task, and a failed or unbound review is NOT_RANKED with its own code."""
+        task, and a failed or unbound review is NOT_RANKED with its own code. A review not
+        started because the breaker is no longer CLOSED records nothing (BreakerHeld)."""
         request_id = claim["request_id"]
         kind = packet["state"].get("kind")
         policy = packet["selection_policy"]
@@ -2160,6 +2364,9 @@ class ResearchCycle(ResearchIntake):
         identity = self._identity(packet)
         verified = self._topk_verified(packet, request_id, questions, identity)
         if verified is None:
+            held = self._breaker_hold()
+            if held is not None:
+                return BreakerHeld(held)
             fresh = await self.reviewer.jev_review(
                 request_id=request_id,
                 identity=identity,
@@ -2206,12 +2413,16 @@ class ResearchCycle(ResearchIntake):
 
     async def _quality_topk(self, packet):
         """One pick's MUSE_JEV_COMPARATIVE_QUALITY_V3 review of the same reviewed state: its
-        0-100 score and category (or NOT_SCORED with its code)."""
+        0-100 score and category (or NOT_SCORED with its code). A review not started because
+        the breaker is no longer CLOSED records nothing (BreakerHeld)."""
         cycle_id = packet["cycle_id"]
         request_id = self._topk_quality_request(packet)
         identity = self._quality_identity(packet)
         verified = self._topk_verified(packet, request_id, QUALITY_V3, identity)
         if verified is None:
+            held = self._breaker_hold()
+            if held is not None:
+                return BreakerHeld(held)
             deadline = min(
                 self._review_deadline(packet),
                 _utc(self.clock()) + timedelta(seconds=self.policy.review_deadline_seconds),
@@ -2313,6 +2524,8 @@ class ResearchCycle(ResearchIntake):
         """The cycle's RESEARCH_RANKING body and its basis, or None while a pick is still
         reviewable: every pick needs both reviews, or its ranking deadline must have passed
         (it is then NOT_RANKED ``REVIEW_DEADLINE_PASSED``)."""
+        if topk_rule.is_v3(rule.policy):
+            return self._topk3_ranking(cycle_id, rows, started, rule, now)
         packets = sorted(self._latest(rows).values(), key=lambda p: p["rank"])
         decisions, quality = {}, {}
         for row in rows:
@@ -2359,10 +2572,17 @@ class ResearchCycle(ResearchIntake):
                 current = self._rows(conn, cycle_id)
                 # Write only against the exact rows the ranking was computed from.
                 if self._topk_ranking_row(current) is None and self._topk_basis(current) == basis:
-                    self.store.event(
+                    written = self.store.event(
                         conn, topk_rule.RANKING_KIND, body,
                         key=topk_rule.ranking_key_for(cycle_id),
                     )
+                    if topk_rule.is_v3(body["policy"]) and not body["counts"]["RANKED"]:
+                        # JEV_TOP_K_SELECTION_V3 may select none: recorded once, with the ranking.
+                        self._event(conn, cycle_id, "SELECTION_NONE", topk_v3.none_body(
+                            cycle_id=cycle_id, ranking_event_seq=written["event_seq"],
+                            counts=body["counts"],
+                            comparison_status=(body.get("comparison") or {}).get("status"),
+                        ), topk_v3.none_key_for(cycle_id))
         with self.store.transaction() as conn:
             rows = self._rows(conn, cycle_id)
             if self._topk_ranking_row(rows) is not None:
@@ -2437,8 +2657,10 @@ class ResearchCycle(ResearchIntake):
             """SELECT event_seq,body->'packet'->>'cycle_id' AS cycle_id,
             body->'packet'->>'run_slot' AS run_slot FROM lab.managed_events
             WHERE kind='RESEARCH_SELECTED' AND body->'packet'->>'symbol'=%s
-            AND body->'packet'->>'cycle_id'<>%s ORDER BY event_seq""",
-            (packet["symbol"], str(cycle_id)),
+            AND body->'packet'->>'cycle_id'<>%s
+            AND body->'packet'->>'selection_policy' IS DISTINCT FROM %s ORDER BY event_seq""",
+            # A promoted strategy's signal (STRATEGY_PAPER_PATH_V1) answers no research run.
+            (packet["symbol"], str(cycle_id), strategies.SIGNAL_SELECTION_POLICY),
         ).fetchall()
         for row in rows:
             try:
@@ -2497,6 +2719,9 @@ class ResearchCycle(ResearchIntake):
         if self._topk_selected_in_run(conn, cycle_id, packet) is not None:
             raise ValueError(topk_rule.DUPLICATE_SYMBOL_IN_RUN)
         decision = self._decisions(rows, packet)
+        if topk_rule.is_v3(started["selection_policy"]):
+            return self._topk3_publish(conn, cycle_id, packet, entry, ranking, decision, key,
+                                       replacement_for)
         quality = [
             r["body"] for r in rows
             if r["kind"] == "RESEARCH_QUALITY"
@@ -2527,10 +2752,37 @@ class ResearchCycle(ResearchIntake):
         }
         return self._event(conn, cycle_id, "SELECTED", {"packet": body}, key)
 
+    @staticmethod
+    def _replacement_window(conn, started):
+        """``(rule, coins a later run selected)`` while the cycle's run may still replace a
+        declined pick, else ``(None, ())``. Reads only the ledger.
+
+        ``TOPK_REPLACEMENT_V1``: the run is over once a V3 selection of any newer run is
+        published. ``TOPK_REPLACEMENT_V2``, for a cycle accepted under ``RESEARCH_SCHEDULE_V2``
+        (the ``research_schedule`` its start recorded): the run is over once a newer full
+        (daily) run's selection is published; an update run's selections only take their own
+        coins out of the walk, since each supersedes this run's pick of that coin
+        (``RESEARCH_RUN_SUPERSESSION_V2``).
+        """
+        slot = started.get("run_slot")
+        recorded = started.get("research_schedule") or {}
+        if slot is not None and recorded.get("version") == SCHEDULE_VERSION_V2:
+            schedule = ResearchSchedule(recorded["timezone"], tuple(recorded["runs"]),
+                                        recorded["grace_minutes"], recorded["daily"])
+            newer = newer_v3_selections(conn, datetime.fromisoformat(slot))
+            if any(schedule.run_kind(run) == FULL_RUN for run, _symbol in newer):
+                return None, frozenset()
+            return topk_rule.REPLACEMENT_RULE_V2, frozenset(symbol for _run, symbol in newer)
+        newest = newest_v3_run_slot(conn)
+        if newest is not None and (slot is None or newest > datetime.fromisoformat(slot)):
+            return None, frozenset()
+        return topk_rule.REPLACEMENT_RULE, frozenset()
+
     def replace_declined(self, conn, decline):
         """``TOPK_REPLACEMENT_V1``: the one replacement decision for a top-K pick declined at
         admission (plan 4.3, package replacement). Returns its RESEARCH_REPLACEMENT row, or None
-        when no decision applies.
+        when no decision applies. ``TOPK_REPLACEMENT_V2`` for a cycle accepted under
+        ``RESEARCH_SCHEDULE_V2`` (``_replacement_window``).
 
         ``decline`` is the selection's RESEARCH_ADMISSION_DECLINED row; the caller runs this in
         that decline's own ledger transaction ``conn``, under the shared lock every publication
@@ -2538,8 +2790,9 @@ class ResearchCycle(ResearchIntake):
         decide:
 
         * no decision for a cycle that is not top-K, for SUPERSEDED_BY_NEW_RESEARCH (the run is
-          over), once the cycle or the declined pick has expired, or once a newer ``run_slot``
-          than the pick's has been published;
+          over) or WITHDRAWN_BY_RESEARCH (AGENT_RESEARCH_WITHDRAWAL_V1: the agent's newer
+          research replaces it), once the cycle or the declined pick has expired, or once a
+          newer ``run_slot`` than the pick's has been published (V2: a newer daily run's);
         * otherwise the walk goes down the cycle's RESEARCH_RANKING to the next RANKED entry not
           yet selected (declined picks included) or skipped and publishes it through
           ``publish_ranked`` with ``replacement_for`` = the declined item. An entry it refuses
@@ -2557,7 +2810,7 @@ class ResearchCycle(ResearchIntake):
         declined_body = decline["body"]
         reason = declined_body.get("reason")
         cycle_id, item_key = declined_body.get("cycle_id"), declined_body.get("item_key")
-        if not cycle_id or not item_key or reason == SUPERSEDED_BY_NEW_RESEARCH:
+        if not cycle_id or not item_key or reason in NOT_REPLACED:
             return None
         cycle_id = str(cycle_id)
         rows = self._rows(conn, cycle_id)
@@ -2586,9 +2839,10 @@ class ResearchCycle(ResearchIntake):
             or now >= self._review_deadline(declined)
         ):
             return None  # The cycle's picks have expired.
-        slot, newest = started.get("run_slot"), newest_v3_run_slot(conn)
-        if newest is not None and (slot is None or newest > datetime.fromisoformat(slot)):
-            return None  # A newer run has been published: this run is over.
+        slot = started.get("run_slot")
+        rule, later_coins = self._replacement_window(conn, started)
+        if rule is None:
+            return None  # A newer run (V2: a newer daily run) has been published: it is over.
         ranking = self._topk_ranking_row(rows)
         if ranking is None:
             raise ValueError("TOPK_RANKING_REQUIRED")
@@ -2598,6 +2852,11 @@ class ResearchCycle(ResearchIntake):
         passed_over, chosen, published = [], None, None
         for entry in ranking["body"]["entries"]:
             if entry["status"] != topk_rule.RANKED or entry["item_key"] in taken:
+                continue
+            if entry["symbol"] in later_coins:  # TOPK_REPLACEMENT_V2: its newer pick stands.
+                passed_over.append({"item_key": entry["item_key"], "rank": entry["rank"],
+                                    "symbol": entry["symbol"],
+                                    "code": topk_rule.SELECTED_BY_LATER_RUN})
                 continue
             try:
                 published = self.publish_ranked(
@@ -2612,7 +2871,7 @@ class ResearchCycle(ResearchIntake):
             chosen = entry
             break
         body = {
-            "replacement_rule": topk_rule.REPLACEMENT_RULE,
+            "replacement_rule": rule,
             "declined_item_key": item_key,
             "declined_revision": declined["revision"],
             "declined_symbol": declined["symbol"],
@@ -2634,3 +2893,379 @@ class ResearchCycle(ResearchIntake):
             "run_slot": slot,
         }
         return self._event(conn, cycle_id, "REPLACEMENT", body, key)
+
+    # --- Selection rule JEV_TOP_K_SELECTION_V3 (research_selection_topk_v3) -----------------
+
+    async def _topk3_tick(self, cycle_id, rows, now):
+        """Stage 1 (each pick's checks review, concurrently), then stage 2 (the cycle's one
+        comparative review) once every pick is reviewed or past its ranking deadline.
+
+        The breaker gate of V1/V2 holds both stages: a review whose request is not recorded
+        starts only while the shared Jev breaker is CLOSED. Returns the stage-1 decisions.
+        """
+
+        def reviewable(packet):
+            return now < self._topk_deadline(packet)
+
+        unreviewed = self._topk_unreviewed(rows, reviewable)
+        held = self._breaker_hold() if unreviewed else None
+        recorded = self._topk_recorded(unreviewed) if held is not None else frozenset()
+
+        def may_start(packet, request_id):
+            return reviewable(packet) and (held is None or request_id in recorded)
+
+        claims = self._claim(
+            cycle_id, eligible=lambda p: may_start(p, self._topk_decision_request(p))
+        )
+        results = await asyncio.gather(
+            *(self._review_topk3(packet, claim) for packet, claim in claims)
+        )
+        if held is None:
+            held = next((r.breaker for r in results if isinstance(r, BreakerHeld)), None)
+        if held is not None:
+            self._topk_defer(cycle_id, held, reviewable, rows)
+        else:
+            await self._topk3_compare(cycle_id)
+        return [r for r in results if not isinstance(r, BreakerHeld)]
+
+    async def _review_topk3(self, packet, claim):
+        """One pick's stage-1 review (``PICK_CHECK_QUESTIONS_V1_C<n>``): its decision records
+        the Noul probabilities, the veto codes and the uncertain codes; a failed or unbound
+        review is NOT_RANKED with its own code."""
+        request_id = claim["request_id"]
+        state = packet["state"]
+        questions = topk_v3.pick_checks_set(state)
+        identity = self._identity(packet)
+        verified = self._topk_verified(packet, request_id, questions, identity)
+        if verified is None:
+            held = self._breaker_hold()
+            if held is not None:
+                return BreakerHeld(held)
+            fresh = await self.reviewer.jev_review(
+                request_id=request_id,
+                identity=identity,
+                state=state,
+                question_set=questions,
+                expires_at=datetime.fromisoformat(claim["deadline"]),
+                purpose="ENGINEERING_TEST",
+            )
+            verified = self._topk_verified(packet, request_id, questions, identity, fresh=fresh)
+        result = verified.result
+        outcome = topk_v3.assess_checks(result, state, verified.decimal_answers)
+        body = {
+            "item_key": packet["item_key"],
+            "revision": packet["revision"],
+            "request_id": request_id,
+            "receipt_ids": list(result.receipt_ids),
+            "evidence_hash": packet["evidence_hash"],
+            "answers": result.answers,
+            "disposition": outcome.status,
+            "reason": outcome.reason,
+            **topk_v3.decision_fields(outcome, state.get("kind")),
+        }
+        if _utc(self.clock()) >= self._review_deadline(packet):
+            body["disposition"] = "EXPIRED"
+            body["reason"] = "ORIGINAL_EVIDENCE_DEADLINE_PASSED"
+            body["reasons"] = [body["reason"]]
+        with self.store.transaction() as conn:
+            self._event(
+                conn,
+                packet["cycle_id"],
+                "DECISION",
+                body,
+                f"research:{packet['cycle_id']}:{packet['item_key']}:{packet['revision']}:decision",
+            )
+        return body
+
+    def _topk3_checks(self, packet, decision):
+        """``(stage-1 outcome, final receipt ID, its audit seq)`` re-derived from the retained
+        receipts: a recorded decision is never trusted on its own."""
+        state = packet["state"]
+        if decision is None:
+            return topk_v3.checks_not_ranked(topk_rule.REVIEW_DEADLINE_PASSED, state), None, None
+        if decision["disposition"] == "EXPIRED":
+            return topk_v3.checks_not_ranked(decision["reason"], state), None, None
+        verified = self._topk_verified(
+            packet, decision["request_id"], topk_v3.pick_checks_set(state),
+            self._identity(packet),
+        )
+        if verified is None:
+            return topk_v3.checks_not_ranked("MISSING_VALID_REVIEW", state), None, None
+        outcome = topk_v3.assess_checks(verified.result, state, verified.decimal_answers)
+        return outcome, (verified.result.receipt_ids or (None,))[-1], verified.receipt_seq
+
+    def _topk3_stage(self, rows, now):
+        """``(packets, assessed stage 1 by item, survivors, stage 1 still running)``.
+
+        Survivors are the RANKABLE picks in the agent's order, at most MAX_CANDIDATES."""
+        packets = sorted(self._latest(rows).values(), key=lambda p: p["rank"])
+        decisions = {
+            (r["body"].get("item_key"), r["body"].get("revision")): r["body"]
+            for r in rows if r["kind"] == "RESEARCH_DECISION"
+        }
+        running = any(
+            (p["item_key"], p["revision"]) not in decisions and now < self._topk_deadline(p)
+            for p in packets
+        )
+        checks = {
+            p["item_key"]: self._topk3_checks(p, decisions.get((p["item_key"], p["revision"])))
+            for p in packets
+        }
+        survivors = [p for p in packets if checks[p["item_key"]][0].status == "RANKABLE"]
+        return packets, checks, survivors[: topk_v3.MAX_CANDIDATES], running
+
+    def _topk3_start_deadline(self, packets, survivors):
+        """The last moment the comparison may start: before every survivor's review deadline
+        and within ``review_validity_seconds`` after the last pick's ranking deadline."""
+        return min(
+            min(self._review_deadline(p) for p in survivors),
+            max(self._topk_deadline(p) for p in packets)
+            + timedelta(seconds=self.policy.review_validity_seconds),
+        )
+
+    @staticmethod
+    def _topk3_row(rows, key):
+        return next((r for r in rows if r["idempotency_key"] == key), None)
+
+    def _topk3_facts(self, survivors, checks, now):
+        """``(market, {item_key: candidate}, evidence)`` from the configured fact reader."""
+        from catalyst_lab import selection_facts_v3 as facts_v3
+
+        reader = self.comparison_facts
+        evidence = {"facts_version": facts_v3.FACTS_VERSION, "as_of": now.isoformat()}
+        if reader is None:
+            evidence["reader"] = "NOT_CONFIGURED"
+            market = {"btc_regime_yesterday": facts_v3.UNKNOWN,
+                      "btc_last_4h": facts_v3.UNKNOWN, "entry_pacing": facts_v3.UNKNOWN}
+        else:
+            market, evidence["market"] = reader.market(now)
+        candidates, evidence["candidates"] = {}, {}
+        for packet in survivors:
+            outcome = checks[packet["item_key"]][0]
+            if reader is None:
+                state = packet["state"]
+                candidates[packet["item_key"]] = {
+                    "symbol": packet["symbol"], "setup_type": facts_v3.setup_type(state),
+                    "catalyst": facts_v3.catalyst_line(state),
+                    "checks": facts_v3.checks_words(outcome),
+                    **{name: facts_v3.UNKNOWN for name in (
+                        "trend_20d", "volume_vs_30d", "stop_width", "fees_in_r",
+                        "recent_results")},
+                }
+                continue
+            candidate, found = reader.candidate(packet, outcome, now)
+            candidates[packet["item_key"]] = candidate
+            evidence["candidates"][packet["item_key"]] = found
+        return market, candidates, evidence
+
+    def _topk3_request_id(self, cycle_id):
+        return str(uuid5(UUID(str(cycle_id)), f"comparison:{topk_v3.POLICY}"))
+
+    @staticmethod
+    def _topk3_identity(cycle_id, state_body):
+        return {
+            "cycle_id": str(cycle_id),
+            "research_item_key": topk_v3.COMPARISON_ITEM,
+            "selection_policy": topk_v3.POLICY,
+            "evidence_hash": state_body["state_hash"],
+        }
+
+    async def _topk3_compare(self, cycle_id):
+        """Stage 2: record the comparison's state (code facts, shuffled order), then its one
+        review, then its RESEARCH_COMPARISON. Nothing while stage 1 runs, after the ranking,
+        without survivors or past the start deadline; a held breaker waits (BreakerHeld)."""
+        now = _utc(self.clock())
+        with self.repo.connect() as conn:
+            rows = self._rows(conn, cycle_id)
+        if self._topk_ranking_row(rows) is not None or self._topk3_row(
+                rows, topk_v3.comparison_key_for(cycle_id)) is not None:
+            return None
+        packets, checks, survivors, running = self._topk3_stage(rows, now)
+        if running or not survivors:
+            return None
+        state_row = self._topk3_row(rows, topk_v3.comparison_state_key_for(cycle_id))
+        if state_row is None:
+            deadline = self._topk3_start_deadline(packets, survivors)
+            if now >= deadline:
+                return None
+            held = self._breaker_hold()
+            if held is not None:
+                return BreakerHeld(held)
+            market, candidates, evidence = await asyncio.to_thread(
+                self._topk3_facts, survivors, checks, now)
+            order = topk_v3.shuffled(cycle_id, [
+                {"item_key": p["item_key"], "revision": p["revision"], "symbol": p["symbol"]}
+                for p in survivors])
+            state = {"market": market,
+                     "candidates": [candidates[item["item_key"]] for item in order]}
+            questions = topk_v3.COMPARE_SETS[len(order)]
+            body = {
+                "selection_policy": topk_v3.POLICY,
+                "shuffle": topk_v3.SHUFFLE_METHOD,
+                "seed": str(cycle_id),
+                "order": order,
+                "state": state,
+                "state_hash": digest(encoded(state)),
+                "question_set_version": questions.version,
+                "template_hash": questions.template_hash,
+                "request_id": self._topk3_request_id(cycle_id),
+                "expires_at": min(
+                    deadline, now + timedelta(seconds=self.policy.review_deadline_seconds)
+                ).isoformat(),
+                "evidence": evidence,
+            }
+            with self.store.transaction() as conn:
+                current = self._rows(conn, cycle_id)
+                if self._topk_ranking_row(current) is not None:
+                    return None
+                state_row = self._event(
+                    conn, cycle_id, "COMPARISON_STATE", body,
+                    topk_v3.comparison_state_key_for(cycle_id))
+        body = state_row["body"]
+        m = len(body["order"])
+        questions = topk_v3.COMPARE_SETS[m]
+        pseudo = {"state": body["state"], "expires_at": body["expires_at"]}
+        identity = self._topk3_identity(cycle_id, body)
+        request_id = body["request_id"]
+        verified = self._topk_verified(pseudo, request_id, questions, identity)
+        if verified is None:
+            if now >= datetime.fromisoformat(body["expires_at"]):
+                verified = TopKReview(ReviewResult(
+                    request_id, "NEEDS_REVIEW", "COMPARISON_DEADLINE_PASSED", (), {}), None, None)
+            else:
+                held = self._breaker_hold()
+                if held is not None:
+                    return BreakerHeld(held)
+                fresh = await self.reviewer.jev_review(
+                    request_id=request_id,
+                    identity=identity,
+                    state=body["state"],
+                    question_set=questions,
+                    expires_at=datetime.fromisoformat(body["expires_at"]),
+                    purpose="ENGINEERING_TEST",
+                )
+                verified = self._topk_verified(pseudo, request_id, questions, identity,
+                                               fresh=fresh)
+        outcome = topk_v3.assess_comparison(verified.result, m, verified.decimal_answers)
+        result = {
+            "selection_policy": topk_v3.POLICY,
+            "state_event_seq": state_row["event_seq"],
+            "request_id": request_id,
+            "receipt_ids": list(verified.result.receipt_ids),
+            "question_set_version": questions.version,
+            "order": body["order"],
+            "answers": verified.result.answers,
+            **outcome.body_fields(),
+        }
+        with self.store.transaction() as conn:
+            return self._event(conn, cycle_id, "COMPARISON", result,
+                               topk_v3.comparison_key_for(cycle_id))["body"]
+
+    def _topk3_comparison(self, cycle_id, rows, now, packets, survivors):
+        """``(outcome, state row, final receipt ID)`` of the comparison re-derived from its
+        receipts, or None while it may still be started or answered."""
+        state_row = self._topk3_row(rows, topk_v3.comparison_state_key_for(cycle_id))
+        result_row = self._topk3_row(rows, topk_v3.comparison_key_for(cycle_id))
+        if state_row is None:
+            if now < self._topk3_start_deadline(packets, survivors):
+                return None
+            return topk_v3.comparison_failed(topk_v3.COMPARISON_MISSING), None, None
+        body = state_row["body"]
+        if result_row is None and now < datetime.fromisoformat(body["expires_at"]):
+            return None
+        m = len(body["order"])
+        verified = self._topk_verified(
+            {"state": body["state"], "expires_at": body["expires_at"]}, body["request_id"],
+            topk_v3.COMPARE_SETS[m], self._topk3_identity(cycle_id, body))
+        if verified is None:
+            return topk_v3.comparison_failed(topk_v3.COMPARISON_MISSING), state_row, None
+        outcome = topk_v3.assess_comparison(verified.result, m, verified.decimal_answers)
+        return outcome, state_row, (verified.result.receipt_ids or (None,))[-1]
+
+    def _topk3_ranking(self, cycle_id, rows, started, rule, now):
+        """The V3 RESEARCH_RANKING body and its basis, or None while stage 1 runs or the
+        comparison may still be started or answered."""
+        packets, checks, survivors, running = self._topk3_stage(rows, now)
+        if running:
+            return None
+        outcome = state_row = comparison_receipt = None
+        if survivors:
+            compared = self._topk3_comparison(cycle_id, rows, now, packets, survivors)
+            if compared is None:
+                return None
+            outcome, state_row, comparison_receipt = compared
+        positions = {}
+        if state_row is not None:
+            positions = {item["item_key"]: index
+                         for index, item in enumerate(state_row["body"]["order"])}
+        survivor_keys = {p["item_key"] for p in survivors}
+        assessed = []
+        for packet in packets:
+            item_key = packet["item_key"]
+            outcome_1, receipt_id, _ = checks[item_key]
+            position = positions.get(item_key)
+            probability = code = best = None
+            if outcome_1.status == "RANKABLE":
+                if item_key not in survivor_keys:
+                    code = topk_v3.CAP_EXCEEDED
+                elif outcome.status != "ANSWERED" or position is None:
+                    code = "COMPARISON_" + (outcome.reason or "MISSING").removeprefix(
+                        "COMPARISON_")
+                else:
+                    probability = outcome.probabilities[position]
+                    best = {side: values[position]
+                            for side, values in outcome.choice_probabilities.items()}
+            assessed.append(topk_v3.Assessed(
+                item_key=item_key, revision=packet["revision"], symbol=packet["symbol"],
+                kind=packet["state"].get("kind"), agent_rank=packet["rank"], checks=outcome_1,
+                receipt_id=receipt_id, position=position if probability is not None else None,
+                probability=probability, comparison_code=code,
+                comparison_receipt_id=comparison_receipt if probability is not None else None,
+                best_choice=best,
+            ))
+        comparison = None
+        if state_row is not None:
+            questions = topk_v3.COMPARE_SETS[len(state_row["body"]["order"])]
+            comparison = {
+                "state_event_id": str(state_row["event_id"]),
+                "state_event_seq": state_row["event_seq"],
+                "request_id": state_row["body"]["request_id"],
+                "receipt_id": comparison_receipt,
+                "question_set_version": questions.version,
+                "order": [item["item_key"] for item in state_row["body"]["order"]],
+                **{k: v for k, v in outcome.body_fields().items()
+                   if k in ("status", "reason", "best_choice")},
+            }
+        elif outcome is not None:
+            comparison = {"status": outcome.status, "reason": outcome.reason}
+        body = topk_v3.ranking_body(
+            cycle_id=cycle_id, run_slot=started.get("run_slot"), k=rule.k,
+            entries=topk_v3.rank_entries(assessed),
+            complete=all(checks[p["item_key"]][0].reason != topk_rule.REVIEW_DEADLINE_PASSED
+                         for p in packets),
+            comparison=comparison,
+        )
+        return body, self._topk_basis(rows)
+
+    def _topk3_publish(self, conn, cycle_id, packet, entry, ranking, decision, key,
+                       replacement_for):
+        """``publish_ranked``'s V3 step: the entry's stage-1 receipt and its comparison bind."""
+        comparison = ranking["body"].get("comparison") or {}
+        if (
+            not decision
+            or decision[-1]["receipt_ids"][-1:] != [entry["receipt_id"]]
+            or entry.get("comparison_receipt_id") is None
+            or entry["comparison_receipt_id"] != comparison.get("receipt_id")
+        ):
+            raise ValueError("TOPK_RANKING_BINDING_FAILURE")
+        result = ReviewResult(
+            decision[-1]["request_id"], "RECORDED", None, tuple(decision[-1]["receipt_ids"]), {}
+        )
+        body = {
+            **self._selected_body(packet, result),
+            **topk_v3.selected_fields(
+                entry, ranking, k=ranking["body"]["k"], agent_rank=packet["rank"],
+                comparison=comparison, replacement_for=replacement_for,
+            ),
+        }
+        return self._event(conn, cycle_id, "SELECTED", {"packet": body}, key)

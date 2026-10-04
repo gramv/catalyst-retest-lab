@@ -75,12 +75,19 @@ def test_the_versions_are_exact_and_scoped_to_report_v3_crypto_in_the_managed_ar
     # From package answer-rules admission recorded CRYPTO_MAINTENANCE_V2 (the minute cadence,
     # context and questions V5 and its answer rule; every other number V1's), and from package
     # jev-budget CRYPTO_MAINTENANCE_V3 (V2 with the budget's cadence). V1's record above is
-    # unchanged and still read back (tests/test_answer_rules.py).
-    assert fields == {"maintenance_policy": cm.CRYPTO_MAINTENANCE_V3.record(),
+    # unchanged and still read back (tests/test_answer_rules.py). From package trade-plan:
+    # CRYPTO_MAINTENANCE_V4 (V3 with the stop-raise guards). From package jev-b1:
+    # CRYPTO_MAINTENANCE_V5 (V4 with two yes/no questions; tests/test_jev_b1_rules.py).
+    assert fields == {"maintenance_policy": cm.CRYPTO_MAINTENANCE_V5.record(),
                       "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}
     changed = {"policy_id", "answer_rule", "review_bar_seconds", "context_version",
                "question_version", "spend_guard", "throttled_review_bar_seconds",
-               "tight_review_bar_seconds"}
+               "tight_review_bar_seconds", "raise_min_r", "raise_range_multiple",
+               "raise_spacing_seconds", "breakeven_fee_fraction", "breakeven_basis",
+               "target_cap", "hour_bar_seconds", "confirm_bar_seconds", "confirm_bars",
+               "btc_move_fraction", "yes_at_or_above", "no_at_or_below", "confirm_yes",
+               "news_max_asks", "state_byte_budget", "invalidation_if_unanswered",
+               "news_if_unanswered"}
     assert {k: v for k, v in fields["maintenance_policy"].items() if k not in changed} == {
         k: v for k, v in record.items() if k not in changed}
     # The control arm opens like the maintained arm (plan 4.6.1) but is never maintained (4.6.6).

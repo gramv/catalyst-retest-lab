@@ -61,6 +61,7 @@ from catalyst_lab.crypto_maintenance import (
     KEEP,
     MAINTENANCE_ANSWER_RULE_V2,
     QUESTION_V5_VERSION,
+    QUESTION_V6_VERSION,
     QUESTION_VERSION,
     RAISE_BOTH,
     RAISE_STOP,
@@ -93,6 +94,8 @@ PICK_FIELDS = ("kind", "agent_current_price", "levels", "stated_reward_risk")
 VS_BTC_WINDOWS = (("1h", 3600), ("4h", 14400), ("24h", 86400))
 BASIS_TEXT = {
     "BREAKEVEN": "breakeven, the average entry price",
+    # CRYPTO_MAINTENANCE_V4: the average entry plus round-trip taker fees.
+    "BREAKEVEN_AFTER_FEES": "breakeven after round-trip fees (the average entry plus both fees)",
     "SWING_LOW_15M": "15-minute swing low",
     "SWING_LOW_1H": "1-hour swing low",
     "SWING_HIGH_1H": "1-hour swing high",
@@ -650,6 +653,13 @@ def review_history_row(item, now):
             if price is not None:
                 entry["price"] = price
         row[name] = entry
+    # CRYPTO_MAINTENANCE_V5 (package jev-b1): its reviews answer two yes/no questions, not the
+    # four above; their probabilities and verdicts are shown (only when present, so a history
+    # of earlier versions' reviews renders exactly as before).
+    for name in ("invalidation_met", "news_contradicts"):
+        value = answers.get(name)
+        if isinstance(value, dict):
+            row[name] = {"p": value.get("p"), "verdict": value.get("verdict")}
     return row
 
 
@@ -802,6 +812,10 @@ def questions_for(context):
     """The question set a stored maintenance context was asked with, by the question version
     its policy record names: V4 (``CRYPTO_MAINTENANCE_V1``) or V5 (``_V2``)."""
     version = policy_from_record(context.data["policy"]).question_version
+    if version == QUESTION_V6_VERSION:  # CRYPTO_MAINTENANCE_V5 (package jev-b1).
+        from catalyst_lab.maintenance_v5 import questions_for_state
+
+        return questions_for_state(context.state)
     if version == QUESTION_V5_VERSION:
         return maintenance_questions_v5(context)
     return maintenance_questions(context)

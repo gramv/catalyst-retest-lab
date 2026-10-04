@@ -147,8 +147,55 @@ def test_was_miss_and_an_empty_record():
 def test_the_status_credential_reads_no_lessons(context_lab):  # noqa: F811
     principal = SimpleNamespace(role="status", agent_id=None, legacy=False)
     body = context_lab.service.context(principal)
-    assert body["context_version"] == "RESEARCH_CONTEXT_V2" and body["lessons"] is None
+    assert body["context_version"] == "RESEARCH_CONTEXT_V3" and body["lessons"] is None
     agent = context_lab.service.context(SimpleNamespace(role="muse", agent_id="claude",
                                                         legacy=False))
     assert agent["lessons"]["outlook"]["status"] == "NO_GRADED_OUTLOOK_YET"
     assert agent["lessons"]["pending_post_mortems"] == {"trades": [], "movers": []}
+
+
+def test_the_lessons_carry_the_daily_brief_view_and_the_post_mortem_queue(mx):  # noqa: F811
+    """Package learning-loop2: the latest DAILY_BRIEF_V1 as an agent may see it (market,
+    movers, focus; never the account's picks or trades) and every mover of the last 7 recorded
+    days still without the agent's post-mortem, each marked AGENT_WEB_RESEARCH."""
+    from datetime import date
+
+    from catalyst_lab.daily_brief import BRIEF_EVENT, brief_key
+
+    engine, venue, _ = mx
+    store = engine.store
+    now = venue.now
+    days = [date(2026, 9, 25), date(2026, 9, 26)]
+    for day in days:
+        start, _ = day_bounds(day)
+        record_reality(store, day.isoformat(), [mover("SOL/USD", "7.0", start)],
+                       universe={"symbols": ["SOL/USD"]}, coins=[], factors={},
+                       outlook_agents=[])
+    brief = {"brief_version": "DAILY_BRIEF_V1", "day": "2026-09-26",
+             "market": {"regime_tag": "UP/HIGH/BROAD/NO_SELLOFF", "words": "Bitcoin 1%."},
+             "movers": {"items": [{"symbol": "SOL/USD", "sector": "L1", "return_pct": "7.0",
+                                   "big_move": True, "pre_move": {"status": "MEASURED"},
+                                   "tradeable": {"signals": 0},
+                                   "why": {"knowability": "PENDING_AGENT_POST_MORTEM"}}],
+                        "sector_clusters": []},
+             "missed": {"tradeable_by_strategy": {}, "previous_day_final": None},
+             "ours": {"trades": [{"symbol": "BTC/USD"}]},
+             "research_focus": [{"kind": "SECTOR_ATTENTION", "text": "Watch L1.",
+                                 "scope": "RESEARCH_ATTENTION_ONLY"}],
+             "agent_queue": {"pending_post_mortems": ["SOL/USD"]}}
+    with store.transaction() as conn:
+        store.event(conn, BRIEF_EVENT, brief, key=brief_key(date(2026, 9, 26)))
+    lessons = lessons_for(store.repo, "claude", now=now)
+    view = lessons["daily_brief"]
+    assert view["day"] == "2026-09-26" and "ours" not in view
+    assert view["research_focus"][0]["scope"] == "RESEARCH_ATTENTION_ONLY"
+    assert view["movers"][0]["knowability"] == "PENDING_AGENT_POST_MORTEM"
+    queue = lessons["post_mortem_queue"]
+    assert queue["movers_total"] == 2 and {m["day"] for m in queue["movers"]} == {
+        "2026-09-25", "2026-09-26"}
+    assert {m["needs"] for m in queue["movers"]} == {"AGENT_WEB_RESEARCH"}
+    newest = next(m for m in queue["movers"] if m["day"] == "2026-09-26")
+    assert newest["pre_move_facts"] == {"status": "MEASURED"}
+    assert queue["needs_agent"] and queue["computed_in_cloud"]
+    # The existing pending list (the latest day) is unchanged.
+    assert [m["day"] for m in lessons["pending_post_mortems"]["movers"]] == ["2026-09-26"]

@@ -301,6 +301,8 @@ def test_jobs_is_a_nightly_cron_with_only_the_traders_ledger_connection(tmp_path
     jobs = resources["service.jobs"]["config"]
     assert jobs["start"] == "python -m catalyst_lab.cloud_entry jobs"
     assert jobs["build"] == {"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile.managed"}
+    # NEVER: a failed run exits 1 (package ops-alarms) and waits for the next night; Railway's
+    # default ON_FAILURE would restart it at once, up to ten times.
     assert jobs["deploy"] == {"cronSchedule": "30 5 * * *", "restartPolicyType": "NEVER"}
     assert jobs["replicas"] == 1 and "healthcheck" not in jobs and "volumeMounts" not in jobs
     assert jobs["env"] == {

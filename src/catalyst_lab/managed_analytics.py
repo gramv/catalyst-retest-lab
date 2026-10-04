@@ -5,9 +5,9 @@ what the operator reconciled; it is not a claim this module contacted the broker
 """
 
 from collections import Counter
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_CEILING, InvalidOperation
 from decimal import Decimal as D
-from decimal import InvalidOperation
 from uuid import UUID, uuid5
 
 from catalyst_lab.agent_identity import agent_fields
@@ -23,9 +23,10 @@ COST_KIND = "FILL_COST_CORRECTION"
 ANALYTICS_VERSION = "MANAGED_ENGINEERING_ANALYTICS_V1"
 # Package fees-net-r (plan phase 0): fee evidence read from Alpaca's own account
 # activities, matched to a fill and appended through the same append-only correction
-# path as an operator's manual import. Fixture evidence only until an owner-run read
-# of the live account's activities confirms the exact activity wire shape (see
-# ``normalize_fee_activity`` and docs/packages/fees-net-r.md).
+# path as an operator's manual import. The shape it assumed (an order id and a transaction
+# time on every row) was wrong for the live paper account's crypto rows, read on 2026-09-29;
+# those bind by ALPACA_FEE_MATCH_V2 below (see ``normalize_fee_activity`` and
+# docs/packages/fees-net-r.md).
 FEE_ACTIVITY_SOURCE = "ALPACA_PAPER_ACTIVITY"
 SOURCES = {"BROKER_ACTIVITY", "BROKER_STATEMENT", "LAB_FIXTURE", FEE_ACTIVITY_SOURCE}
 LABEL = "PAPER_ENGINEERING_OBSERVATIONS_NOT_VALIDATED_STRATEGY_PERFORMANCE"
@@ -43,6 +44,39 @@ FEE_CORRECTION_NAMESPACE = UUID("c9a6f6f0-2b34-4c1a-9b7a-1a9c2f5e6d7b")
 # A fee activity's transaction time may lag the fill it belongs to by a few seconds; a gap
 # wider than this is not a match (fees-net-r matches "by order ID and time").
 FEE_MATCH_TOLERANCE_SECONDS = 5
+# ALPACA_FEE_MATCH_V2 (2026-09-29, docs/CONTRACT-RESOLUTIONS.md). The live paper account's
+# crypto CFEE rows carry no order id and no transaction time, so a row without an order id
+# binds by amount: to the one fill without fee evidence of its side (a coin fee: a buy of
+# that coin; a USD fee: any crypto sell), filled at most 24 h before the row's posting time
+# (``created_at``, FEE_MATCH_TOLERANCE_SECONDS of clock tolerance after it), whose fee at an
+# Alpaca tier-1 crypto rate rounds up to the posted amount. The fees-net-r rule (order id and
+# closest time, ``match_fee_activity``) is named ALPACA_FEE_MATCH_V1 and still binds every
+# row that carries an order id.
+FEE_MATCH_V1 = "ALPACA_FEE_MATCH_V1"
+FEE_MATCH_V2 = "ALPACA_FEE_MATCH_V2"
+# ALPACA_FEE_MATCH_V3 (2026-10-02, docs/CONTRACT-RESOLUTIONS.md). For a coin whose price has
+# more decimals than the activity's ``price`` field carries (PEPE, SHIB and BONK on the live
+# paper account, 2026-09-30 to 10-01), Alpaca posts the coin-fee row with ``price`` "0". Such a
+# row is a coin fee with no posted price: it binds exactly as V2 (its coin, a buy, the window
+# and the rate-rounded quantity) and its USD value is the posted quantity at the price of the
+# fill it binds to, the fill the coins were charged from. A negative price, or a zero price
+# with a cash debit, is still invalid.
+FEE_MATCH_V3 = "ALPACA_FEE_MATCH_V3"
+# ALPACA_FEE_MATCH_V4 (2026-10-02, package learning-measure, docs/CONTRACT-RESOLUTIONS.md). V2
+# and V3 leave a row ``ambiguous`` when it has two or more candidate fills. When a group of
+# ambiguous rows and their candidate fills is closed (no candidate is shared with a row outside
+# the group), the counts match, a complete assignment exists, and every complete assignment
+# gives the same fee to each trade (the fills are of one setup and side, or the rows carry the
+# same amounts), the group binds in time order (``assign_fee_activities_v4``). Anything else
+# stays ambiguous: V4 never chooses between outcomes that would differ.
+FEE_MATCH_V4 = "ALPACA_FEE_MATCH_V4"
+FEE_MATCH_V2_RATES = (D("0.0015"), D("0.0025"))  # Tier-1 crypto maker and taker.
+FEE_MATCH_V2_COIN_QUANTUM = D("0.000000001")  # A coin fee: rate x fill qty, rounded up.
+FEE_MATCH_V2_USD_QUANTUM = D("0.01")  # A USD fee: rate x fill notional, rounded up.
+FEE_MATCH_V2_MAX_LAG = timedelta(hours=24)
+# The fee read reaches back to the earliest fill still without fee evidence, at most this far
+# (Alpaca filters activities by date, and posts some fees hours after their fill).
+FEE_PENDING_MAX_AGE = timedelta(days=7)
 
 
 def _stamp(value):
@@ -121,15 +155,28 @@ def import_fill_cost_correction(store, raw, *, recorded_at):
     _privacy_check(encoded(body))
     request_hash = digest(encoded(body))
     key = "fill-cost-correction:" + correction_id
+
+    def replay(existing):
+        if existing["body"].get("request_hash") != request_hash:
+            raise ValueError("COST_CORRECTION_IDEMPOTENCY_MISMATCH")
+        return {"status": "COST_EVIDENCE_RECORDED", "event_seq": existing["event_seq"],
+                "correction_id": correction_id, "idempotent_replay": True}
+
+    # A recorded event never changes, so a replay is answered without the shared managed
+    # lock (the periodic fee import replays every recorded fee it reads again); only a
+    # first write takes the lock, and checks again under it.
+    with store.repo.connect() as conn:
+        existing = conn.execute(
+            "SELECT event_seq,body FROM lab.managed_events WHERE idempotency_key=%s", (key,),
+        ).fetchone()
+    if existing:
+        return replay(existing)
     with store.transaction() as conn:
         existing = conn.execute(
             "SELECT * FROM lab.managed_events WHERE idempotency_key=%s", (key,),
         ).fetchone()
         if existing:
-            if existing["body"].get("request_hash") != request_hash:
-                raise ValueError("COST_CORRECTION_IDEMPOTENCY_MISMATCH")
-            return {"status": "COST_EVIDENCE_RECORDED", "event_seq": existing["event_seq"],
-                    "correction_id": correction_id, "idempotent_replay": True}
+            return replay(existing)
         fill = conn.execute(
             """SELECT f.*,s.market,s.cohort FROM lab.managed_fills f
             JOIN lab.managed_setups s USING(setup_id) WHERE f.fill_id=%s""", (raw["fill_id"],),
@@ -224,10 +271,17 @@ def normalize_fee_activity(raw):
     (a debit) or unsigned; both are read as a magnitude. A row that explicitly reports
     zero (both fields absent or ``"0"``) is accepted as confirmed evidence of no fee,
     the same as any other amount — it is still one read account activity, not a guess.
+
+    That is ALPACA_FEE_MATCH_V1, kept for every row that carries an ``order_id``. A row
+    without one is read under ALPACA_FEE_MATCH_V2 (``_normalize_fee_activity_v2``): the
+    two crypto ``CFEE`` shapes the live paper account reported on 2026-09-29. The result
+    names its rule in ``match_policy``.
     """
     try:
         if not isinstance(raw, dict) or raw.get("activity_type") not in {"CFEE", "FEE"}:
             raise ValueError
+        if raw.get("order_id") is None:
+            return _normalize_fee_activity_v2(raw)
         order_id, activity_id = raw.get("order_id"), raw.get("id")
         if not isinstance(order_id, str) or not order_id:
             raise ValueError
@@ -246,6 +300,7 @@ def normalize_fee_activity(raw):
             base_value = qty * price
         return {
             "activity_id": activity_id,
+            "match_policy": FEE_MATCH_V1,
             "order_id": order_id,
             "at": timestamp(raw["transaction_time"]),
             "cash_fee_usd": cash,
@@ -257,6 +312,55 @@ def normalize_fee_activity(raw):
         MarketDataError,
     ):
         raise ValueError("INVALID_FEE_ACTIVITY") from None
+
+
+def _exact_number(value):
+    if isinstance(value, (float, bool)) or value is None:
+        raise ValueError
+    number = D(str(value))
+    if not number.is_finite():
+        raise ValueError
+    return number
+
+
+def _normalize_fee_activity_v2(raw):
+    """One of the two verified crypto ``CFEE`` shapes (ALPACA_FEE_MATCH_V2); else raises.
+
+    Both are ``activity_type`` ``CFEE``, ``status`` ``executed``, ``currency`` ``USD``,
+    with an ``id`` and ``created_at`` (the posting time) and no order id:
+
+    - ``"Coin Pair Transaction Fee (Non USD)"``, a buy's fee taken in the coin: ``symbol``
+      (``UNIUSD`` for the ledger's ``UNI/USD``), a negative ``qty`` (the coin charged), the
+      ``price`` in USD per coin, and ``net_amount`` ``"0"``. Its USD value is |qty| x price.
+    - ``"Coin Pair Transaction Fee (USD)"``, a sell's fee in USD: a negative ``net_amount``
+      and no symbol, qty or price.
+
+    A coin-fee row posted with ``price`` "0" is read under ALPACA_FEE_MATCH_V3: the same
+    binding, valued at the price of the fill it binds to (``_fee_correction``). Any other
+    combination is not guessed at: the row is invalid.
+    """
+    activity_id = raw.get("id")
+    if (raw.get("activity_type") != "CFEE" or raw.get("status") != "executed"
+            or raw.get("currency") != "USD"
+            or not isinstance(activity_id, str) or not 1 <= len(activity_id) <= 160):
+        raise ValueError
+    cash = _exact_number(raw["net_amount"])
+    common = {"activity_id": activity_id, "match_policy": FEE_MATCH_V2,
+              "at": timestamp(raw["created_at"])}
+    if all(raw.get(k) is None for k in ("symbol", "qty", "price")):
+        if cash >= 0:
+            raise ValueError
+        return {**common, "fee_kind": "USD", "symbol": None, "cash_fee_usd": -cash,
+                "base_asset_fee_qty": D(0), "base_asset_fee_usd": D(0)}
+    symbol, qty, price = raw["symbol"], _exact_number(raw["qty"]), _exact_number(raw["price"])
+    if not isinstance(symbol, str) or not symbol or cash != 0 or qty >= 0 or price < 0:
+        raise ValueError
+    coin = {**common, "fee_kind": "COIN", "symbol": symbol.replace("/", ""),
+            "cash_fee_usd": D(0), "base_asset_fee_qty": -qty}
+    if price == 0:
+        # ALPACA_FEE_MATCH_V3: no posted price; valued at the fill it binds to.
+        return {**coin, "match_policy": FEE_MATCH_V3, "base_asset_fee_usd": None}
+    return {**coin, "base_asset_fee_usd": -qty * price}
 
 
 def match_fee_activity(fills, activity):
@@ -277,6 +381,227 @@ def match_fee_activity(fills, activity):
     return best if gap <= FEE_MATCH_TOLERANCE_SECONDS else None
 
 
+def fee_correction_id(activity_id, fill_id):
+    """The deterministic correction id of one (broker activity, fill) binding."""
+    return str(uuid5(FEE_CORRECTION_NAMESPACE, f"alpaca-fee:{activity_id}:{fill_id}"))
+
+
+def _v2_in_time(activity, fill):
+    lag = activity["at"] - fill["filled_at"]
+    return -timedelta(seconds=FEE_MATCH_TOLERANCE_SECONDS) <= lag <= FEE_MATCH_V2_MAX_LAG
+
+
+def _v2_consistent(activity, fill):
+    """Whether this fill could have produced this V2 fee: market, side, coin, time, amount.
+
+    Fee evidence is not considered here (``assign_fee_activities_v2`` does that).
+    """
+    if fill.get("market") != "CRYPTO" or not _v2_in_time(activity, fill):
+        return False
+    try:
+        qty = D(str(fill["qty"]))
+        if activity["fee_kind"] == "COIN":
+            symbol = fill.get("symbol")
+            if (fill["side"] != "buy" or not isinstance(symbol, str)
+                    or symbol.replace("/", "") != activity["symbol"]):
+                return False
+            base, quantum, posted = qty, FEE_MATCH_V2_COIN_QUANTUM, activity["base_asset_fee_qty"]
+        else:
+            if fill["side"] != "sell":
+                return False
+            base, quantum = qty * D(str(fill["price"])), FEE_MATCH_V2_USD_QUANTUM
+            posted = activity["cash_fee_usd"]
+        return any(
+            (rate * base).quantize(quantum, rounding=ROUND_CEILING) == posted
+            for rate in FEE_MATCH_V2_RATES
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def _without_fee_evidence(fill):
+    """No native fee and no correction. A fill read without ``cost_correction_ids`` (not
+    through ``fee_match_fills``) has unknown evidence and is never a V2 candidate."""
+    corrections = fill.get("cost_correction_ids")
+    return fill.get("fee_usd") is None and corrections is not None and not corrections
+
+
+def assign_fee_activities_v2(fills, activities, *, taken=()):
+    """ALPACA_FEE_MATCH_V2's bindings for normalized V2 ``activities``; writes nothing.
+
+    Returns ``(recorded, bound, unmatched, ambiguous)``:
+
+    - ``recorded``: ``(activity, fill)`` pairs whose correction id (``fee_correction_id``)
+      the fill already carries: an earlier run bound the activity there. It is replayed,
+      never matched again.
+    - ``bound``: new ``(activity, fill)`` pairs. A candidate is a fill without fee evidence
+      (``_without_fee_evidence``), not in ``taken`` (bound in this run by another rule),
+      for which ``_v2_consistent`` holds. An activity binds when it has exactly one
+      candidate and no other activity has that same fill as its only candidate. Bound fills
+      leave every other candidate list and the pass repeats until nothing binds, so the
+      outcome does not depend on the order of the rows.
+    - ``unmatched``: activities left with no candidate. ``ambiguous``: left with two or more
+      candidates, or with one that another activity also needs; never guessed.
+    """
+    taken = set(taken)
+    recorded, pending = [], []
+    for activity in activities:
+        prior = next((
+            fill for fill in fills
+            if fill.get("cost_correction_ids") and _v2_in_time(activity, fill)
+            and fee_correction_id(activity["activity_id"], fill["fill_id"])
+            in fill["cost_correction_ids"]
+        ), None)
+        if prior is not None:
+            recorded.append((activity, prior))
+        else:
+            pending.append(activity)
+    pool = [f for f in fills if f["fill_id"] not in taken and _without_fee_evidence(f)]
+    options = [[f for f in pool if _v2_consistent(activity, f)] for activity in pending]
+    bound, used, remaining = [], set(), list(range(len(pending)))
+    while True:
+        claims = {}
+        for index in remaining:
+            live = [f for f in options[index] if f["fill_id"] not in used]
+            if len(live) == 1:
+                claims.setdefault(live[0]["fill_id"], []).append((index, live[0]))
+        winners = [claimed[0] for claimed in claims.values() if len(claimed) == 1]
+        if not winners:
+            break
+        for index, fill in winners:
+            bound.append((pending[index], fill))
+            used.add(fill["fill_id"])
+        won = {index for index, _ in winners}
+        remaining = [index for index in remaining if index not in won]
+    unmatched, ambiguous = [], []
+    for index in remaining:
+        live = [f for f in options[index] if f["fill_id"] not in used]
+        (ambiguous if live else unmatched).append(pending[index])
+    return recorded, bound, unmatched, ambiguous
+
+
+def _amounts(activity):
+    return (activity["fee_kind"], activity.get("symbol"), activity["cash_fee_usd"],
+            activity["base_asset_fee_qty"], activity["base_asset_fee_usd"])
+
+
+def _time_order_matching(activities, fills, options):
+    """A complete assignment of ``activities`` to ``fills``, or None.
+
+    The time-order pairing (the n-th row, by posting time then id, to the n-th fill, by fill
+    time then id) when every pair is consistent; else the first complete assignment found by
+    augmenting paths, rows in time order, each trying its candidates in time order."""
+    rows = sorted(activities, key=lambda a: (a["at"], a["activity_id"]))
+    ordered = sorted(fills, key=lambda f: (f["filled_at"], f["fill_id"]))
+    allowed = {a["activity_id"]: {f["fill_id"] for f in options[a["activity_id"]]} for a in rows}
+    if all(f["fill_id"] in allowed[a["activity_id"]] for a, f in zip(rows, ordered, strict=True)):
+        return list(zip(rows, ordered, strict=True))
+    by_id = {f["fill_id"]: f for f in ordered}
+    owner = {}  # fill_id -> row
+
+    def augment(row, seen):
+        for fill in sorted(options[row["activity_id"]],
+                           key=lambda f: (f["filled_at"], f["fill_id"])):
+            if fill["fill_id"] in seen:
+                continue
+            seen.add(fill["fill_id"])
+            if fill["fill_id"] not in owner or augment(owner[fill["fill_id"]], seen):
+                owner[fill["fill_id"]] = row
+                return True
+        return False
+
+    for row in rows:
+        if not augment(row, set()):
+            return None
+    return sorted(((row, by_id[fill_id]) for fill_id, row in owner.items()),
+                  key=lambda pair: (pair[0]["at"], pair[0]["activity_id"]))
+
+
+def assign_fee_activities_v4(fills, ambiguous, *, taken=()):
+    """ALPACA_FEE_MATCH_V4's bindings for the rows V2/V3 left ``ambiguous``; writes nothing.
+
+    Returns ``(bound, ambiguous)``. ``taken`` holds the fills bound in this run by V1, V2 or
+    V3. A row's candidates are V2's (``_v2_consistent``, a fill without fee evidence, not
+    taken). Rows that share a candidate, directly or through other rows, form one group with
+    the union of their candidates. A group binds only when all of these hold:
+
+    - as many rows as candidate fills (a fill whose fee row has not been read yet keeps the
+      group open: which fill lacks its row is unknown);
+    - every complete assignment gives each trade the same fee: all candidate fills are of one
+      setup and one side (a coin fee posted without a price, V3, also needs one fill price,
+      since it is valued at its fill's price), or every row carries the same amounts;
+    - a complete, consistent assignment exists (``_time_order_matching``: time order first).
+
+    Otherwise every row of the group stays ambiguous, never guessed.
+    """
+    taken = set(taken)
+    pool = [f for f in fills if f["fill_id"] not in taken and _without_fee_evidence(f)]
+    options = {a["activity_id"]: [f for f in pool if _v2_consistent(a, f)] for a in ambiguous}
+    parent = {a["activity_id"]: a["activity_id"] for a in ambiguous}
+
+    def root(key):
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    first_claim = {}
+    for activity in ambiguous:
+        for fill in options[activity["activity_id"]]:
+            other = first_claim.setdefault(fill["fill_id"], activity["activity_id"])
+            parent[root(activity["activity_id"])] = root(other)
+    groups = {}
+    for activity in ambiguous:
+        groups.setdefault(root(activity["activity_id"]), []).append(activity)
+    bound, left = [], []
+    for rows in groups.values():
+        candidates = {f["fill_id"]: f for a in rows for f in options[a["activity_id"]]}
+        group_fills = list(candidates.values())
+        one_trade = (len({str(f["setup_id"]) for f in group_fills}) == 1
+                     and len({f["side"] for f in group_fills}) == 1
+                     and (all(a["base_asset_fee_usd"] is not None for a in rows)
+                          or len({D(str(f["price"])) for f in group_fills}) == 1))
+        same_amounts = len({_amounts(a) for a in rows}) == 1
+        pairs = (_time_order_matching(rows, group_fills, options)
+                 if len(rows) == len(group_fills) and (one_trade or same_amounts) else None)
+        if pairs is None:
+            left += rows
+            continue
+        size = len(rows)
+        bound += [({**activity, "match_policy": FEE_MATCH_V4, "row_policy":
+                    activity["match_policy"], "group_size": size}, fill)
+                  for activity, fill in pairs]
+    order = {a["activity_id"]: n for n, a in enumerate(ambiguous)}
+    left.sort(key=lambda a: order[a["activity_id"]])
+    return bound, left
+
+
+def _fee_correction(activity, fill):
+    reference = "alpaca-activity:" + activity["activity_id"]
+    if activity["match_policy"] in (FEE_MATCH_V2, FEE_MATCH_V3):
+        reference += ";" + activity["match_policy"]  # The rule that bound it, with the evidence.
+    elif activity["match_policy"] == FEE_MATCH_V4:
+        reference += (f";{FEE_MATCH_V4};row:{activity['row_policy']}"
+                      f";interchangeable-group:{activity['group_size']}")
+    base_usd = activity["base_asset_fee_usd"]
+    if base_usd is None:
+        # ALPACA_FEE_MATCH_V3: the posted quantity at the price of the fill it binds to.
+        base_usd = activity["base_asset_fee_qty"] * D(str(fill["price"]))
+        reference += ";valued-at-fill-price:" + str(fill["price"])
+    return {
+        "correction_id": fee_correction_id(activity["activity_id"], fill["fill_id"]),
+        "setup_id": str(fill["setup_id"]),
+        "fill_id": fill["fill_id"],
+        "fill_event_seq": fill["event_seq"],
+        "fee_usd": str(activity["cash_fee_usd"] + base_usd),
+        "base_asset_fee_qty": str(activity["base_asset_fee_qty"]),
+        "base_asset_fee_usd": str(base_usd),
+        "source": FEE_ACTIVITY_SOURCE,
+        "broker_source_reference": reference,
+        "observed_at": max(activity["at"], fill["filled_at"]).isoformat(),
+    }
+
+
 def import_alpaca_fee_activities(store, fills, activities, *, recorded_at):
     """Match Alpaca fee activities to managed fills and append idempotent cost evidence.
 
@@ -288,47 +613,112 @@ def import_alpaca_fee_activities(store, fills, activities, *, recorded_at):
     or whose fill already carries a different latest correction (a conflict this
     automated import never resolves by overwriting) is counted, never guessed.
 
+    A row with an order id binds by ALPACA_FEE_MATCH_V1 (``match_fee_activity``); a row
+    without one by ALPACA_FEE_MATCH_V2 (``assign_fee_activities_v2``; a coin row posted with
+    no price binds the same way under ALPACA_FEE_MATCH_V3 and is valued at its fill's price),
+    after V1's fills are taken out of its candidates; the rows V2/V3 leave ambiguous then
+    go to ALPACA_FEE_MATCH_V4 (``assign_fee_activities_v4``). V2 needs ``fills`` as
+    ``fee_match_fills`` reads them (with each setup's symbol and market and each fill's
+    existing correction ids) and reaching 24 hours before the earliest activity
+    (``fee_match_fills_after``).
+
     ``fills`` are candidate ``lab.managed_fills`` rows (any setup) the caller has already
     read; matching happens in Python so the same pure logic is unit-testable without a
     database. Returns counts: ``activities_read``, ``matched`` (new evidence appended),
-    ``already_recorded`` (idempotent replay), ``unmatched``, ``invalid``, ``conflicting``.
+    ``already_recorded`` (idempotent replay), ``unmatched``, ``invalid``, ``conflicting``,
+    ``ambiguous`` (more than one possible fill that V4 could not bind either, never guessed).
     """
     result = {
         "activities_read": len(activities), "matched": 0, "already_recorded": 0,
-        "unmatched": 0, "invalid": 0, "conflicting": 0,
+        "unmatched": 0, "invalid": 0, "conflicting": 0, "ambiguous": 0,
     }
+    by_order, by_amount = [], []  # V1 rows; V2 and V3 rows, which bind by amount together.
     for raw in activities:
         try:
             activity = normalize_fee_activity(raw)
         except ValueError:
             result["invalid"] += 1
             continue
+        (by_order if activity["match_policy"] == FEE_MATCH_V1 else by_amount).append(activity)
+    bindings = []
+    for activity in by_order:
         fill = match_fee_activity(fills, activity)
         if fill is None:
             result["unmatched"] += 1
-            continue
-        correction_name = f"alpaca-fee:{activity['activity_id']}:{fill['fill_id']}"
-        correction_id = str(uuid5(FEE_CORRECTION_NAMESPACE, correction_name))
-        fee_usd = activity["cash_fee_usd"] + activity["base_asset_fee_usd"]
-        raw_correction = {
-            "correction_id": correction_id,
-            "setup_id": str(fill["setup_id"]),
-            "fill_id": fill["fill_id"],
-            "fill_event_seq": fill["event_seq"],
-            "fee_usd": str(fee_usd),
-            "base_asset_fee_qty": str(activity["base_asset_fee_qty"]),
-            "base_asset_fee_usd": str(activity["base_asset_fee_usd"]),
-            "source": FEE_ACTIVITY_SOURCE,
-            "broker_source_reference": "alpaca-activity:" + activity["activity_id"],
-            "observed_at": max(activity["at"], fill["filled_at"]).isoformat(),
-        }
+        else:
+            bindings.append((activity, fill))
+    taken = {fill["fill_id"] for _, fill in bindings}
+    recorded, bound, unmatched, ambiguous = assign_fee_activities_v2(fills, by_amount, taken=taken)
+    # ALPACA_FEE_MATCH_V4: only rows V2/V3 left ambiguous, never a fill bound in this run.
+    bound_v4, ambiguous = assign_fee_activities_v4(
+        fills, ambiguous, taken=taken | {fill["fill_id"] for _, fill in bound})
+    result["unmatched"] += len(unmatched)
+    result["ambiguous"] += len(ambiguous)
+    # A row whose own correction id its fill already carries was recorded by an earlier run:
+    # a replay, counted and never written again (a V4 correction names the group it bound in,
+    # which a later run, with that group already bound, cannot rebuild).
+    result["already_recorded"] += len(recorded)
+    bindings += sorted(bound + bound_v4, key=lambda pair: (pair[0]["at"], pair[0]["activity_id"]))
+    for activity, fill in bindings:
         try:
-            outcome = import_fill_cost_correction(store, raw_correction, recorded_at=recorded_at)
+            outcome = import_fill_cost_correction(
+                store, _fee_correction(activity, fill), recorded_at=recorded_at
+            )
         except ValueError:
             result["conflicting"] += 1
             continue
         result["already_recorded" if outcome["idempotent_replay"] else "matched"] += 1
     return result
+
+
+def fee_match_fills(conn, after):
+    """Managed fills filled at or after ``after``, as fee matching needs them, oldest first.
+
+    Each is a ``lab.managed_fills`` row plus its setup's ``symbol`` and ``market`` and
+    ``cost_correction_ids``: the ids of its ``FILL_COST_CORRECTION`` events, oldest first
+    (ALPACA_FEE_MATCH_V2: a coin fee names only its coin, a fill with fee evidence is
+    never a candidate, and an activity already bound is known by its own correction id).
+    """
+    return conn.execute(
+        """SELECT f.*,s.symbol,s.market,coalesce((
+            SELECT array_agg(e.body->>'correction_id' ORDER BY e.event_seq)
+            FROM lab.managed_events e WHERE e.setup_id=f.setup_id AND e.kind=%s
+            AND e.body->>'fill_id'=f.fill_id), ARRAY[]::text[]) AS cost_correction_ids
+        FROM lab.managed_fills f JOIN lab.managed_setups s USING(setup_id)
+        WHERE f.filled_at>=%s ORDER BY f.filled_at,f.fill_id""",
+        (COST_KIND, after),
+    ).fetchall()
+
+
+def fee_match_fills_after(after, activities):
+    """Where the fills for these activities start: 24 h (FEE_MATCH_V2_MAX_LAG) before the
+    earliest of ``after`` and the activities' own times. A date-filtered read returns rows
+    from before ``after``, and an activity bound earlier must find its own fill again."""
+    times = [after]
+    for raw in activities:
+        try:
+            times.append(normalize_fee_activity(raw)["at"])
+        except ValueError:
+            continue
+    return min(times) - FEE_MATCH_V2_MAX_LAG
+
+
+def pending_fee_window_start(conn, *, now, lookback):
+    """Where a fee read must start so a fee still missing cannot be lost, or ``None``.
+
+    The earliest managed fill of the last ``FEE_PENDING_MAX_AGE`` without fee evidence (no
+    native fee, no ``FILL_COST_CORRECTION``), less ``lookback``, and never earlier than
+    ``now - FEE_PENDING_MAX_AGE``. ``None`` when every such fill has evidence.
+    """
+    floor = now - FEE_PENDING_MAX_AGE
+    earliest = conn.execute(
+        """SELECT min(f.filled_at) AS at FROM lab.managed_fills f
+        WHERE f.filled_at>=%s AND f.fee_usd IS NULL AND NOT EXISTS(
+            SELECT 1 FROM lab.managed_events e WHERE e.setup_id=f.setup_id AND e.kind=%s
+            AND e.body->>'fill_id'=f.fill_id)""",
+        (floor, COST_KIND),
+    ).fetchone()["at"]
+    return None if earliest is None else max(earliest - lookback, floor)
 
 
 def _cursor(after_event_seq, limit):
@@ -402,7 +792,8 @@ def managed_daily_rollups(repository, *, start_date=None, end_date=None):
             UNION ALL SELECT e.setup_id,e.body->>'reason' AS reason FROM lab.managed_events e
             JOIN lab.managed_setups s USING(setup_id) WHERE s.cohort=%s
             AND e.body->>'reason' IS NOT NULL AND e.kind IN
-            ('POSITION_REVIEW_OBSOLETE','POSITION_REVIEW_UNAVAILABLE','MANAGED_JEV_JUDGMENT')""",
+            ('POSITION_REVIEW_OBSOLETE','POSITION_REVIEW_UNAVAILABLE','MANAGED_JEV_JUDGMENT',
+            'CRYPTO_ENTRY_PACING_WAIT','DAILY_SOFT_LOSS_ENTRY_WAIT')""",
             (COHORT, COHORT),
         ).fetchall()
     reasons = {}

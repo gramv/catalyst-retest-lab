@@ -11,7 +11,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from catalyst_lab import managed_eligibility, managed_execution
+from catalyst_lab import managed_eligibility, managed_execution, stop_breach
 from catalyst_lab.audit import verify_events
 from catalyst_lab.execution import system_event
 from catalyst_lab.jev_contract import SKEPTIC, digest, encoded
@@ -125,9 +125,11 @@ def events(engine, kind, setup_id=None):
 
 
 def without_grid_checks(monkeypatch):
-    """Simulate a setup admitted and entered before any grid check existed."""
+    """Simulate a setup admitted and entered before any grid check existed (and so before
+    ``CRYPTO_STOP_BREACH_V2``: it keeps V1's stop-limit fallback)."""
     for module in (managed_execution, managed_eligibility):
         monkeypatch.setattr(module, "off_grid_levels", lambda *args: {})
+    monkeypatch.setattr(stop_breach, "admission_fields", lambda packet: {})
 
 
 @pytest.fixture
@@ -279,7 +281,14 @@ def test_crypto_execution_error_at_entry_becomes_risk_rejected(mx, monkeypatch, 
 # Protection and exits for a filled legacy off-grid position
 
 
-def test_legacy_off_grid_position_gets_raised_native_stop_recorded(mx, legacy):
+@pytest.fixture
+def one_tick_limit(monkeypatch):
+    """A crypto setup admitted before CRYPTO_STOP_BREACH_V4 (one-tick stop-limit); the V4
+    cushion is tests/test_trade_plan_*.py."""
+    monkeypatch.setattr(stop_breach, "ADMITTED_STOP_LIMIT", None)
+
+
+def test_legacy_off_grid_position_gets_raised_native_stop_recorded(one_tick_limit, mx, legacy):
     engine, venue, _ = mx
     plan = engine.manage(legacy, observation(mx))
     assert plan.state == "PROTECTION_REQUIRED"
@@ -364,7 +373,7 @@ def test_unsnappable_stop_halts_entries_without_exception_and_position_still_exi
     assert venue.orders_of("sell", "market")
 
 
-def test_on_grid_crypto_protection_is_unchanged_and_records_no_grid_details(mx):
+def test_on_grid_crypto_protection_is_unchanged_and_records_no_grid_details(one_tick_limit, mx):
     engine, venue, _ = mx
     sid = engine.admit(packet(mx))
     engine.observe_trigger(sid, observation(mx))

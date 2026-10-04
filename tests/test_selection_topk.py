@@ -636,9 +636,10 @@ def test_k_is_strict_json_5_to_10_and_defaults_to_10():
     for k in (4, 11, 10.0, True, "10"):
         with pytest.raises(ValueError, match="^SELECTION_TOPK_INVALID$"):
             topk.TopKRule(TOPK, k)
-    # JEV_TOP_K_SELECTION_V2 exists since 2026-09-27 (tests/test_selection_topk_v2.py).
+    # JEV_TOP_K_SELECTION_V2 exists since 2026-09-27 (tests/test_selection_topk_v2.py) and V3
+    # since 2026-10-03 (tests/test_selection_topk_v3.py).
     with pytest.raises(ValueError, match="^UNKNOWN_SELECTION_RULE$"):
-        topk.TopKRule("JEV_TOP_K_SELECTION_V3", 10)
+        topk.TopKRule("JEV_TOP_K_SELECTION_V4", 10)
 
 
 def test_top_k_refuses_a_floor_and_the_other_rules_are_read_unchanged():
@@ -1560,8 +1561,13 @@ def test_migration_021_reuses_every_earlier_function_byte_for_byte(er):
     # Migration 023 later puts the top-K V2 branch in front of that; without it the stored
     # dispatcher is 021's exactly (tests/test_selection_topk_v2.py checks 023's).
     from tests.test_selection_topk_v2 import TOPK_V2_DISPATCH
+    from tests.test_selection_topk_v3 import TOPK_V3_DISPATCH, stored_dispatcher_before_031
 
-    stored = rows["managed_review_failure"]["prosrc"]
+    # Migration 031 (package plugin-c3) puts the strategy-signal branch in front of all of them.
+    stored = stored_dispatcher_before_031(rows["managed_review_failure"]["prosrc"])
+    # Migration 029 puts the V3 branch in front of both (tests/test_selection_topk_v3.py).
+    assert stored.count(TOPK_V3_DISPATCH) == 1
+    stored = stored.replace(TOPK_V3_DISPATCH, "")
     assert stored.count(TOPK_V2_DISPATCH) == 1
     dispatcher = stored.replace(TOPK_V2_DISPATCH, "")
     assert dispatcher == function_source(

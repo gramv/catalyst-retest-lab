@@ -1225,7 +1225,20 @@ def test_populated_schema19_ledger_migrates_to_20_ddl_only_and_keeps_every_route
                 conn.execute((MIGRATIONS / "023_selection_topk_v2.sql").read_text())
                 conn.execute((MIGRATIONS / "024_public_experiment.sql").read_text())
                 conn.execute((MIGRATIONS / "025_jev_review_policy_v2.sql").read_text())
-            assert audit_state(root)[3] == SCHEMA_VERSION == 25
+            # 026 (JEV_MANAGED_RISK_V4) appends exactly its three policy rows, no route change.
+            from tests.test_risk_v4 import apply_migration_026
+
+            apply_migration_026(root)
+            # 027 (the trade plan's planned-stop guard) adds no row, no route change.
+            from tests.test_trade_plan_migration import apply_migration_027
+
+            apply_migration_027(root)
+            # 028, 029 (public page views) and 030 (JEV_TOP_K_SELECTION_V3) add no row; 030's
+            # dispatcher routes every earlier packet as 023's did.
+            from tests.test_selection_topk_v3 import apply_migrations_after_027
+
+            apply_migrations_after_027(root)
+            assert audit_state(root)[3] == SCHEMA_VERSION == 31  # Through 031 (plugin-c3).
             assert failures(risk_url, variants) == before
             RiskRepository(risk_url).check_role()  # The code's schema pin accepts the ledger.
             # B2 runs on the migrated ledger and its selections cross the new branch.

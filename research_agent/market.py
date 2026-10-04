@@ -1,4 +1,6 @@
-"""Coinbase public candles: 1-hour bars aggregated to 2h/4h/6h, plus daily bars.
+"""Coinbase public candles: 1-hour bars aggregated to 2h/4h/6h, plus daily bars, and 5-minute
+candles as fetched for the answers to the app's reviews and exit flags (``fetch_candles``,
+``completed_bars``; ``answers``).
 
 Coinbase Exchange's public ``/products/{id}/candles`` needs no key. Every function that
 looks at bars here is pure and takes ``retrieved_at`` as data: a bar (or an aggregated
@@ -9,8 +11,8 @@ Building a report from a bar that was still forming when it was fetched is exact
 (``catalyst_lab.research_report_v3.PickTechnicalEvidence``), so this module never gives
 ``levels`` or ``build`` a bar that would fail it.
 
-Only the network layer (``fetch_coinbase``) touches a clock, exactly once, and returns
-that instant in its result for every later step to reuse.
+Only the network layer (``fetch_coinbase`` and the other ``fetch_*`` calls) touches a clock,
+exactly once per call, and returns that instant in its result for every later step to reuse.
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ TIMEFRAMES = {"1h": 3600, "2h": 7200, "4h": 14_400, "6h": 21_600, "1d": 86_400}
 HOURLY_LOOKBACK_HOURS = 300  # Coinbase caps a single candles call near 300 points.
 DAILY_LOOKBACK_DAYS = 60
 REQUEST_SLEEP_SECONDS = 0.15  # Between-request pacing against Coinbase's public API.
+# The granularities Coinbase's candles route serves; 5-minute candles are what the answers to
+# the app's reviews and exit flags read (``answers``, MUSE_ANSWER_RULES_V1).
+CANDLE_GRANULARITIES = frozenset({60, 300, 900, 3600, 21_600, 86_400})
+FIVE_MINUTE_SECONDS = 300
 
 
 class MarketDataError(Exception):
@@ -104,6 +110,26 @@ def aggregate(candles_1h, seconds, *, retrieved_at):
             volume=sum((row[5] for row in group), Decimal(0)),
         ))
     return bars
+
+
+def completed_bars(rows, seconds, *, retrieved_at):
+    """Coinbase candle rows of one granularity (``seconds`` wide, as fetched: no aggregation) as
+    ``Bar``s, oldest first: one per start time (a row returned twice counts once) and only those
+    that had ended at or before ``retrieved_at``, the instant they were fetched. The candle still
+    forming then, which Coinbase returns too, is never one of them."""
+    cutoff = int(retrieved_at.astimezone(UTC).timestamp())
+    unique = {}
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 6:
+            raise MarketDataError("INVALID_CANDLE_ROW")
+        parsed = _decimal_row(row)
+        unique[parsed[0]] = parsed
+    return [
+        Bar(started_at=datetime.fromtimestamp(t, UTC), open=op, high=hi, low=lo, close=cl,
+            volume=vol)
+        for t, lo, hi, op, cl, vol in sorted(unique.values())
+        if t + seconds <= cutoff
+    ]
 
 
 def daily_bars(candles_1d, *, retrieved_at):
@@ -261,3 +287,38 @@ def fetch_hourly_span(coins, *, start, end, client=None, timeout=30.0,
             client.close()
     return {"retrieved_at": now.isoformat(), "start": start.isoformat(), "end": end.isoformat(),
             "coinbase": coinbase, "excluded": excluded}
+
+
+def fetch_candles(coin, *, seconds, start, end, client=None, timeout=30.0,
+                  sleep=REQUEST_SLEEP_SECONDS, now=None):
+    """Coinbase's candles of one granularity (``seconds``, one of ``CANDLE_GRANULARITIES``) for
+    ``coin``'s USD market over ``[start, end]``, rows exactly as returned (newest first, the one
+    still forming included), in one call: at most 300 candles, Coinbase's cap.
+
+    For the answers to the app's reviews and exit flags (``answers``: the last hour of 5-minute
+    candles for one trade's coin). ``now`` is recorded as ``retrieved_at`` exactly as in
+    ``fetch_coinbase``: the one instant every later completeness check (``completed_bars``)
+    reuses. A coin with no Coinbase USD market (404) raises ``MarketDataError``
+    (``NO_COINBASE_USD_CANDLES``), as does any other failure; nothing is ever made up.
+    """
+    now = now or datetime.now(UTC)
+    if seconds not in CANDLE_GRANULARITIES:
+        raise MarketDataError("UNKNOWN_GRANULARITY")
+    if end <= start or (end - start).total_seconds() / seconds > HOURLY_LOOKBACK_HOURS:
+        raise MarketDataError("CANDLE_SPAN_INVALID")
+    owns_client = client is None
+    client = client or httpx.Client(timeout=timeout)
+    try:
+        rows = _get(client, f"{COINBASE_BASE}/products/{coin}-USD/candles",
+                    {"granularity": seconds, "start": start.isoformat(),
+                     "end": end.isoformat()})
+        time.sleep(sleep)
+    finally:
+        if owns_client:
+            client.close()
+    if rows is None:
+        raise MarketDataError("NO_COINBASE_USD_CANDLES")
+    if not isinstance(rows, list):
+        raise MarketDataError("COINBASE_UNEXPECTED_CANDLES_SHAPE")
+    return {"retrieved_at": now.isoformat(), "product": f"{coin}-USD", "granularity": seconds,
+            "start": start.isoformat(), "end": end.isoformat(), "candles": rows}

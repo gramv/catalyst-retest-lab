@@ -307,6 +307,190 @@ def test_a_coin_with_no_setup_is_skipped_with_a_reason():
                                "reason": build.skip_reason(["4h/20 rule A: no held higher low"])},)
 
 
+def test_a_coin_with_an_open_trade_is_skipped_and_takes_no_place_in_the_pick_limit():
+    """The guidelines: a coin held open is not picked again. The daily build skips it with the
+    reason, before the pick limit, so the next coin keeps its place."""
+    market_retrieved_at = NOW - timedelta(minutes=5)
+    quote = ("100.09", "100.11", (NOW - timedelta(seconds=30)).isoformat())
+    ctx = make_context({"SOL/USD": quote, "AVAX/USD": quote, "LINK/USD": quote})
+    ctx["open_trades"] = [{"symbol": "SOL/USD", "state": "OPEN"},
+                          {"symbol": "LINK/USD", "state": "WATCHING"}]  # Not filled: not open.
+    market_data = {"retrieved_at": market_retrieved_at.isoformat(), "coinbase": {}}
+    for coin in ("SOL", "AVAX", "LINK"):
+        market_data["coinbase"].update(
+            make_market_data(coin, market_retrieved_at=market_retrieved_at)["coinbase"])
+    setup = make_sol_setup(market_retrieved_at)
+    result = build.build_report(
+        context=ctx, market_data=market_data,
+        levels_by_coin={coin: (setup, []) for coin in ("SOL", "AVAX", "LINK")},
+        agent_id="claude", agent_version="test-1.0", now=NOW, max_picks=2)
+    assert sorted(outcome.symbol for outcome in result.accepted) == ["AVAX/USD", "LINK/USD"]
+    assert result.skipped == ({"symbol": "SOL/USD", "reason": build.OPEN_TRADE_SKIP_REASON},)
+    assert len(build.OPEN_TRADE_SKIP_REASON) <= 200
+
+
+def test_the_evidence_filter_leaves_out_excluded_and_far_coins_before_the_pick_limit():
+    """Owner direction 2026-10-02: no new pick without solid evidence. The operator's filter
+    leaves out an excluded coin and a coin whose entry sits too far under the live mid, each
+    with its reason and without taking a place in the pick limit; an update's adjusted pick
+    (a first coin) is never filtered."""
+    market_retrieved_at = NOW - timedelta(minutes=5)
+    quote = ("100.09", "100.11", (NOW - timedelta(seconds=30)).isoformat())
+    ctx = make_context({"SOL/USD": quote, "AVAX/USD": quote, "LINK/USD": quote})
+    market_data = {"retrieved_at": market_retrieved_at.isoformat(), "coinbase": {}}
+    for coin in ("SOL", "AVAX", "LINK"):
+        market_data["coinbase"].update(
+            make_market_data(coin, market_retrieved_at=market_retrieved_at)["coinbase"])
+    setup = make_sol_setup(market_retrieved_at)  # Its entry sits about 5% under the mid.
+    distance = (Decimal("100.10") - setup.max_entry) / Decimal("100.10")
+    assert Decimal("0.04") < distance < Decimal("0.06")
+    levels_by_coin = {coin: (setup, []) for coin in ("SOL", "AVAX", "LINK")}
+
+    def built(evidence, **kwargs):
+        return build.build_report(
+            context=ctx, market_data=market_data, levels_by_coin=levels_by_coin,
+            agent_id="claude", agent_version="test-1.0", now=NOW, evidence=evidence, **kwargs)
+
+    # Excluded: left out before the limit, so the next coin keeps its place.
+    result = built(build.EvidenceFilter(exclude=frozenset({"AVAX"})), max_picks=2)
+    assert sorted(o.symbol for o in result.accepted) == ["LINK/USD", "SOL/USD"]
+    assert result.skipped == ({"symbol": "AVAX/USD", "reason": build.EXCLUDED_SKIP_REASON},)
+    # Too far: every entry here is about 5% under the mid; 3% leaves all out, 6% none.
+    result = built(build.EvidenceFilter(max_entry_distance=Decimal("0.03")))
+    assert result.accepted == ()
+    assert [row["symbol"] for row in result.skipped] == ["AVAX/USD", "LINK/USD", "SOL/USD"]
+    assert all(row["reason"].startswith("Entry 4.") and "3.00%" in row["reason"]
+               for row in result.skipped)
+    assert len(result.skipped[0]["reason"]) <= 200
+    result = built(build.EvidenceFilter(max_entry_distance=Decimal("0.06")))
+    assert sorted(o.symbol for o in result.accepted) == ["AVAX/USD", "LINK/USD", "SOL/USD"]
+    # A first coin (an update's adjusted pick) passes both filters untouched.
+    result = built(build.EvidenceFilter(exclude=frozenset({"LINK"}),
+                                        max_entry_distance=Decimal("0.03")),
+                   first_coins=frozenset({"LINK"}))
+    assert [o.symbol for o in result.accepted] == ["LINK/USD"]
+    # No filter: unchanged.
+    result = built(None)
+    assert sorted(o.symbol for o in result.accepted) == ["AVAX/USD", "LINK/USD", "SOL/USD"]
+
+
+def _with_candles(market_data, coin, *, daily_closes, hourly_closes, price, retrieved_at):
+    """Add Coinbase daily and hourly candle rows (newest first) and a ticker price to a coin's
+    market record, as ``market.fetch_coinbase`` records them."""
+    day = retrieved_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    hour = retrieved_at.replace(minute=0, second=0, microsecond=0)
+    record = market_data["coinbase"][coin]
+    record["candles_1d"] = [
+        [int((day - timedelta(days=i)).timestamp()), c - 1, c + 1, c, c, 10]
+        for i, c in enumerate(reversed(daily_closes))]
+    record["candles_1h"] = [
+        [int((hour - timedelta(hours=i)).timestamp()), c - 0.5, c + 0.5, c, c, 10]
+        for i, c in enumerate(reversed(hourly_closes))]
+    record["ticker"] = {**record["ticker"], "price": price}
+
+
+def test_the_v8_checks_leave_out_thin_downtrend_and_selloff_coins_and_state_the_evidence():
+    """Method v8 (owner direction 2026-10-02): a new coin needs Alpaca volume or a fill of its
+    own, must trade at or above its 20-day average, and nothing new goes out during a
+    market-wide drop; every pick's why_now states the facts. A first coin is never filtered."""
+    market_retrieved_at = NOW - timedelta(minutes=5)
+    quote = ("100.09", "100.11", (NOW - timedelta(seconds=30)).isoformat())
+    ctx = make_context({"SOL/USD": quote, "AVAX/USD": quote, "LINK/USD": quote})
+    for row in ctx["universe"]["coins"]:
+        if row["symbol"] == "LINK/USD":
+            row["volume_24h"] = {"base": "100", "usd": "15108.00", "completed_hour_bars": 24}
+    ctx["recent_outcomes"] = {"window_days": 7, "closed_trades": [
+        {"symbol": "SOL/USD", "closed_at": "2026-09-26T10:00:00+00:00",
+         "exit_reason": "BROKER_EXIT"}]}
+    market_data = {"retrieved_at": market_retrieved_at.isoformat(), "coinbase": {}}
+    for coin in ("SOL", "AVAX", "LINK"):
+        market_data["coinbase"].update(
+            make_market_data(coin, market_retrieved_at=market_retrieved_at)["coinbase"])
+    calm = [100] * 6
+    _with_candles(market_data, "SOL", daily_closes=[95] * 25, hourly_closes=calm, price="100.1",
+                  retrieved_at=market_retrieved_at)  # +5.4% vs its 20-day average
+    _with_candles(market_data, "AVAX", daily_closes=[95] * 25, hourly_closes=calm, price="100.1",
+                  retrieved_at=market_retrieved_at)
+    _with_candles(market_data, "LINK", daily_closes=[105] * 25, hourly_closes=calm, price="100.1",
+                  retrieved_at=market_retrieved_at)  # -4.7%: below its 20-day average
+    setup = make_sol_setup(market_retrieved_at)
+    levels_by_coin = {coin: (setup, []) for coin in ("SOL", "AVAX", "LINK")}
+
+    def built(evidence, **kwargs):
+        return build.build_report(
+            context=ctx, market_data=market_data, levels_by_coin=levels_by_coin,
+            agent_id="claude", agent_version="test-1.0", now=NOW, evidence=evidence, **kwargs)
+
+    # Volume or fills: SOL has a fill in the window, LINK the volume, AVAX neither.
+    result = built(build.EvidenceFilter(min_alpaca_volume_usd=Decimal("5000")))
+    assert sorted(o.symbol for o in result.accepted) == ["LINK/USD", "SOL/USD"]
+    [left] = result.skipped
+    assert left["symbol"] == "AVAX/USD" and left["reason"] == (
+        "Alpaca 24 h volume unknown is under the evidence minimum $5,000 and the agent has no "
+        "fill on Alpaca in the last 7 days.")
+    # Trend: LINK trades under its 20-day average.
+    result = built(build.EvidenceFilter(trend_floor=Decimal("0")))
+    assert sorted(o.symbol for o in result.accepted) == ["AVAX/USD", "SOL/USD"]
+    [left] = result.skipped
+    assert left["symbol"] == "LINK/USD" and left["reason"].startswith(
+        "-4.7% vs its 20-day average: a pullback in a downtrend (the evidence floor is +0.0%)")
+    assert built(build.EvidenceFilter(trend_floor=Decimal("-0.05"))).skipped == ()
+    # A coin without 20 daily bars cannot be judged and is left out under a floor.
+    del market_data["coinbase"]["AVAX"]["candles_1d"]
+    result = built(build.EvidenceFilter(trend_floor=Decimal("0")))
+    assert {row["symbol"]: row["reason"][:22] for row in result.skipped} == {
+        "AVAX/USD": "No 20 completed daily ", "LINK/USD": "-4.7% vs its 20-day av"}
+    # The evidence sentence on an accepted pick.
+    [sol] = [o for o in result.accepted if o.symbol == "SOL/USD"]
+    why_now = sol.pick["reasoning"]["why_now"]
+    assert ("Evidence: +5.4% vs its 20-day average; filled on Alpaca 1 time in the last 7 days; "
+            "the market's median coin +0.10% in 2 h." in why_now)
+    assert why_now == sol.pick["selection_rationale"]["why_now"] and len(why_now) <= 600
+    # Sell-off: a 3% drop in the median coin leaves every new coin out, not a first coin.
+    for coin in ("SOL", "AVAX", "LINK"):
+        market_data["coinbase"][coin]["ticker"]["price"] = "97"
+    result = built(build.EvidenceFilter(selloff=Decimal("0.02")))
+    assert result.accepted == ()
+    assert all(row["reason"].startswith("Sell-off in progress: the median coin -3.00% and BTC "
+                                        "n/a in 2 h (limit -2.00%)") for row in result.skipped)
+    assert len(result.skipped[0]["reason"]) <= 200
+    result = built(build.EvidenceFilter(selloff=Decimal("0.02"), trend_floor=Decimal("0")),
+                   first_coins=frozenset({"LINK"}))
+    assert [o.symbol for o in result.accepted] == ["LINK/USD"]
+    # No filter: unchanged, and no evidence sentence.
+    result = built(None)
+    assert sorted(o.symbol for o in result.accepted) == ["AVAX/USD", "LINK/USD", "SOL/USD"]
+    assert all("Evidence:" not in o.pick["reasoning"]["why_now"] for o in result.accepted)
+
+
+def test_the_evidence_filter_parses_its_options_and_refuses_nonsense():
+    parse = build.EvidenceFilter.parse_exclude
+    assert parse("pol, ldo,WIF") == frozenset({"POL", "LDO", "WIF"})
+    assert parse("") == parse(None) == frozenset()
+    with pytest.raises(ValueError, match="EXCLUDE_COINS_INVALID"):
+        parse("POL/USD")
+    distance = build.EvidenceFilter.parse_distance_pct
+    assert distance("2.5") == Decimal("0.025") and distance(" 50 ") == Decimal("0.5")
+    for bad in ("0", "-1", "50.01", "abc", "NaN", "inf"):
+        with pytest.raises(ValueError, match="MAX_ENTRY_DISTANCE_INVALID"):
+            distance(bad)
+    floor = build.EvidenceFilter.parse_trend_floor_pct
+    assert floor("0") == 0 and floor("-2") == Decimal("-0.02") and floor("5") == Decimal("0.05")
+    for bad in ("-50.5", "51", "x"):
+        with pytest.raises(ValueError, match="TREND_FLOOR_INVALID"):
+            floor(bad)
+    selloff = build.EvidenceFilter.parse_selloff_pct
+    assert selloff("2") == Decimal("0.02")
+    for bad in ("0", "-2", "51", "x"):
+        with pytest.raises(ValueError, match="SELLOFF_INVALID"):
+            selloff(bad)
+    usd = build.EvidenceFilter.parse_usd
+    assert usd("5000") == 5000 and usd("5,000.50") == Decimal("5000.50") and usd("0") == 0
+    for bad in ("-1", "x", "NaN"):
+        with pytest.raises(ValueError, match="MIN_ALPACA_VOLUME_INVALID"):
+            usd(bad)
+
+
 def test_the_skip_reason_names_what_the_levels_profile_tried():
     tried = ["1h/30 rule B: the window high is its most recent bar"]
     daily = ("No qualifying pullback setup on any tried rule/timeframe/window (20-30 bars, "

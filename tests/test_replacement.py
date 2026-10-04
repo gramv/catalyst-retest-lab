@@ -30,6 +30,7 @@ from catalyst_lab.managed_runtime import (
     replaces_on_decline,
 )
 from catalyst_lab.research_cycle import CyclePolicy, ResearchCycle
+from catalyst_lab.research_schedule import ResearchSchedule
 from tests.test_agent_research_session import TOPK_SCRIPT, session_script, topk_report
 from tests.test_agent_research_session import make_session as make_session
 from tests.test_agent_research_session import submit as submit_to_session
@@ -87,40 +88,51 @@ def key(symbol):
     return "CRYPTO:" + symbol
 
 
-def submit(cycle, script, now, *, agent_id=AGENT, run_slot=None, picks=None):
+def submit(cycle, script, now, *, agent_id=AGENT, run_slot=None, picks=None, schedule=None):
     """One report V3 whose picks are ``script``'s symbols in order; ``picks`` overrides fields
-    of a symbol's pick; a ``run_slot`` uses the hourly fixture schedule (30-minute validity)."""
+    of a symbol's pick; a ``run_slot`` uses the hourly fixture schedule (30-minute validity),
+    or ``schedule`` (``hourly_v2``)."""
     values = [pick(i, symbol, kind=spec.get("kind", "BOTH"), now=now,
                    **(picks or {}).get(symbol, {}))
               for i, (symbol, spec) in enumerate(script.items())]
-    fields, schedule = {}, SCHEDULE
+    fields, intake_schedule = {}, SCHEDULE
     if run_slot is not None:
         fields = {"run_slot": run_slot.isoformat(),
                   "valid_until": (now + timedelta(minutes=30)).isoformat()}
-        schedule = HOURLY
+        intake_schedule = schedule or HOURLY
     raw = report_v3(values, now=now, agent_id=agent_id, **fields)
     result = cycle.start_report(raw, max_seconds=86400,
-                                v3=v3_intake(universe=set(script), schedule=schedule, now=now))
+                                v3=v3_intake(universe=set(script), schedule=intake_schedule,
+                                             now=now))
     assert result["rejected_count"] == 0
     return cycle_of(raw)
 
 
-def ladder(mx, *, run_slot=None, picks=None):
+def hourly_v2(daily):
+    """The hourly fixture schedule as RESEARCH_SCHEDULE_V2, its daily (full) run at ``daily``'s
+    hour and every other hour an update run."""
+    return ResearchSchedule(HOURLY.timezone, HOURLY.runs, HOURLY.grace_minutes,
+                            daily.astimezone(UTC).strftime("%H:%M"))
+
+
+def ladder(mx, *, run_slot=None, picks=None, schedule=None):
     """The LADDER report under top-K with K = 5, reviewed, ranked and published."""
     engine, venue, _ = mx
     cycle, _ = topk_cycle(mx, LADDER, rule=K5)
-    cycle_id = submit(cycle, LADDER, venue.now, run_slot=run_slot, picks=picks)
+    cycle_id = submit(cycle, LADDER, venue.now, run_slot=run_slot, picks=picks,
+                      schedule=schedule)
     publish(cycle, cycle_id)
     for symbol in LADDER:
         classify(engine, symbol)
     return cycle, cycle_id
 
 
-def single(mx, symbol, *, agent_id, run_slot=None):
+def single(mx, symbol, *, agent_id, run_slot=None, schedule=None):
     """Another agent's one-pick top-K report, published."""
     engine, venue, _ = mx
     cycle, _ = topk_cycle(mx, {symbol: {}}, rule=K5)
-    cycle_id = submit(cycle, {symbol: {}}, venue.now, agent_id=agent_id, run_slot=run_slot)
+    cycle_id = submit(cycle, {symbol: {}}, venue.now, agent_id=agent_id, run_slot=run_slot,
+                      schedule=schedule)
     publish(cycle, cycle_id)
     return cycle_id
 
@@ -337,6 +349,57 @@ def test_no_replacement_for_a_superseded_run_or_after_a_newer_run(mx, market):
     with engine.store.transaction() as conn:  # The research side decides nothing either.
         for row in events(engine, "RESEARCH_ADMISSION_DECLINED"):
             assert cycle.replace_declined(conn, row) is None
+
+
+def test_v2_keeps_replacing_after_an_update_run_and_passes_over_its_coins(mx, market):
+    """TOPK_REPLACEMENT_V2: a daily run's cycle accepted under RESEARCH_SCHEDULE_V2 keeps
+    replacing its declined picks after a later update run is published. The update run's coin
+    is passed over: its newer pick supersedes this run's (RESEARCH_RUN_SUPERSESSION_V2)."""
+    engine, venue, _ = mx
+    daily, update_run = two_slots(venue.now)
+    schedule = hourly_v2(daily)
+    cycle, cycle_id = ladder(mx, run_slot=daily, schedule=schedule)
+    runtime = runtime_for(mx, market, cycle, [])
+    single(mx, "A6/USD", agent_id="instinct", run_slot=update_run, schedule=schedule)
+    refuse(runtime, selected(engine, cycle_id)["A2/USD"])
+    [replacement] = replacements(engine, cycle_id)
+    assert replacement["replacement_rule"] == "TOPK_REPLACEMENT_V2"
+    assert replacement["passed_over"] == [{"item_key": key("A6/USD"), "rank": 6,
+                                           "symbol": "A6/USD", "code": "SELECTED_BY_LATER_RUN"}]
+    assert (replacement["outcome"], replacement["replacement_symbol"],
+            replacement["replacement_rank"]) == ("PUBLISHED", "A7/USD", 7)
+    assert datetime.fromisoformat(replacement["run_slot"]) == daily
+    assert live(engine, cycle_id, venue.now) == ["A1/USD", "A3/USD", "A4/USD", "A5/USD",
+                                                 "A7/USD"]
+
+
+def test_v2_stops_replacing_once_the_next_daily_run_is_published(mx, market):
+    """TOPK_REPLACEMENT_V2: an update run's cycle is replaced until the next daily run's
+    selection is published, then never again, as V1 after any newer run."""
+    engine, venue, _ = mx
+    update_run, daily = two_slots(venue.now)
+    schedule = hourly_v2(daily)
+    cycle, cycle_id = ladder(mx, run_slot=update_run, schedule=schedule)
+    runtime = runtime_for(mx, market, cycle, [])
+    single(mx, "B1/USD", agent_id="instinct", run_slot=daily, schedule=schedule)
+    refuse(runtime, selected(engine, cycle_id)["A2/USD"])
+    [declined] = events(engine, "RESEARCH_ADMISSION_DECLINED")
+    assert declined["body"]["reason"] == "PRICE_MISMATCH"
+    assert replacements(engine) == [] and sorted(selected(engine, cycle_id)) == TOP
+    with engine.store.transaction() as conn:
+        assert cycle.replace_declined(conn, declined) is None
+
+
+def test_a_v1_cycle_keeps_v1s_rule_whatever_the_later_runs(mx, market):
+    """A cycle accepted under RESEARCH_SCHEDULE_V1 (no daily run) keeps TOPK_REPLACEMENT_V1:
+    its first replacement names V1, and any newer run ends it."""
+    engine, venue, _ = mx
+    cycle, cycle_id = ladder(mx)
+    runtime = runtime_for(mx, market, cycle, [])
+    refuse(runtime, selected(engine, cycle_id)["A2/USD"])
+    [replacement] = replacements(engine, cycle_id)
+    assert replacement["replacement_rule"] == "TOPK_REPLACEMENT_V1"
+    assert replacement["replacement_symbol"] == "A6/USD" and replacement["passed_over"] == []
 
 
 def test_no_replacement_once_the_cycles_picks_have_expired(mx, market):

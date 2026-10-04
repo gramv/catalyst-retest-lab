@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import secrets
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,6 +21,26 @@ def local_settings(root: Path):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "history-test":
+        # HISTORY_TEST_V1 (package strategy-c2): offline, keyless public bars, no ledger, no
+        # broker; its own options (``catalyst-lab history-test --help``).
+        from catalyst_lab.history_test import main as history_main
+
+        history_main(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "stack":
+        # LOCAL_STACK_V1 (package oss-packaging): the local Docker stack's commands (scorecard,
+        # promote-strategy, ...); ``catalyst-lab stack --help``.
+        from catalyst_lab.local_stack import main as stack_main
+
+        stack_main(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "new-strategy":
+        # STRATEGY_SDK_V1 (package plugin-c3): a plug-in skeleton; writes one file, nothing else.
+        from catalyst_lab.strategies.template import main as template_main
+
+        template_main(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser(description="Catalyst Retest Lab — paper laboratory")
     parser.add_argument(
         "command",
@@ -36,6 +57,9 @@ def main():
             "measure",
             "dashboard",
             "research-import",
+            "history-test",
+            "new-strategy",
+            "stack",
         ],
     )
     data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))

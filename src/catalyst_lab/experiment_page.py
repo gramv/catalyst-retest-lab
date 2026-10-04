@@ -5,7 +5,8 @@
 Configuration (environment):
 
 * ``EXPERIMENT_DATABASE_URL`` (required): a PostgreSQL URL for the ``catalyst_public`` role of
-  migration 024, which can read only the four sanitized ``lab.public_dashboard_*`` views.
+  migration 024, which can read only the four sanitized ``lab.public_dashboard_*`` views and
+  (migration 028, page V2) the four ``lab.public_page_*`` views.
 * ``EXPERIMENT_TITLE`` (optional): the page title; default "AI crypto trading - live".
 * ``EXPERIMENT_RESEARCH_SCHEDULE_JSON`` (optional): the research schedule, in the engine's
   ``MANAGED_RESEARCH_SCHEDULE_JSON`` format, for the "next run" figure; default daily 08:00
@@ -16,9 +17,15 @@ exchange, and refuses to start when any ``APCA_*`` variable or ``TYPESAFE_API_KE
 (defense in depth). Every database session is read-only, and the service refuses a login that
 is not ``catalyst_public`` or that can read a base table. The JSON is cached for
 ``CACHE_SECONDS``; the page's own script (the only script the Content-Security-Policy allows)
-polls it every five seconds. For an opened trade's price chart the reader's browser, not this
-service, reads public 5-minute bars from ``PRICE_HISTORY_ORIGIN`` without any key; that is the
-one other origin the policy's ``connect-src`` allows. Fonts (IBM Plex, SIL OFL) are served here.
+polls it every 30 seconds. A trade's own page is ``/trade/{n}``. Fonts (IBM Plex, SIL OFL) are
+served here.
+
+EXPERIMENT_DASHBOARD_V3 (package public-page-v3): this service itself reads Alpaca's public
+crypto market data (``public_market.PublicMarketData``: keyless, two GET routes only,
+timeout-bounded and cached) for the open positions' mark prices (≤15 s), the BTC buy-and-hold
+benchmark (≥5 min) and a trade page's candles and after-the-sale numbers
+(``/api/public/experiment/trades/{n}/chart``). A failed read omits that element. The reader's
+browser now reads this origin only.
 
 ``fixture_data=True`` (a ``create_experiment_app`` argument only; no environment variable or
 command-line flag reaches it) adds a "FIXTURE DATA - not real results" banner to the page and
@@ -42,6 +49,8 @@ from psycopg.rows import dict_row
 
 from catalyst_lab.experiment_html import render_page
 from catalyst_lab.experiment_report import DASHBOARD_VERSION, build_dashboard, read_snapshot
+from catalyst_lab.experiment_v3 import enrich, trade_chart
+from catalyst_lab.repository import json_safe
 
 ROLE = "catalyst_public"
 CACHE_SECONDS = 5
@@ -54,11 +63,10 @@ FONTS = STATIC / "fonts"  # IBM Plex Sans and Mono (SIL Open Font License 1.1, O
 FONT_FILES = {"IBMPlexSans-Regular.woff2", "IBMPlexSans-Medium.woff2",
               "IBMPlexSans-SemiBold.woff2", "IBMPlexMono-Regular.woff2",
               "IBMPlexMono-Medium.woff2"}
-# The one other origin the page's script may read: public 5-minute crypto bars for a trade's
-# price chart, requested by the reader's browser without any key. This service calls nothing.
-PRICE_HISTORY_ORIGIN = "https://data.alpaca.markets"
+# V3: the service reads the public market data itself (keyless, cached); the browser reads
+# this origin only.
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
-       f"font-src 'self'; connect-src 'self' {PRICE_HISTORY_ORIGIN}; base-uri 'none'; "
+       "font-src 'self'; connect-src 'self'; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
 SECURITY_HEADERS = {
     "Content-Security-Policy": CSP,
@@ -70,7 +78,11 @@ SECURITY_HEADERS = {
     "Cross-Origin-Resource-Policy": "same-origin",
     "Strict-Transport-Security": "max-age=31536000",
 }
-SECTIONS = ("status", "overall", "today", "live_trades", "agents", "feed", "past")
+SECTIONS = ("status", "overall", "today", "live_trades", "agents", "feed", "past",
+            # EXPERIMENT_DASHBOARD_V2 (package public-page).
+            "system", "limits", "open_risk", "market", "results",
+            # EXPERIMENT_DASHBOARD_V3 (package public-page-v3).
+            "account", "equity", "daily", "performance")
 ROLE_CHECK = """SELECT current_user::text AS role, r.rolsuper, r.rolcreaterole, r.rolcreatedb,
     r.rolreplication, r.rolbypassrls,
     has_table_privilege('lab.managed_events', 'SELECT') AS reads_base_table,
@@ -110,8 +122,14 @@ def verify_role(conn):
 
 
 class ReportCache:
-    """The last built page and report; rebuilt at most once per ``seconds``. A failed rebuild
-    serves the previous build, marked stale, for at most ``STALE_LIMIT_SECONDS``."""
+    """The last built page and report; rebuilt at most once per ``seconds``, counted from the
+    end of the previous build. One build runs at a time: meanwhile every other request gets the
+    last build at once (within ``STALE_LIMIT_SECONDS``) instead of queueing behind it. A failed
+    rebuild serves the previous build, marked stale, for at most ``STALE_LIMIT_SECONDS``.
+
+    2026-09-29: builds took 6.5 s against the page's 5 s poll. Each waiting request found the
+    cache expired and built again, the queue grew to 5-minute waits, and the waiting reads
+    held every worker thread until even the page itself stopped answering."""
 
     def __init__(self, build, seconds, *, monotonic=time.monotonic):
         self.build, self.seconds, self.monotonic = build, seconds, monotonic
@@ -119,7 +137,12 @@ class ReportCache:
         self.value, self.built_at, self.builds = None, None, 0
 
     def get(self):
-        with self.lock:
+        if not self.lock.acquire(blocking=False):
+            value, built_at = self.value, self.built_at
+            if value is not None and self.monotonic() - built_at <= STALE_LIMIT_SECONDS:
+                return value
+            self.lock.acquire()
+        try:
             now = self.monotonic()
             if self.value is not None and now - self.built_at < self.seconds:
                 return self.value
@@ -129,15 +152,22 @@ class ReportCache:
                 if self.value is None or now - self.built_at > STALE_LIMIT_SECONDS:
                     raise
                 return {**self.value, "stale": True}
-            self.value, self.built_at, self.builds = value, now, self.builds + 1
+            # The time first: a request reading without the lock (value, then time) never sees
+            # a build without its time.
+            self.built_at = self.monotonic()
+            self.value, self.builds = value, self.builds + 1
             return value
+        finally:
+            self.lock.release()
 
 
 def create_experiment_app(database_url, *, title=None, fixture_data=False, schedule=None,
                           cache_seconds=CACHE_SECONDS, environ=None, clock=None,
-                          monotonic=time.monotonic):
+                          monotonic=time.monotonic, market=None):
     """The public dashboard app. ``fixture_data`` is for tests and screenshots only;
-    ``schedule`` is a ``research_schedule.ResearchSchedule`` or its constructor keywords."""
+    ``schedule`` is a ``research_schedule.ResearchSchedule`` or its constructor keywords;
+    ``market`` a ``public_market.PublicMarketData`` (None: no public market data; ``main``
+    passes the real one)."""
     refuse_trading_credentials(os.environ if environ is None else environ)
     if not isinstance(database_url, str) or not database_url.strip():
         raise ExperimentRefused("EXPERIMENT_DATABASE_URL_REQUIRED")
@@ -147,9 +177,14 @@ def create_experiment_app(database_url, *, title=None, fixture_data=False, sched
         with connect(database_url) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             verify_role(conn)
-            snapshot = read_snapshot(conn)
+            snapshot = read_snapshot(conn, schedule)
         document = build_dashboard(snapshot, title=title, fixture_data=fixture_data,
                                    schedule=schedule)
+        try:  # Public market data only adds; any failure leaves the ledger's figures.
+            enrich(document, market, clock())
+        except Exception:  # noqa: BLE001
+            document["market_data"] = {"source": "ALPACA_PUBLIC_KEYLESS",
+                                       "quotes": "UNAVAILABLE", "benchmark": "UNAVAILABLE"}
         return {"document": document, "html": render_page(document), "stale": False}
 
     cache = ReportCache(build, cache_seconds, monotonic=monotonic)
@@ -200,6 +235,39 @@ def create_experiment_app(database_url, *, title=None, fixture_data=False, sched
     @app.get("/", response_class=HTMLResponse)
     def index():
         return HTMLResponse(cache.get()["html"], headers=cached)
+
+    @app.get("/trade/{trade_no}", response_class=HTMLResponse)
+    def trade_page(trade_no: int):
+        """A trade's own page: every open trade and the latest closed ones (the document's)."""
+        document = cache.get()["document"]
+        listed = {t["trade_no"] for t in document["live_trades"]} | {
+            t["trade_no"] for t in document["past"]["closed_trades"]}
+        if trade_no not in listed:
+            raise HTTPException(404, "Unknown trade")
+        return HTMLResponse(render_page(document, trade_no), headers=cached)
+
+    @app.get("/api/public/experiment/trades/{trade_no}/chart")
+    def trade_chart_data(trade_no: int):
+        """A listed trade's candles, 24 hours after its exit and the after-the-sale numbers,
+        from the public market data (cached); empty with a status when unavailable."""
+        document = cache.get()["document"]
+        trade = next((t for t in document["live_trades"] if t["trade_no"] == trade_no), None)
+        closed = trade is None
+        if trade is None:
+            trade = next((t for t in document["past"]["closed_trades"]
+                          if t["trade_no"] == trade_no), None)
+        if trade is None:
+            raise HTTPException(404, "Unknown trade")
+        if market is None:
+            body = {"candles": [], "after": [], "after_exit": None, "status": "UNAVAILABLE"}
+        else:
+            try:
+                body = json_safe(trade_chart(trade, closed, market, clock()))
+            except Exception:  # noqa: BLE001 -- the trade page shows its levels and story.
+                body = {"candles": [], "after": [], "after_exit": None,
+                        "status": "UNAVAILABLE"}
+        return JSONResponse({"trade_no": trade_no, **body},
+                            headers={"Cache-Control": "public, max-age=30"})
 
     @app.get("/experiment.css")
     def stylesheet():
@@ -289,8 +357,10 @@ def main(argv=None, environ=None):
             print(f"Refusing to start: {SCHEDULE_ENV} is not a valid research schedule",
                   file=sys.stderr)
             raise SystemExit(2) from None
+    from catalyst_lab.public_market import PublicMarketData
+
     app = create_experiment_app(url, title=environ.get("EXPERIMENT_TITLE"), schedule=schedule,
-                                environ=environ)
+                                environ=environ, market=PublicMarketData())
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, proxy_headers=True,

@@ -22,8 +22,10 @@ from research_agent.submit import BaseUrlRefused, checked_base_url
 
 CONTEXT_ROUTE = "/api/v1/lab/research-context"
 CONTEXT_VERSION = "RESEARCH_CONTEXT_V1"
-# V2 (package learning-app, 2026-09-28) is every V1 field unchanged plus ``lessons``.
-CONTEXT_VERSIONS = frozenset({CONTEXT_VERSION, "RESEARCH_CONTEXT_V2"})
+# V2 (package learning-app, 2026-09-28) is every V1 field unchanged plus ``lessons``; V3
+# (package research-loop-app, 2026-09-29) is V2 unchanged plus ``watching_setups``, the
+# caller's own report-V3 setups still WATCHING, which the update run reviews (``update``).
+CONTEXT_VERSIONS = frozenset({CONTEXT_VERSION, "RESEARCH_CONTEXT_V2", "RESEARCH_CONTEXT_V3"})
 OFFLINE_CONTEXT_VERSION = "RESEARCH_AGENT_OFFLINE_CONTEXT_V1"
 ALPACA_QUOTES_URL = "https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes"
 # Owner list (2026-09-26, research_context.py): USD-pegged and euro stablecoins are
@@ -57,7 +59,7 @@ def fetch_context(base_url, token, *, client=None, timeout=30.0):
     ``client`` is an injectable ``httpx.Client`` (tests use one on ``httpx.MockTransport``;
     a real client is opened and closed when omitted). Raises ``ContextError`` for any
     non-200 response or unexpected body; never returns anything but the parsed JSON of
-    an actual ``RESEARCH_CONTEXT_V1`` or ``RESEARCH_CONTEXT_V2`` response.
+    an actual ``RESEARCH_CONTEXT_V1``, ``_V2`` or ``_V3`` response.
     """
     try:
         base_url = checked_base_url(base_url)
@@ -226,3 +228,10 @@ def mid_price(quote):
     if not quote or quote.get("bid") is None or quote.get("ask") is None:
         return None
     return (quote["bid"] + quote["ask"]) / 2
+
+
+def open_trade_symbols(context):
+    """Symbols with a filled, not yet closed trade: never reviewed, never picked again."""
+    return {row["symbol"] for row in context.get("open_trades") or []
+            if isinstance(row, dict) and isinstance(row.get("symbol"), str)
+            and row.get("state") != "WATCHING" and row.get("watching") is not True}

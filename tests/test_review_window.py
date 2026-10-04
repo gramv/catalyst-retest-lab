@@ -53,6 +53,7 @@ from tests.day_review_fixtures import (
     state,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_jev_b1_admission as pre_jev_b1_admission
 from tests.maintenance_fixtures import quote
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
@@ -589,6 +590,7 @@ def test_the_day_review_replay_of_a_window_setup_continues_for_its_window():
     assert day_replay_ready_at(continued, 14400) == day_replay_ready_at(continued)
 
 
+@pytest.mark.usefixtures("pre_jev_b1_admission")  # V4's maintenance (before jev-b1).
 def test_the_unchanged_plan_holds_for_the_window_the_setup_recorded(mt, managed_arm):
     from catalyst_lab.unchanged_plan import unchanged_plan_comparisons
     from tests.maintenance_fixtures import bodies, maintainer

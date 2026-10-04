@@ -12,6 +12,7 @@ import httpx
 import psycopg
 import pytest
 
+from catalyst_lab import stop_breach
 from catalyst_lab.alpaca import AlpacaCredentials
 from catalyst_lab.audit import verify_events
 from catalyst_lab.authorization import RiskRepository
@@ -40,6 +41,7 @@ class ManagedVenue:
         # date-bound sessions and calendar flatten times hold at any wall-clock time.
         self.now = fixture_now()
         self.equity = "10000"
+        self.last_equity = "10000"  # Alpaca's previous-close equity (US stock calendar).
         self.cash = "10000"
         self.non_marginable_buying_power = "10000"
         # Margin evidence (plan 2.3); ``buying_power`` None follows cash.
@@ -131,7 +133,7 @@ class ManagedVenue:
                 data = {
                     "id": self.account_id,
                     "equity": self.equity,
-                    "last_equity": "10000",
+                    "last_equity": self.last_equity,
                     "cash": self.cash,
                     "multiplier": self.multiplier,
                     "buying_power": self.buying_power or self.cash,
@@ -152,11 +154,13 @@ class ManagedVenue:
             elif path == "/v2/orders":
                 data = [o for o in self.orders.values() if o["status"] not in TERMINAL]
             elif path == "/v2/account/activities":
-                data = (
-                    self.fee_activities
-                    if request.url.params.get("activity_types") == "CFEE,FEE"
-                    else []
-                )
+                data = []
+                if request.url.params.get("activity_types") == "CFEE,FEE":
+                    # As the live account did on 2026-09-29, ``after`` filters by activity
+                    # date: a dated row is served from the window's UTC day on, whatever its
+                    # time. Rows without a date (older fixtures) are always served.
+                    day = request.url.params["after"][:10]
+                    data = [a for a in self.fee_activities if a.get("date", day) >= day]
             elif path == "/v2/calendar":
                 start = datetime.fromisoformat(request.url.params["start"]).date()
                 end = datetime.fromisoformat(request.url.params["end"]).date()
@@ -651,8 +655,11 @@ def test_stock_partial_fill_cancel_and_flatten_without_waiting_for_model(mx):
     assert close["qty"] == "1"
 
 
-def test_crypto_gap_through_stop_cancels_and_flattens_after_grace(mx):
+def test_crypto_gap_through_stop_cancels_and_flattens_after_grace(mx, monkeypatch):
+    """V1's fallback, for a setup admitted before ``CRYPTO_STOP_BREACH_V2`` (a fresh bid at or
+    below the stop is the breach); V2 is covered in ``tests/test_stop_breach.py``."""
     engine, venue, _ = mx
+    monkeypatch.setattr(stop_breach, "admission_fields", lambda packet: {})
     sid, _ = admit_enter(mx)
     entry = venue.orders_of("buy")[0]
     engine.ingest(venue.fill(entry["id"], entry["qty"]))

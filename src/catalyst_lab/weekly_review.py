@@ -40,6 +40,27 @@ effects (nearest rank, 5% and 95%).
 otherwise ``PROPOSE`` when the interval's upper end is below zero (the evidence says the current
 rule loses value), else ``KEEP``. ``evidence``: ``ADDS_VALUE`` (lower end above zero),
 ``INCONCLUSIVE`` or ``LOSES_VALUE``.
+
+**Package learning-measure (2026-10-02), additive.** ``fee_verification`` states how many closed
+trades the net-R figures rest on (all evidence before the week's end, and the week alone);
+``dimensions`` groups every closed trade before the week's end by ``MARKET_REGIME_V1`` and by the
+rule versions its setup recorded (``result_dimensions``: net R over fee-verified trades only,
+``NOT_ENOUGH_DATA`` below 30 per cell), so each phase-A version is compared with the old rules
+per regime. A recorded policy kept as a record (``maintenance_policy``, ``holding_policy``) is
+read by its ``policy_id``.
+
+**Package learning-loop2 (2026-10-03), additive.** ``tests_excluding_exclusions`` (the same
+tests without the ``STATS_EXCLUSION_V1`` trades) and ``learning`` (``LEARNING_LOOP_WEEKLY_V1``,
+``weekly_learning``: the weekly speed of the learning loop, PROPOSE-only items, never applied).
+Replays are read on each trade's official-R scale (``TRADED_LEVELS_V1``).
+
+**Package jev-b3 (2026-10-03), additive.** ``jev_calibration`` (``JEV_CALIBRATION_V1``,
+``jev_calibration.calibration_section``): per Jev question and version, a 5-bin reliability
+table, the Brier score beside the base-rate Brier, counts and ``NOT_ENOUGH_DATA`` below 40
+selection or 30 maintenance outcomes; the ranking lift of Jev's top K against the agent's own
+order, all picks and the ``BREAKOUT_7D_VOLUME_V1`` baseline on the same cycles; confirmed
+exits against holding to the plan; and a record-only ``thresholds_suggestion``. No verdict
+and no proposal: nothing here changes a threshold.
 """
 
 import re
@@ -49,15 +70,27 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from hashlib import sha256
 
 from catalyst_lab.crypto_holding import REVIEW_POLICY_IDS
+from catalyst_lab.jev_calibration import calibration_section
 from catalyst_lab.learning_intake import day_bounds
-from catalyst_lab.learning_replays import DAY_REPLAY_EVENT, REPLAY_EVENT, counterfactual_r
+from catalyst_lab.learning_replays import (
+    DAY_REPLAY_EVENT,
+    REPLAY_EVENT,
+    counterfactual_r,
+    scale_of,
+)
 from catalyst_lab.managed_engineering import is_engineering
 from catalyst_lab.managed_measurement import managed_measurement
 from catalyst_lab.managed_store import COHORT
 from catalyst_lab.market import NY
+from catalyst_lab.market_regime import recorded_trade_regimes
 from catalyst_lab.pick_outcomes import SHADOW_EVENT_KIND, rank_bucket
 from catalyst_lab.repository import json_safe
+from catalyst_lab.result_dimensions import CELL_MINIMUM, dimensions, recorded_versions
 from catalyst_lab.scorecard import recorded_scorecard
+from catalyst_lab.stats_exclusion import excluded_setups_of
+from catalyst_lab.strategies import strategy_id_of
+from catalyst_lab.strategy_shadow import strategy_section
+from catalyst_lab.weekly_learning import learning_section
 
 D = Decimal
 REVIEW_VERSION = "WEEKLY_REVIEW_V1"
@@ -187,9 +220,17 @@ def shadow_samples(repository, until):
     return groups, policies
 
 
+def _policy_id(value):
+    """A recorded policy's id: the string itself, or a record's ``policy_id``."""
+    if isinstance(value, dict):
+        value = value.get("policy_id")
+    return value if isinstance(value, str) else None
+
+
 def closed_trades(repository, until):
-    """``{setup_id: {arm, r_net, maintenance_policy, holding_policy}}`` of non-engineering
-    managed trades closed before ``until``; ``r_net`` null without verified, non-fixture fees."""
+    """``{setup_id: {arm, r_net, maintenance_policy, holding_policy, closed_at, win, versions,
+    regime}}`` of non-engineering managed trades closed before ``until``; ``r_net`` null without
+    verified, non-fixture fees. The policies are ids (the live state keeps whole records)."""
     with repository.connect() as conn:
         rows = conn.execute(
             """SELECT s.setup_id, s.record_json, t.body AS state FROM lab.managed_setups s
@@ -208,14 +249,25 @@ def closed_trades(repository, until):
         tainted = any(item.get("source") == "LAB_FIXTURE"
                       for item in measured.get("cost_evidence") or [])
         official = measured.get("official_r")
-        holding = state.get("holding_policy")
+        gross = measured.get("gross_realized_pnl")
         trades[str(row["setup_id"])] = {
             "arm": state.get("arm"),
             "r_net": None if tainted or official is None else D(str(official)),
-            "maintenance_policy": state.get("maintenance_policy"),
-            # The recorded holding policy's ID (the state keeps the whole record).
-            "holding_policy": holding.get("policy_id") if isinstance(holding, dict) else None,
+            # The recorded policies' IDs (the state keeps whole records; a record was counted
+            # as a dict before 2026-10-02, which no Counter can hold).
+            "maintenance_policy": _policy_id(state.get("maintenance_policy")),
+            "holding_policy": _policy_id(state.get("holding_policy")),
+            "closed_at": _aware(state["closed_at"]),
+            "win": None if gross is None else D(str(gross)) > 0,
+            "versions": recorded_versions(row["record_json"], state),
+            "strategy_id": strategy_id_of(state, row["record_json"]),
+            # Official R's scale (TRADED_LEVELS_V1, package learning-loop2): rebases replays
+            # recorded on the research stop of a CRYPTO_TRADE_PLAN_V1 setup.
+            "r_basis": scale_of(row["record_json"], state),
         }
+    regimes = recorded_trade_regimes(repository, list(trades))
+    for setup_id, trade in trades.items():
+        trade["regime"] = regimes.get(setup_id)
     return trades
 
 
@@ -231,7 +283,7 @@ def replay_samples(repository, trades):
     for row in rows:
         body = row["body"]
         trade = trades.get(body.get("setup_id"))
-        counterfactual = counterfactual_r(row["kind"], body)
+        counterfactual = counterfactual_r(row["kind"], body, trade.get("r_basis"))
         if trade is None or trade["r_net"] is None or counterfactual is None:
             continue
         difference = trade["r_net"] - counterfactual
@@ -280,10 +332,45 @@ def _common(values):
     return counter.most_common(1)[0][0] if counter else None
 
 
-def run_tests(repository, week_end, *, until):
+def fee_verification(trades, week_start):
+    """How many closed trades carry net R: all before the week's end, and the week's own."""
+    def counts(members):
+        verified = sum(1 for t in members if t["r_net"] is not None)
+        return {"closed": len(members), "fee_verified": verified,
+                "fees_unverified": len(members) - verified}
+    week = [t for t in trades.values() if t["closed_at"] >= week_start]
+    return {"scope": "FEE_VERIFIED_TRADES_ONLY", "all_before_week_end": counts(
+        list(trades.values())), "week": counts(week)}
+
+
+def _summary(members):
+    r_values = [t["r_net"] for t in members if t["r_net"] is not None]
+    wins = sum(1 for t in members if t["win"])
+    decided = sum(1 for t in members if t["win"] is not None)
+    return {"closed": len(members), "wins": wins,
+            "win_rate": _q(D(wins) / decided) if decided else None,
+            "r_net_count": len(r_values), "mean_r_net": _q(mean(r_values))}
+
+
+def exclusion_views(trades, excluded, week_start):
+    """Both views (all trades, and excluding ``STATS_EXCLUSION_V1`` days), for the evidence
+    before the week's end and the week alone, with the excluded counts."""
+    def views(members):
+        kept = [t for setup_id, t in members if setup_id not in excluded]
+        return {"all_trades": _summary([t for _, t in members]),
+                "excluding_exclusions": _summary(kept),
+                "excluded_trades": len(members) - len(kept)}
+    items = list(trades.items())
+    return {"version": "STATS_EXCLUSION_V1",
+            "days": sorted({e["day"] for s, e in excluded.items() if s in trades}),
+            "all_before_week_end": views(items),
+            "week": views([(s, t) for s, t in items if t["closed_at"] >= week_start])}
+
+
+def run_tests(repository, week_end, *, until, trades=None):
     """Every pre-registered test on the evidence recorded before ``until``."""
     selection, policies = shadow_samples(repository, until)
-    trades = closed_trades(repository, until)
+    trades = closed_trades(repository, until) if trades is None else trades
     level, day = replay_samples(repository, trades)
     selection_policy = _common(policies.elements())
     maintenance_policy = _common(t["maintenance_policy"] for t in trades.values())
@@ -389,6 +476,10 @@ def compute_review(repository, week_end, *, now):
     if now < until:
         raise ValueError("WEEK_NOT_OVER")
     monday, _ = week_of(week_end)
+    week_start, _ = day_bounds(monday)
+    trades = closed_trades(repository, until)
+    excluded = excluded_setups_of(repository)
+    calibration = calibration_section(repository, until=until)
     scorecard = recorded_scorecard(repository, week_end)
     week = None
     if scorecard is not None:
@@ -406,7 +497,26 @@ def compute_review(repository, week_end, *, now):
                    "seed": f"SHA256('{REVIEW_VERSION}|<week_end>|<test_id>')[:8]",
                    "value_precision": "1E-8", "minimums": MINIMUMS,
                    "propose_when": "INTERVAL_UPPER_BELOW_ZERO"},
-        "tests": run_tests(repository, week_end.isoformat(), until=until),
+        "tests": run_tests(repository, week_end.isoformat(), until=until, trades=trades),
+        "fee_verification": fee_verification(trades, week_start),
+        "dimensions": dimensions(list(trades.values()), CELL_MINIMUM),
+        # STRATEGY_REGISTRY_V1 (package strategy-c1): every closed paper trade and every shadow
+        # outcome to date, per strategy, labelled apart, with the promotion ladder's standing.
+        "strategies": strategy_section(repository, trades.values(), end=until),
+        "jev_calibration": calibration,
+        # STATS_EXCLUSION_V1 (package public-page-v3): every closed trade, and without the
+        # trades of owner-excluded days; the pre-registered tests above use all the evidence.
+        "stats_exclusions": exclusion_views(trades, excluded, week_start),
+        # Package learning-loop2 (2026-10-03): the same pre-registered tests without the
+        # STATS_EXCLUSION_V1 trades (the tests above keep their recorded definition).
+        "tests_excluding_exclusions": run_tests(
+            repository, week_end.isoformat(), until=until,
+            trades={k: v for k, v in trades.items() if k not in excluded}),
+        # LEARNING_LOOP_WEEKLY_V1 (package learning-loop2): the weekly speed -- patterns,
+        # strategy fit by regime, shadow vs live, Jev calibration, missed tradeable, the
+        # management split, after-exit paths and PROPOSE-only items (never applied).
+        "learning": learning_section(repository, trades, until=until, excluded=excluded,
+                                     calibration=calibration),
         "week": week, "limitations": list(LIMITATIONS),
     })
 

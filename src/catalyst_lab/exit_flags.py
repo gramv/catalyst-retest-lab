@@ -15,11 +15,13 @@ both phases share, so phase 6 consumes and resolves flags without changing the J
 * ``pending_exit_flags``: flags without a resolution whose trade is still open in the flag's
   lifecycle, oldest first (what phase 6 answers, and what the runtime status alarms on).
 * ``resolve_exit_flag``: one append-only ``EXIT_FLAG_RESOLVED`` per flag (``EXIT_AGREED``,
-  ``EXIT_NOT_AGREED``, ``NO_ANSWER_IN_TIME`` or ``LIFECYCLE_ENDED``) with the other side's
-  answer. ``EXIT_AGREED`` also requests the exit (state ``exit_requested`` =
-  ``EARLY_EXIT_AGREED``) in the same transaction while the trade is open in that lifecycle and
-  not already exiting; the protection loop then cancels the resting stop-limit and sells at
-  market, each under its own one-use five-second authorization. A second resolution is refused.
+  ``EXIT_NOT_AGREED``, ``NO_ANSWER_IN_TIME``, ``LIFECYCLE_ENDED`` or, for a
+  ``CRYPTO_MAINTENANCE_V5`` invalidation flag left unanswered, ``NO_ANSWER_EXIT``) with the other
+  side's answer. ``EXIT_AGREED`` and ``NO_ANSWER_EXIT`` also request the exit (state
+  ``exit_requested`` = ``EARLY_EXIT_AGREED``) in the same transaction while the trade is open
+  in that lifecycle and not already exiting; the protection loop then cancels the resting
+  stop-limit and sells at market, each under its own one-use five-second authorization. A
+  second resolution is refused.
 
 Callers pass an open ledger transaction (``ManagedStore.transaction``: the shared advisory lock).
 """
@@ -32,7 +34,12 @@ from catalyst_lab.crypto_maintenance import EXIT_FLAG_VERSION
 FLAG_EVENT = "EXIT_FLAG_RAISED"
 RESOLUTION_EVENT = "EXIT_FLAG_RESOLVED"
 SIDES = frozenset({"JEV", "AGENT"})
-OUTCOMES = frozenset({"EXIT_AGREED", "EXIT_NOT_AGREED", "NO_ANSWER_IN_TIME", "LIFECYCLE_ENDED"})
+# NO_ANSWER_EXIT (CRYPTO_MAINTENANCE_V5, package jev-b1): a flag whose reasons say it exits when
+# unanswered (``if_unanswered`` EXIT: a confirmed invalidation) had no answer by its deadline.
+NO_ANSWER_EXIT = "NO_ANSWER_EXIT"
+OUTCOMES = frozenset({"EXIT_AGREED", "EXIT_NOT_AGREED", "NO_ANSWER_IN_TIME", "LIFECYCLE_ENDED",
+                      NO_ANSWER_EXIT})
+EXIT_OUTCOMES = frozenset({"EXIT_AGREED", NO_ANSWER_EXIT})  # Both request the market sell.
 EARLY_EXIT_REASON = "EARLY_EXIT_AGREED"
 ANSWER_WINDOW_SECONDS = 900
 _PENDING_SQL = """
@@ -67,16 +74,22 @@ def pending_exit_flags(conn, *, setup_id=None, lifecycle_id=None, side=None):
 
 
 def raise_exit_flag(store, conn, *, setup_id, lifecycle_id, side, raised_by, reasons, evidence,
-                    raised_at, reference):
+                    raised_at, reference, question=None):
     """``(row, created)``: one EXIT_FLAG_RAISED, or the side's pending flag for the lifecycle.
 
     ``reference`` makes the flag idempotent (the Jev side uses its review request ID);
     ``raised_by`` names the raiser (Jev: the request, receipts and context hash; an agent: its
     agent ID), ``reasons`` why, ``evidence`` the levels, quote and anything else at the flag.
+    ``question`` (``CRYPTO_MAINTENANCE_V5``: ``invalidation_met`` or ``news_contradicts``, also
+    recorded as ``reasons.question``): only a pending flag of the same question is returned, so a
+    confirmed invalidation is raised (and exits when unanswered) even while a news flag waits.
     """
     if side not in SIDES:
         raise ValueError("EXIT_FLAG_SIDE_INVALID")
     pending = pending_exit_flags(conn, setup_id=setup_id, lifecycle_id=lifecycle_id, side=side)
+    if question is not None:
+        pending = [row for row in pending
+                   if (row["body"].get("reasons") or {}).get("question") == question]
     if pending:
         return pending[0], False
     key = f"exit-flag:{setup_id}:{lifecycle_id}:{side}:{reference}"
@@ -117,7 +130,7 @@ def resolve_exit_flag(store, conn, *, flag_id, outcome, answered_by, answer, res
     state = store.state(conn, setup_id)
     open_now = state.get("state") == "OPEN" and state.get("lifecycle_id") == body["lifecycle_id"]
     exit_requested = None
-    if outcome == "EXIT_AGREED" and open_now and not state.get("exit_requested"):
+    if outcome in EXIT_OUTCOMES and open_now and not state.get("exit_requested"):
         exit_requested = EARLY_EXIT_REASON
     row = store.event(conn, RESOLUTION_EVENT, {
         "flag_version": EXIT_FLAG_VERSION,

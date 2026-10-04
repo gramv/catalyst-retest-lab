@@ -12,11 +12,12 @@ import stat
 import tempfile
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import psycopg
 import pytest
 
 from catalyst_lab import cloud_provision, cloud_runtime, localdb
@@ -300,10 +301,31 @@ class StatusServer:
         return httpx.MockTransport(self.handler)
 
 
-def loop_for(ledger, volume, places, status, **extra):
-    from catalyst_lab.cloud_config import ops_config
+def roomy(path):
+    """``shutil.disk_usage`` of a healthy ops volume (4 GB, half free): the test machine's own
+    disk never decides an ops alarm."""
+    return SimpleNamespace(total=4 * 10**9, used=2 * 10**9, free=2 * 10**9)
+
+
+def record_scorecard_as_the_jobs_do(ledger, day, now):
+    """The nightly jobs' ``DAILY_SCORECARD_V1`` of ``day``, over their catalyst_risk login."""
+    from catalyst_lab.managed_store import ManagedStore
+    from catalyst_lab.scorecard import record_scorecard
 
     cluster, passwords = ledger
+    store = ManagedStore(RiskRepository(cluster.url("catalyst_risk",
+                                                    passwords["RISK_DATABASE_PASSWORD"])))
+    return record_scorecard(store, day, now=now)
+
+
+def loop_for(ledger, volume, places, status, *, disk_usage=roomy, **extra):
+    """An ops loop over the cloud-shaped ledger, whose nightly jobs recorded the scorecard due
+    at ``NOW`` (package ops-alarms: a healthy ledger has it)."""
+    from catalyst_lab.cloud_config import ops_config
+    from catalyst_lab.managed_ops import scorecard_due_day
+
+    cluster, passwords = ledger
+    record_scorecard_as_the_jobs_do(ledger, scorecard_due_day(NOW), NOW)
     env = ops_env(volume,
                   AUDIT_DATABASE_URL=cluster.url("catalyst_app",
                                                  passwords["APP_DATABASE_PASSWORD"]),
@@ -312,7 +334,8 @@ def loop_for(ledger, volume, places, status, **extra):
                   **extra)
     config = ops_config(env, **places)
     server = StatusServer(status)
-    return cloud_runtime.OpsLoop(config, release(), transport=server.transport), server
+    return cloud_runtime.OpsLoop(config, release(), transport=server.transport,
+                                 disk_usage=disk_usage), server
 
 
 @pytest.fixture
@@ -399,6 +422,79 @@ def test_a_failed_backup_alarms_until_a_retry_succeeds(ledger, tmp_path, places)
     server.status = healthy_status(retry)
     recovered = loop.tick(retry)
     assert recovered["backup"]["result"] == "MATCH" and "BACKUP_FAILED" not in recovered["alarms"]
+
+
+def test_ops_alarms_on_a_missed_nightly_run_a_large_ledger_and_a_low_volume(
+        ledger, tmp_path, places, monkeypatch):
+    """Package ops-alarms, on the cloud-shaped ledger. The ops watchdog reads the due day's
+    DAILY_SCORECARD_V1 and pg_database_size as catalyst_app (no grant needed: the size needs
+    only CONNECT, which the role's login holds), every five minutes and at once when the due
+    day changes; the ops volume's free space every tick. None of this existed before
+    2026-09-29: a missed nightly run, a 3 GB ledger and a full backup volume raised nothing."""
+    from catalyst_lab import managed_ops
+
+    volume, used = tmp_path / "volume", {"free": 10}
+    measured = []
+
+    def usage(path):
+        measured.append(Path(path))
+        return SimpleNamespace(total=100 * 10**6, used=(100 - used["free"]) * 10**6,
+                               free=used["free"] * 10**6)
+
+    late = datetime(2026, 10, 6, 7, 0, tzinfo=UTC)  # 2026-10-05 is due: no run recorded it.
+    loop, server = loop_for(ledger, volume, places, healthy_status(late), disk_usage=usage)
+    checks = []
+    real_check = loop.check_ledger
+    loop.check_ledger = lambda now: checks.append(now) or real_check(now)
+    first = loop.tick(late)
+    assert {"LEARNING_JOBS_MISSED", "OPS_VOLUME_LOW"} <= set(first["alarms"])
+    assert not {"DATABASE_SIZE_HIGH", "LEDGER_CHECK_FAILED"} & set(first["alarms"])
+    facts = json.loads((volume / "alarms.json").read_text())["ledger"]
+    assert facts["scorecard_day"] == "2026-10-05" and facts["scorecard_recorded"] is False
+    assert 0 < facts["database_bytes"] < managed_ops.DATABASE_SIZE_HIGH_BYTES
+    assert first["ops_volume"] == {"total_bytes": 100 * 10**6, "free_bytes": 10 * 10**6}
+    assert measured == [volume]  # The mount path: the state directory on the ops volume.
+    # The jobs record the day (catalyst_risk); the watchdog sees it at its next ledger check.
+    assert record_scorecard_as_the_jobs_do(ledger, date(2026, 10, 5), late)[0] == "RECORDED"
+    used["free"] = 20
+    for minutes in (1, 4):
+        server.status = healthy_status(late + timedelta(minutes=minutes))
+        cached = loop.tick(late + timedelta(minutes=minutes))
+        assert "LEARNING_JOBS_MISSED" in cached["alarms"]
+        assert "OPS_VOLUME_LOW" not in cached["alarms"]  # 20% free is enough.
+    assert len(checks) == 1
+    server.status = healthy_status(late + timedelta(minutes=5))
+    assert loop.tick(late + timedelta(minutes=5))["alarms"] == []
+    # A ledger at the threshold: 3 GB in production, here the size the last check measured.
+    with monkeypatch.context() as patch:
+        patch.setattr(managed_ops, "DATABASE_SIZE_HIGH_BYTES", loop.ledger["database_bytes"])
+        server.status = healthy_status(late + timedelta(minutes=6))
+        assert loop.tick(late + timedelta(minutes=6))["alarms"] == ["DATABASE_SIZE_HIGH"]
+    # The next due day is checked at once at 07:00 UTC, however recent the last check.
+    next_day = datetime(2026, 10, 7, 7, 0, tzinfo=UTC)
+    server.status = healthy_status(next_day - timedelta(minutes=1))
+    assert loop.tick(next_day - timedelta(minutes=1))["alarms"] == []
+    server.status = healthy_status(next_day)
+    assert loop.tick(next_day)["alarms"] == ["LEARNING_JOBS_MISSED"]
+    assert [c.isoformat() for c in checks[-2:]] == [
+        (next_day - timedelta(minutes=1)).isoformat(), next_day.isoformat()]
+    # An unreachable ledger fails closed, with a code only, and is retried every five minutes.
+
+    class Unreachable:
+        def connect(self):
+            raise psycopg.OperationalError("connection to server failed: password private-text")
+
+    loop.audit_repository = Unreachable()
+    later = next_day + timedelta(minutes=5)
+    server.status = healthy_status(later)
+    down = loop.tick(later)
+    assert "LEDGER_CHECK_FAILED" in down["alarms"] and "LEARNING_JOBS_MISSED" not in down["alarms"]
+    assert down["ledger"]["code"] == "OPERATIONALERROR"
+    assert "private-text" not in (volume / "alarms.json").read_text()
+    calls = len(checks)
+    server.status = healthy_status(later + timedelta(minutes=1))
+    assert "LEDGER_CHECK_FAILED" in loop.tick(later + timedelta(minutes=1))["alarms"]
+    assert len(checks) == calls
 
 
 def test_ops_alerts_through_the_notifier_with_the_secret_url_variable(ledger, tmp_path, places):

@@ -124,9 +124,10 @@ def test_protective_stop_exit_after_the_entry_window_closes_with_its_exit_reason
     assert stop["status"] == "new"
 
     # The price gaps through the stop; the stop-limit triggers but does not fill. After the
-    # grace the controller cancels it and sends an authorized market exit.
+    # grace the controller cancels it and sends an authorized market exit (CRYPTO_STOP_BREACH_V2:
+    # the print through the stop is the breach, and the grace is 5 s).
     engine.manage(sid, observation(ex, **GAP))
-    venue.now += timedelta(seconds=3)
+    venue.now += timedelta(seconds=5)
     engine.manage(sid, observation(ex, **GAP))
     assert stop["status"] == "canceled"
     assert engine._load(sid)[1]["exit_requested"] == "STOP_LIMIT_NOT_FILLED"

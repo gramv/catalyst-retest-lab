@@ -41,7 +41,13 @@ from tests.test_execution import pristine_cluster as pristine_cluster  # noqa: F
 from tests.test_localdb_guard import audit_head, disposable_root, migrations_through
 
 PUBLIC_VIEWS = {"public_dashboard_status", "public_dashboard_trades", "public_dashboard_runs",
-                "public_dashboard_decisions"}
+                "public_dashboard_decisions",
+                # Migration 028 (package public-page): the page V2's four views.
+                "public_page_trades", "public_page_reviews", "public_page_trade_waits",
+                "public_page_status", "public_page_regimes",
+                # Migration 029 (package public-page-v3): the page V3's four views.
+                "public_page_equity", "public_page_day_starts", "public_page_account_marks",
+                "public_page_stats_exclusions"}
 PUBLIC_FUNCTIONS = {"lab.public_decimal(jsonb)", "lab.public_timestamp(jsonb)",
                     "lab.public_line(jsonb)"}
 MIGRATION = Path(localdb.__file__).with_name("migrations") / "024_public_experiment.sql"
@@ -512,6 +518,28 @@ def test_the_snapshot_reads_each_shown_trades_listed_decisions(er, ledger):  # n
         t0 + timedelta(minutes=2)]
 
 
+def test_the_snapshot_reads_each_agents_latest_picks_as_the_join_it_replaced(
+        er, ledger):  # noqa: F811
+    """read_snapshot's latest_picks: each agent's newest run's picks and verdicts, read by run
+    number (2026-09-29: the join with the runs view took 5.8 s on the live ledger and the page
+    stopped answering). The same rows, in the same order, as that join."""
+    ledger.run(SLOT, [Pick("SOL/USD", jev_rank=1, selected=True)])
+    ledger.run(SLOT + timedelta(hours=2), [Pick("DOT/USD", jev_rank=1, selected=True)],
+               agent="second-fixture-agent")
+    ledger.run(SLOT + timedelta(days=1), [Pick("ETH/USD", jev_rank=2, selected=True),
+                                          Pick("BTC/USD", jev_rank=1, selected=True),
+                                          Pick("LTC/USD", status="VETOED")])
+    joined = """SELECT d.* FROM lab.public_dashboard_decisions d
+        JOIN (SELECT agent, max(run_no) AS run_no FROM lab.public_dashboard_runs GROUP BY agent)
+        l ON l.run_no=d.run_no WHERE d.kind IN ('PICK','SELECTION')
+        ORDER BY d.run_no, d.kind, d.jev_rank NULLS LAST, d.symbol"""
+    with public(er) as conn:
+        snapshot = read_snapshot(conn)
+        assert snapshot["latest_picks"] == conn.execute(joined).fetchall()
+    assert {(r["run_no"], r["symbol"]) for r in snapshot["latest_picks"]} == {
+        (2, "DOT/USD"), (3, "ETH/USD"), (3, "BTC/USD"), (3, "LTC/USD")}
+
+
 def test_the_snapshot_reads_the_current_cycles_picks_and_the_decisions_since_its_start(
         er, ledger):  # noqa: F811
     """read_snapshot's cycle_picks: the newest ranked run's picks and verdicts only (an older
@@ -544,7 +572,7 @@ def test_status_reports_heartbeat_halts_equity_and_jev_calls(er, ledger):  # noq
     assert empty["last_heartbeat_at"] is None and empty["experiment_started_at"] is None
     assert (empty["active_halts"], empty["daily_loss_halt_today"], empty["schema_version"],
             empty["equity_usd"], empty["jev_last_call_at"], empty["jev_calls_today"]) == (
-        0, False, 25, None, None, 0)  # The ledger's schema: 025 (Jev review policy V2).
+        0, False, 31, None, None, 0)  # The ledger's schema: 031 (package plugin-c3).
     ledger.heartbeat(management_reviews="DISABLED",
                      jev_breaker={"state": "OPEN", "epoch": 1, "blocked_until": None})
     with ledger.store.transaction() as conn:

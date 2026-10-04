@@ -22,9 +22,13 @@ from tests.test_operator_controls import audit_state, populate_schema14, start_c
 
 LIVE_LEDGER_VERSION = 13
 # Migrations 014, 015, 017, 018, 019, 020 and 021 are DDL-only; 016 seeds exactly these
-# audited policy rows, and 022 appends two more: JEV_MANAGED_RISK_V3 and its CRYPTO terms.
+# audited policy rows, and 022 appends two more: JEV_MANAGED_RISK_V3 and its CRYPTO terms;
+# 026 three: JEV_MANAGED_RISK_V4, its CRYPTO terms and its daily limits; 031 four:
+# JEV_MANAGED_RISK_V5, its terms, its daily limits and its strategy cap (package plugin-c3).
 SEEDED_POLICY_ROWS = 3
 V3_POLICY_EVENTS = 2
+V4_POLICY_EVENTS = 3
+V5_POLICY_EVENTS = 4
 
 
 def test_populated_schema13_ledger_migrates_to_current_through_the_cli(monkeypatch, capsys,
@@ -55,9 +59,10 @@ def test_populated_schema13_ledger_migrates_to_current_through_the_cli(monkeypat
             main()
             result = json.loads(capsys.readouterr().out)
 
-            # Step 7: the head moves by exactly the three seeded policy rows and 022's two V3
-            # rows, nothing else.
-            appended = SEEDED_POLICY_ROWS + V3_POLICY_EVENTS
+            # Step 7: the head moves by exactly the three seeded policy rows, 022's two V3 rows
+            # and 026's three V4 rows, nothing else.
+            appended = (SEEDED_POLICY_ROWS + V3_POLICY_EVENTS + V4_POLICY_EVENTS
+                        + V5_POLICY_EVENTS)
             assert (result["before"], result["after"]) == (LIVE_LEDGER_VERSION, SCHEMA_VERSION)
             assert result["warning"] == "AUDIT_HEAD_CHANGED_BY_MIGRATION"
             assert result["audit_head_before"] == head_before
@@ -65,13 +70,14 @@ def test_populated_schema13_ledger_migrates_to_current_through_the_cli(monkeypat
                 count_before, count_before + appended)
             assert result["broker_requests"] == 0
             after, audited_after, halts_after, version_after = audit_state(root)
-            assert version_after == schema_version(root) == SCHEMA_VERSION == 25
+            assert version_after == schema_version(root) == SCHEMA_VERSION == 31
             assert after["valid"] and after["event_count"] == count_before + appended
             assert audit_head(root) == (result["audit_head_after"], count_before + appended)
             # Every historical audited row still verifies; the rename in 015 keeps every halt.
             assert {t: v for t, v in audited_after.items() if t in audited_before} == audited_before
-            assert audited_after["account_risk_policies"] == (SEEDED_POLICY_ROWS + 1,) * 2
-            assert audited_after["account_risk_market_terms"] == (1, 1)
+            assert audited_after["account_risk_policies"] == (SEEDED_POLICY_ROWS + 3,) * 2
+            assert audited_after["account_risk_market_terms"] == (3, 3)
+            assert audited_after["account_risk_daily_limits"] == (2, 2)
             assert audited_after["ledger_account_binding"] == (0, 0)
             assert audited_after["operator_flatten_completions"] == (0, 0)  # 019: DDL only.
             assert halts_after == halts_before
@@ -89,7 +95,7 @@ def test_populated_schema13_ledger_migrates_to_current_through_the_cli(monkeypat
             assert kept == head_before  # The old head is untouched at its sequence.
             assert [p[0] for p in policies] == [
                 "CATALYST_RETEST_V1", "JEV_MANAGED_RISK_V2", "JEV_MANAGED_RISK_V3",
-                "MUSE_JEV_MANAGED_TEST_V1"]
+                "JEV_MANAGED_RISK_V4", "JEV_MANAGED_RISK_V5", "MUSE_JEV_MANAGED_TEST_V1"]
             assert "catalyst_operator" in roles  # Added by 015 for the release path.
             # The application roles accept the migrated ledger (preflight --check-database MATCH).
             Repository(localdb.connection_url(root)).check_role()
@@ -115,6 +121,8 @@ def test_populated_schema20_ledger_migrates_to_21_through_the_cli_with_the_head_
 
     from catalyst_lab.managed_store import ManagedStore
     from tests.test_crypto_size_hold import MIGRATION_022_EVENTS, assert_migration_022_appended
+    from tests.test_risk_v4 import V4_AUDIT_EVENTS
+    from tests.test_risk_v5 import V5_AUDIT_ROWS
     from tests.test_selection_b1 import replay_script
     from tests.test_selection_b2 import failures, packet_variants, selected_packets
     from tests.test_selection_topk import run_topk_fixture_cycle
@@ -159,17 +167,18 @@ def test_populated_schema20_ledger_migrates_to_21_through_the_cli_with_the_head_
             assert audit_head(root) == (head_before, count_before)
             assert audited_after == audited and halts_after == halts
             assert failures(risk_url, variants) == before_routes  # Every earlier route kept.
-            # The next owner step, 21 to 25: exactly migration 022's two V3 rows are appended
-            # (023, 024 and 025 are DDL only).
+            # The next owner step, 21 to 26: exactly migration 022's two V3 rows and 026's
+            # three V4 rows are appended (023, 024 and 025 are DDL only).
             monkeypatch.setattr("sys.argv", ledger_migrate(root, 21, SCHEMA_VERSION, manifest))
             main()
             step = json.loads(capsys.readouterr().out)
-            assert (step["before"], step["after"]) == (21, SCHEMA_VERSION) == (21, 25)
+            assert (step["before"], step["after"]) == (21, SCHEMA_VERSION) == (21, 31)
             assert step["warning"] == "AUDIT_HEAD_CHANGED_BY_MIGRATION"
-            assert step["event_count"] == count_before + MIGRATION_022_EVENTS
+            assert step["event_count"] == count_before + MIGRATION_022_EVENTS + len(
+                V4_AUDIT_EVENTS) + len(V5_AUDIT_ROWS)
             assert assert_migration_022_appended(
-                localdb.connection_url(root, "lab_owner"), head_before
-            ) == step["audit_head_after"]
+                localdb.connection_url(root, "lab_owner"), head_before,
+                later=V4_AUDIT_EVENTS + V5_AUDIT_ROWS) == step["audit_head_after"]
             assert failures(risk_url, variants) == before_routes  # 022 changes no route.
             Repository(localdb.connection_url(root)).check_role()
             RiskRepository(risk_url).check_role()
@@ -197,6 +206,8 @@ def test_populated_schema21_ledger_migrates_to_22_with_exactly_the_v3_policy_app
     answer is unchanged, and the application roles accept the migrated ledger."""
     from tests.test_account_risk_policy import populate_reservations
     from tests.test_crypto_size_hold import MIGRATION_022_EVENTS, assert_migration_022_appended
+    from tests.test_risk_v4 import V4_AUDIT_EVENTS
+    from tests.test_risk_v5 import V5_AUDIT_ROWS
 
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"purpose": "LAB_FIXTURE"}))
@@ -229,7 +240,9 @@ def test_populated_schema21_ledger_migrates_to_22_with_exactly_the_v3_policy_app
                 with psycopg.connect(owner_url) as conn:
                     policies = conn.execute(
                         """SELECT to_jsonb(p) FROM lab.account_risk_policies p
-                        WHERE policy_id<>'JEV_MANAGED_RISK_V3' ORDER BY policy_id""").fetchall()
+                        WHERE policy_id NOT IN ('JEV_MANAGED_RISK_V3','JEV_MANAGED_RISK_V4',
+                        'JEV_MANAGED_RISK_V5')
+                        ORDER BY policy_id""").fetchall()
                     reservations = conn.execute(
                         """SELECT to_jsonb(r) FROM lab.account_risk_reservations r
                         ORDER BY source""").fetchall()
@@ -251,29 +264,32 @@ def test_populated_schema21_ledger_migrates_to_22_with_exactly_the_v3_policy_app
             main()
             result = json.loads(capsys.readouterr().out)
 
-            assert (result["before"], result["after"]) == (21, SCHEMA_VERSION) == (21, 25)
+            assert (result["before"], result["after"]) == (21, SCHEMA_VERSION) == (21, 31)
             assert result["warning"] == "AUDIT_HEAD_CHANGED_BY_MIGRATION"
             assert result["audit_head_before"] == head_before
+            appended = MIGRATION_022_EVENTS + len(V4_AUDIT_EVENTS) + len(
+                V5_AUDIT_ROWS)  # 022, then 026, then 031.
             assert (result["event_count_before"], result["event_count"]) == (
-                count_before, count_before + MIGRATION_022_EVENTS)
+                count_before, count_before + appended)
             assert result["broker_requests"] == 0
             # The exact audit-head change: the V3 row's event chained to the old head, then its
-            # crypto terms' event chained to that; the new head is the second event's hash.
-            new_head = assert_migration_022_appended(owner_url, head_before)
+            # crypto terms' event chained to that, then 026's three V4 events.
+            new_head = assert_migration_022_appended(owner_url, head_before,
+                                                     later=V4_AUDIT_EVENTS + V5_AUDIT_ROWS)
             assert result["audit_head_after"] == new_head
-            assert audit_head(root) == (new_head, count_before + MIGRATION_022_EVENTS)
+            assert audit_head(root) == (new_head, count_before + appended)
             with psycopg.connect(owner_url) as conn:
                 old_head = conn.execute(
                     "SELECT event_hash FROM lab.trade_events WHERE seq=%s", (count_before,)
                 ).fetchone()[0]
             assert old_head == head_before  # The old head is untouched at its sequence.
             after, audited_after, halts_after, version_after = audit_state(root)
-            assert version_after == schema_version(root) == 25 and after["valid"]
-            assert after["event_count"] == count_before + MIGRATION_022_EVENTS
+            assert version_after == schema_version(root) == 31 and after["valid"]
+            assert after["event_count"] == count_before + appended
             unchanged = {t: v for t, v in audited_before.items() if t != "account_risk_policies"}
             assert {t: v for t, v in audited_after.items() if t in unchanged} == unchanged
-            assert audited_after["account_risk_policies"] == (SEEDED_POLICY_ROWS + 1,) * 2
-            assert audited_after["account_risk_market_terms"] == (1, 1)
+            assert audited_after["account_risk_policies"] == (SEEDED_POLICY_ROWS + 3,) * 2
+            assert audited_after["account_risk_market_terms"] == (3, 3)  # V3, V4 and V5.
             assert halts_after == halts_before
             # V1, the legacy row and V2 byte for byte; the open reservations keep their
             # policies; every V1, legacy and V2 account-risk answer is the same.

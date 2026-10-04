@@ -20,6 +20,7 @@ themselves, and nothing here sends an order itself.
 import re
 from uuid import uuid4
 
+from catalyst_lab.equity_snapshot import EquitySnapshotRecorder
 from catalyst_lab.jev_contract import digest, encoded
 from catalyst_lab.managed_execution import error_code, normalized_symbol, num
 from catalyst_lab.managed_store import TERMINAL
@@ -142,6 +143,7 @@ class ManagedAccountSafety:
         self.runtime_id = str(getattr(execution, "process_run_id", None) or uuid4())
         self._flatten_started = {}
         self._flatten_status = None
+        self.equity_snapshots = EquitySnapshotRecorder()
 
     def legacy_exposure(self):
         with self.repo.connect() as conn:
@@ -250,9 +252,10 @@ class ManagedAccountSafety:
         return reason
 
     def _account_tick(self, *, flatten):
-        account, positions, cashflow, _ = self.execution.account_snapshot(shared=True)
+        account, positions, cashflow, observed = self.execution.account_snapshot(shared=True)
         with self.execution.store.transaction() as conn:
             reason = self.execution._account_halt(conn, account, positions, cashflow)
+            self._record_equity(conn, account, positions, observed)
             if reason == "DAILY_RISK_HALT":
                 rows = conn.execute(
                     "SELECT setup_id,body FROM lab.managed_states"
@@ -277,6 +280,17 @@ class ManagedAccountSafety:
             # Yesterday's incomplete exit remains active after midnight or restart.
             self.safety.process_exits()
         return reason
+
+    def _record_equity(self, conn, account, positions, observed):
+        """ACCOUNT_EQUITY_SNAPSHOT_V1 (package public-page-v3): record this tick's account read,
+        at most once per five minutes. No broker read of its own; record-only, in a savepoint,
+        so a failure here never changes the account tick."""
+        try:
+            with conn.transaction():
+                self.equity_snapshots.record(conn, self.execution.store, account, positions,
+                                             observed)
+        except Exception:  # noqa: BLE001 -- record-only: the account tick goes on without it.
+            pass
 
     # --- Operator flatten (migration 015 requests, 019 completions) --------------------
 

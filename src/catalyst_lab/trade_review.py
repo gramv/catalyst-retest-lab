@@ -38,7 +38,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal as D
 from uuid import UUID, uuid4
 
-from catalyst_lab import crypto_holding, exit_flags
+from catalyst_lab import crypto_holding, exit_flags, trade_plan
 from catalyst_lab import crypto_maintenance as cm
 from catalyst_lab import day_review as dr
 from catalyst_lab.day_review_dossier import ANSWERED as AGENT_ANSWERED
@@ -59,13 +59,14 @@ from catalyst_lab.managed_review import MANAGED_COHORT, ManagedContext
 from catalyst_lab.position_monitor import MANAGEMENT_REVIEWS_ENABLED, MANAGEMENT_REVIEWS_SETTINGS
 from catalyst_lab.repository import json_safe
 from catalyst_lab.system_check import LivePriceReader, LivePriceUnavailable
-from catalyst_lab.trade_maintenance import TradeMaintenance
+from catalyst_lab.trade_maintenance import TradeMaintenance, v4_guards
 
 PURPOSE = "ENGINEERING_TEST"  # The position reviews' record purpose (PositionMonitor's).
 _CODE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 POLL_HINT_SECONDS = 60
 RECOVERY_MARGIN_SECONDS = 5
 HARD_EXIT_MARGIN_SECONDS = 60  # A continue is never applied within a minute of the fail-safe.
+DECISION_REST_READS_PER_PASS = 10  # A decision's own REST quote reads per pass (every trade's).
 _OPEN_REVIEW_SETUPS = """SELECT s.setup_id,s.symbol,s.market,s.strategy_version,s.record_json,
 s.cycle_id,s.revision,t.body AS state FROM lab.managed_states t JOIN lab.managed_setups s
 USING(setup_id) WHERE t.body->>'state'='OPEN'
@@ -366,6 +367,11 @@ class DayReviews:
         self.management_reviews = management_reviews
         self.agents = frozenset(agents) if agents is not None else None
         self.live_prices = live_prices or LivePriceReader(bars, clock=clock)
+        # A decision or an early-exit resolution reads its quote through its own reader (as in
+        # trade_maintenance, 2026-09-28): a slow answer never finds the pass's one REST read
+        # spent on its own request. Freshness rules are the reader's, unchanged.
+        self.decision_prices = LivePriceReader(self.live_prices.source, clock=clock,
+                                               rest_reads_per_tick=DECISION_REST_READS_PER_PASS)
         # The review's numbers come from each setup's own recorded version (``review_policy``):
         # V2 has V1's exactly, and CRYPTO_WINDOW_REVIEW_V1 differs only in its interval (the
         # window the setup recorded at admission). The version also names its records and reads
@@ -394,6 +400,7 @@ class DayReviews:
         now = self.now()
         self.last_pass_at = now
         self.live_prices.new_tick()
+        self.decision_prices.new_tick()
         reviewed = [s for s in setups if (s.get("state") or {}).get("state") == "OPEN"
                     and crypto_holding.review_active(s.get("state"))]
         self._sweep({s["setup_id"] for s in reviewed})
@@ -454,11 +461,12 @@ class DayReviews:
 
     # --- quotes, bars and the trade now ----------------------------------------------------
 
-    def _quote(self, symbol, row):
+    def _quote(self, symbol, row, reader=None):
         received = (row or {}).get("quote_received_at")
         received = _aware(received) if isinstance(received, str) else received
         try:
-            return self.live_prices.read(symbol, row, by_read_time=True, received_at=received)
+            return (reader or self.live_prices).read(symbol, row, by_read_time=True,
+                                                     received_at=received)
         except LivePriceUnavailable:
             return None
 
@@ -518,7 +526,9 @@ class DayReviews:
         increment = _num(await asyncio.to_thread(
             lambda: self.execution.broker.asset(setup["symbol"])["price_increment"]))
         packet = setup["record_json"]
-        levels = {k: _num(v) for k, v in packet["levels"].items()}
+        # CRYPTO_TRADE_PLAN_V1: R and the initial levels are the plan's (trade_plan.py).
+        levels = trade_plan.initial_levels(
+            {k: _num(v) for k, v in packet["levels"].items()}, state)
         risk = cm.r_per_coin(levels)
         with self.store.repo.connect() as conn:
             entry = TradeMaintenance._average_entry(conn, sid, state)
@@ -539,18 +549,24 @@ class DayReviews:
         best = max(v for v in (extremes["high"], quote.bid,
                                entry + risk * milestone if milestone else None) if v is not None)
         worst = min(v for v in (extremes["low"], quote.bid) if v is not None)
+        # CRYPTO_MAINTENANCE_V4: the stop-raise guards (None under V1-V3: options unchanged).
+        guards = cm.raise_guards(
+            cm.recorded_policy(state), hourly_range=cm.hourly_range(bars["bars_1h"], now)[0],
+            last_raise_at=cm.last_stop_raise(state), target_cap=trade_plan.target_cap(state))
         computed = None
         if options:
             computed = {
                 "stop": [o.record() for o in cm.stop_options(
                     bars_15m=bars["bars_15m"], bars_1h=bars["bars_1h"], now=now, bid=quote.bid,
                     entry=entry, current_stop=stop, best_bid=best, risk=risk,
-                    increment=increment)],
+                    increment=increment, guards=guards)],
                 "target": [o.record() for o in cm.target_options(
                     bars_15m=bars["bars_15m"], bars_1h=bars["bars_1h"], now=now, bid=quote.bid,
-                    current_target=target, increment=increment)],
+                    current_target=target, increment=increment,
+                    target_cap=guards.target_cap if guards is not None else None)],
             }
         return {
+            "raise_guards": {**guards.record(), "best_bid": best} if guards is not None else None,
             "quote": quote, "bars": bars, "increment": increment, "entry": entry, "risk": risk,
             "stop": stop, "target": target, "options": computed, "changes": changes,
             "news": news, "history": history, "pick": packet.get("state") or packet,
@@ -645,7 +661,8 @@ class DayReviews:
             options = inputs["options"] if inputs else None
         packet = setup["record_json"]
         pick = packet.get("state") or packet
-        levels = packet["levels"]
+        # CRYPTO_TRADE_PLAN_V1: the plan's levels (the research levels stay in original_pick).
+        levels = trade_plan.initial_levels(packet["levels"], state)
         risk = cm.r_per_coin({k: _num(v) for k, v in levels.items()})
         qty = _num(state.get("qty") or "0")
         trade = {
@@ -812,7 +829,10 @@ class DayReviews:
             "basis": {"stop": inputs["stop"], "target": inputs["target"],
                       "entry": inputs["entry"], "risk_per_coin": inputs["risk"],
                       "increment": inputs["increment"], "bid": inputs["quote"].bid,
-                      "quote": inputs["quote"].evidence()},
+                      "quote": inputs["quote"].evidence(),
+                      # CRYPTO_MAINTENANCE_V4 only (earlier versions' contexts are unchanged).
+                      **({"raise_guards": inputs["raise_guards"]}
+                         if inputs.get("raise_guards") is not None else {})},
             "policy": policy.record(), "expires_at": expires.isoformat(),
             "manifest": compiled.manifest,
         }))
@@ -942,7 +962,8 @@ class DayReviews:
         market) or DISCARDED (the trade closed or began exiting meanwhile)."""
         sid = setup["setup_id"]
         request = view.request["body"]
-        quote = self._quote(setup["symbol"], row) if outcome != dr.DISCARDED else None
+        quote = (self._quote(setup["symbol"], row, self.decision_prices)
+                 if outcome != dr.DISCARDED else None)
         key = "day-review-decision:" + view.review_id
         with self.store.transaction() as conn:
             if conn.execute("SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s",
@@ -1052,11 +1073,13 @@ class DayReviews:
             low, high = self._bid_extremes(setup_id, state["lifecycle_id"],
                                            _aware(request["body"]["asked_at"]), quote.bid)
             answered = jev["body"].get("answered_at")
+            guards, best_bid = v4_guards(basis, state, high)
             code = cm.check_change(
                 old_stop=old_stop, new_stop=new_stop, old_target=old_target,
                 new_target=new_target, bid=quote.bid, min_bid=low, max_bid=high,
                 answered_at=_aware(answered) if answered else now, now=now,
-                increment=_num(basis["increment"]))
+                increment=_num(basis["increment"]), guards=guards, best_bid=best_bid,
+                entry=_num(basis["entry"]), risk=_num(basis["risk_per_coin"]))
         if code is not None:
             return change, {}, ("REFUSED", code)
         fields = {}
@@ -1067,6 +1090,8 @@ class DayReviews:
             fields["stop_replace"] = {"change_id": view.review_id, "path": cm.PATCH_REPLACE,
                                       "from_stop": str(old_stop), "to_stop": str(new_stop),
                                       "applied_at": now.isoformat()}
+            if "raise_guards" in basis:  # CRYPTO_MAINTENANCE_V4: the spacing starts now.
+                fields[cm.STOP_RAISED_AT] = now.isoformat()
         return change, fields, ("APPLIED", None)
 
     # --- early exits (plan 4.6.3) ----------------------------------------------------------
@@ -1094,8 +1119,15 @@ class DayReviews:
         return jobs
 
     def _jev_flag(self, setup, row, now, flag):
-        """Jev flagged the trade (maintenance): the agent is asked at once and has 15 min."""
+        """Jev flagged the trade (maintenance): the agent is asked at once and has 15 min.
+
+        ``CRYPTO_MAINTENANCE_V5`` (package jev-b1): a flag whose reasons say ``if_unanswered``
+        EXIT (a confirmed invalidation) resolves ``NO_ANSWER_EXIT`` (the market sell) when no
+        agent answers by its deadline, or at once when no agent can be asked; every other flag
+        keeps the trade when unanswered (``NO_ANSWER_IN_TIME``), as before."""
         due = _aware(flag.raised["body"]["answer_due_at"])
+        unanswered = (dr.NO_ANSWER_EXIT if (flag.raised["body"].get("reasons") or {}).get(
+            "if_unanswered") == dr.EXIT_IF_UNANSWERED else dr.NO_ANSWER_IN_TIME)
         if flag.asked is None:
             with self.store.repo.connect() as conn:
                 addressee, basis = addressee_for(conn, setup, self.agents)
@@ -1112,16 +1144,18 @@ class DayReviews:
                         "answer_schema": crypto_holding.AGENT_REVIEW_ANSWER_VERSION,
                         "answer_route": f"/api/v1/lab/exit-flags/{flag.flag_id}/answer",
                         "policy_id": self.flag_policy.policy_id,
+                        **({"if_unanswered": dr.EXIT_IF_UNANSWERED}
+                           if unanswered == dr.NO_ANSWER_EXIT else {}),
                     }, setup_id=setup["setup_id"], key=key)
             if addressee is None:
-                self._resolve(setup, row, now, [flag], dr.NO_ANSWER_IN_TIME, dr.NO_ACTIVE_AGENT)
+                self._resolve(setup, row, now, [flag], unanswered, dr.NO_ACTIVE_AGENT)
             return
         if flag.agent_answer is not None:
             decision = flag.agent_answer["body"]["answer"]["decision"]
             self._resolve(setup, row, now, [flag], dr.flag_resolution(decision == dr.EXIT),
                           None, agent=flag.agent_answer)
         elif now >= due:
-            self._resolve(setup, row, now, [flag], dr.NO_ANSWER_IN_TIME, None)
+            self._resolve(setup, row, now, [flag], unanswered, None)
 
     async def _agent_flag(self, setup, row, now, flag, schedule):
         """The agent flagged the trade: Jev is asked at once and has the flag's 15 minutes."""
@@ -1187,14 +1221,16 @@ class DayReviews:
         """``EXIT_FLAG_RESOLVED`` for each flag (``EXIT_AGREED`` requests the market sell) and one
         ``EARLY_EXIT_DECISION`` with both sides' answers and the measurement hook."""
         sid = setup["setup_id"]
-        quote = self._quote(setup["symbol"], row) if row is not None else None
+        quote = (self._quote(setup["symbol"], row, self.decision_prices)
+                 if row is not None else None)
         first = flags[0]
         key = "early-exit-decision:" + first.flag_id
         with self.store.transaction() as conn:
             if conn.execute("SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s",
                             (key,)).fetchone():
                 return
-            if outcome == dr.NO_ANSWER_IN_TIME and agent is None and conn.execute(
+            if outcome in (dr.NO_ANSWER_IN_TIME, dr.NO_ANSWER_EXIT) and agent is None \
+                    and conn.execute(
                 "SELECT 1 FROM lab.managed_events WHERE idempotency_key=%s",
                 ("exit-flag-answer:" + first.flag_id,),
             ).fetchone():
@@ -1228,7 +1264,7 @@ class DayReviews:
                 )
                 resolved.append(flag.flag_id)
             after = self.store.state(conn, sid)
-            exited = (outcome == dr.EXIT_AGREED and not state.get("exit_requested")
+            exited = (outcome in exit_flags.EXIT_OUTCOMES and not state.get("exit_requested")
                       and after.get("exit_requested") == self.flag_policy.exit_reason)
             quote_record = quote.evidence() if quote else None
             self.store.event(conn, dr.EARLY_EXIT_DECISION, {
@@ -1445,8 +1481,11 @@ class TradeReviewService:
                 "raised_by": "JEV", "raised_at": raised["raised_at"],
                 "answer_due_at": asked["answer_due_at"], "answer_route": asked["answer_route"],
                 "answer_schema": asked["answer_schema"],
-                "jev_reasons": {k: raised["reasons"].get(k) for k in (
+                "jev_reasons": {**{k: raised["reasons"].get(k) for k in (
                     "trade_reason", "answers", "trigger_reasons")},
+                    # CRYPTO_MAINTENANCE_V5: which question confirmed and what no answer does.
+                    **{k: raised["reasons"][k] for k in ("question", "if_unanswered")
+                       if k in raised["reasons"]}},
                 "trade": raised.get("evidence"),
             })
         return items

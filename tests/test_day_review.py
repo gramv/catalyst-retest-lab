@@ -46,12 +46,13 @@ from tests.day_review_fixtures import (
     stop_orders,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.maintenance_fixtures import quote
 from tests.maintenance_fixtures import v1_admission as v1_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 
-pytestmark = pytest.mark.usefixtures("managed_arm")
+pytestmark = pytest.mark.usefixtures("managed_arm", "pre_trade_plan_admission")
 _ = managed_arm
 
 

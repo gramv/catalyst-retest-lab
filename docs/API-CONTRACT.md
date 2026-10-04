@@ -5,7 +5,7 @@ The earlier sections retain the frozen baseline and historical review contracts.
 the separate managed application's current source; it is not an activation record.
 
 Implements the candidate intake and polling portions of [integration-spec.md](integration-spec.md).
-Conflicts with the frozen build plan are resolved in [CONTRACT-RESOLUTIONS.md](CONTRACT-RESOLUTIONS.md).
+Conflicts with the frozen build plan are resolved in [REFERENCE-RULES.md](REFERENCE-RULES.md).
 
 Base URL for the local lab: `http://127.0.0.1:8765`.
 Except `/health` and the local OpenAPI UI, all routes require `Authorization: Bearer <Muse token>`.
@@ -19,7 +19,7 @@ through the authenticated review API; the app-owned bridge enrolls exact reviewe
 engineering items. It creates no new client order/quantity permission. Private report
 items include `paper_execution` (null if unenrolled) with cohort, outcome, state, open
 quantity, expiry and revocation reason. Selection remains distinct from a risk grant
-and from a broker fill. See US-JEV-INTEGRATION.md for the opt-in local-test boundary.
+and from a broker fill.
 
 | Method | Path | Scope | Behavior |
 | --- | --- | --- | --- |
@@ -190,7 +190,7 @@ US records and CSV are hidden until the stored official session close; aggregate
 Engineering records never enter these views. No execution/override or manual-result mutation route is exposed.
 
 Research import is an operator-only CLI using source prices/quantity, not caller-computed outcomes.
-See PHASE-5-6.md for methodology, correction revisions, disclosure and deployment boundaries.
+
 
 ## Step 4 isolated review storage surface
 
@@ -227,9 +227,9 @@ not test whether an answer approves a trade, reserve risk or change candidate st
 There is no intent GET, worker or consuming role. Duplicate IDs and binding conflicts
 return 409, invalid payloads 422, missing/wrong scope 401; response errors omit inputs.
 
-See COHORTS.md and STEP-4-REPORT.md. The frozen trading API and risk capabilities are unchanged.
+See COHORTS.md. The frozen trading API and risk capabilities are unchanged.
 
-## Local research-report testing (owner-approved selection policy, 2026-09-19)
+## Local research-report testing (selection policy)
 
 This surface is separate from executable US candidates. All reports in this milestone
 are server-tagged ENGINEERING_TEST / JEV_ENGINEERING_TEST and require a TEST- report key.
@@ -273,7 +273,7 @@ is not current approval. The write token grants none of these read permissions.
 The app worker uses a separate catalyst_jev database connection and shares breaker state
 by provider, exact model and non-secret credential slot. Operator halt/resume is a separate
 DB capability, not a Muse/API endpoint. Health's worker_loop=false describes the API process;
-worker health is read from the authenticated status endpoint. See REVIEW-WORKER-LOCAL.md.
+worker health is read from the authenticated status endpoint.
 
 
 ## Managed schema-14 source contract
@@ -374,18 +374,18 @@ version and guideline fields are recorded as the agent declares them, not verifi
 
 Credentials: each configured research-agent token (private config v2 `agents`, one token
 file per agent) acts for exactly its `agent_id` and has Muse's routes (from 2026-09-26 these
-include the read-only `GET /api/v1/lab/research-context`). The legacy Muse
-token (`MANAGED_API_TOKEN`, `muse.token_file`) acts for agent `muse` (the Muse worker's
-default version is `LEGACY_UNDECLARED`) and is the only credential that may submit an
-unversioned legacy report. Any other combination is 403
+include the read-only `GET /api/v1/lab/research-context`, and from 2026-09-29
+`POST /api/v1/lab/research-withdrawals`, which acts only on the caller's own picks). The
+legacy Muse token (`MANAGED_API_TOKEN`, `muse.token_file`) acts for agent `muse` (the Muse
+worker's default version is `LEGACY_UNDECLARED`) and is the only credential that may submit
+an unversioned legacy report. Any other combination is 403
 `AGENT_IDENTITY_MISMATCH` with nothing stored: a report naming another agent, a legacy
 body from an agent credential, or the legacy token naming an agent other than `muse`.
 The same 403 guards the writes that act on a recorded cycle or setup: evidence-task
 claims, evidence revisions and position news are accepted only from the credential of
 the cycle's (setup's) recorded agent, and an unattributed legacy cycle only from the
 legacy credential. Their bodies are unchanged and carry no agent block. Reads are not
-restricted by agent: what agents may see of each other's work is an open owner ruling of
-plan 1.3.
+restricted by agent.
 
 Cycle IDs: a V2 report's cycle is `uuid5(284306f0-6a31-5d71-a753-f854db41ccfa,
 "<agent_id>:<report_id>")` (the namespace is `uuid5(NAMESPACE_URL,
@@ -469,7 +469,7 @@ broker eligibility, quotes, liquidity, trigger, expiry and risk checks remain ma
 
 ### Research context and `AGENT_RESEARCH_REPORT_V3` (2026-09-26, package research-v3)
 
-Owner decisions of 2026-09-26: crypto only; picks must be coins Alpaca Paper can trade; one
+Crypto only; picks must be coins Alpaca Paper can trade; one
 research run a day at 08:00 New York time (a second run can be switched on); 20 picks per run.
 Jev reads each pick exactly as the agent sent it and the independent system check comes after
 Jev's selection, at admission (package system-check, [below](#system-check-at-admission-system_check_v1-2026-09-27)),
@@ -485,12 +485,13 @@ Decimals are fixed-point strings and times RFC 3339. Without the service the rou
 
 | Field | Content |
 | --- | --- |
-| `context_version`, `as_of` | `RESEARCH_CONTEXT_V2` from package learning-app (2026-09-28; `RESEARCH_CONTEXT_V1` before) and the instant described |
+| `context_version`, `as_of` | `RESEARCH_CONTEXT_V3` from package research-loop-app (2026-09-29; `RESEARCH_CONTEXT_V2` from package learning-app before it, `RESEARCH_CONTEXT_V1` before that) and the instant described |
 | `caller` | `role`, and `agent_id` for a research or legacy credential |
-| `schedule` | `RESEARCH_SCHEDULE_V1` (`version`, `timezone`, `runs`, `grace_minutes`), `current_run_slot` (latest run at or before `as_of`), `current_run_valid_until_limit`, `next_runs` (the next occurrence of each run), in the schedule's zone; `null` without `MANAGED_RESEARCH_SCHEDULE_JSON` |
+| `schedule` | `RESEARCH_SCHEDULE_V1` (`version`, `timezone`, `runs`, `grace_minutes`), `current_run_slot` (latest run at or before `as_of`), `current_run_valid_until_limit`, `next_runs` (the next occurrence of each run), in the schedule's zone; `null` without `MANAGED_RESEARCH_SCHEDULE_JSON`. Under `RESEARCH_SCHEDULE_V2` also `daily`, `current_run_kind` and `next_run_kinds` ([below](#research-context-v3-watching-setups-and-the-v2-schedule-research_context_v3)) |
 | `report_format` | `schema_version`, guidelines version and SHA-256 (`MUSE_RESEARCH_GUIDELINES_V6` from package learning-app), `picks_target` 20, `picks_max` 30, `skipped_max` 200, dossier and rationale budgets, `max_report_age_seconds`, `report_max_seconds` |
 | `universe` | `count`, `coins`, `excluded`, `sources`, `issues` (below) |
 | `open_trades` | the caller's open positions: `setup_id`, `symbol`, `signal_id`, `state`, average `entry`, current `stop` and `target`, `quantity`, `opened_at`, original `levels`, `unrealized_pnl_usd` at the latest bid (`null` without a quote), and (package day-review) `review_at` (T of the next review) and `continuations` under `CRYPTO_24H_REVIEW_V1`, `_V2` or `CRYPTO_WINDOW_REVIEW_V1`, else `null`, and (package review-window) `holding_window_seconds`, the window a trade under `CRYPTO_WINDOW_REVIEW_V1` or `CRYPTO_WINDOW_HOLD_V1` recorded at admission, else `null` |
+| `watching_setups` | package research-loop-app (V3 only): the caller's own report-V3 setups still `WATCHING`, which `open_trades` never lists ([below](#research-context-v3-watching-setups-and-the-v2-schedule-research_context_v3)) |
 | `pending_reviews` | package day-review: the caller's pending 24-hour reviews and Jev exit flags, exactly the `items` of `GET /api/v1/lab/reviews` ([below](#24-hour-reviews-and-early-exits-package-day-review-2026-09-27)); `[]` for the status credential |
 | `recent_outcomes` | `closed_trades` of the last 7 days (at most 50, newest first; `exit_reason`, `entry`, `exit`, `quantity`, `gross_pnl_usd`, `net_pnl_usd`, `fees_verified`, `r` = the measurement's `test_r` with `r_basis`) and `last_run` (the caller's latest research cycle, each pick with its status) |
 | `lessons` | package learning-app (V2 only): the caller's own sanitized learning record, `RESEARCH_LESSONS_V1` ([below](#research-context-v2-lessons-research_context_v2-research_lessons_v1)); `null` for the status credential |
@@ -542,7 +543,7 @@ envelope is checked as a whole:
 | --- | --- |
 | `schema_version` | `AGENT_RESEARCH_REPORT_V3` |
 | `report_id` | UUID; the cycle is `uuid5(agent, report_id)` as for V2, and an exact retry returns the stored answer |
-| `generated_at`, `valid_until` | RFC 3339 with an offset; `generated_at < valid_until <= generated_at + 24 h`, and `valid_until <=` the next scheduled run after `run_slot` plus the grace |
+| `generated_at`, `valid_until` | RFC 3339 with an offset; `generated_at < valid_until <= generated_at + 24 h`, and `valid_until <=` the next scheduled run after `run_slot` plus the grace (under `RESEARCH_SCHEDULE_V2`, the next full daily run after it) |
 | `run_slot` | a scheduled run instant (any offset); the report may be generated at most the grace before it |
 | `context_as_of` | the `as_of` of the context used; not after `generated_at` |
 | `agent` | V2's agent block, required (the credential check is V2's) |
@@ -625,7 +626,7 @@ their selections cross the same admission SQL, then the system check below.
 Active only when the owner sets `MANAGED_SELECTION_RULE=JEV_TOP_K_SELECTION_V1` (K from
 `MANAGED_TOPK_SELECTION_JSON`, exactly `{"k": N}`, N 5–10, default 10; a quality floor refuses
 startup). Its question sets, veto and uncertain labels, score and ranking are recorded in
-CONTRACT-RESOLUTIONS.md. Output changes:
+REFERENCE-RULES.md. Output changes:
 
 - **Intake**: under top-K only report V3 is accepted. A V2 or legacy body is refused whole with
   422 `{"detail": "REPORT_V3_REQUIRED"}` and nothing stored. `RESEARCH_STARTED.selection_rule`
@@ -642,7 +643,8 @@ CONTRACT-RESOLUTIONS.md. Output changes:
   `question_set_version`, `pick_kind`, `selection_policy` and `evidence_tasks: []`.
   `RESEARCH_QUALITY` has `quality_policy` `MUSE_JEV_COMPARATIVE_QUALITY_V3`, `status` `SCORED`
   or `NOT_SCORED`, `reason`, `score` (a 0–100 four-decimal string), `category` (or null) and
-  `answers`.
+  `answers`. Since `RESEARCH_REVIEW_BREAKER_GATE_V1` (below), both reviews start only while
+  the Jev circuit breaker is closed.
 - **`RESEARCH_RANKING`** (one per cycle, idempotency key `research:ranking:<cycle_id>`, in the
   cycle outputs): `{policy: "JEV_TOP_K_SELECTION_V1", cycle_id, run_slot, k, entries,
   quality_policy, uncertain_penalty, complete, counts: {RANKED, VETOED, NOT_RANKED}}`. Each entry
@@ -674,9 +676,30 @@ CONTRACT-RESOLUTIONS.md. Output changes:
   `SELECTION_QUESTION_POLICY_MISMATCH`, `QUALITY_RECEIPT_REQUIRED` and
   `QUALITY_RECEIPT_BINDING_FAILURE`.
 
+#### Top-K reviews wait for a closed Jev breaker (`RESEARCH_REVIEW_BREAKER_GATE_V1`, 2026-09-29)
+
+Fixture evidence only; the rule is in docs/REFERENCE-RULES.md. No new route. In a top-K
+cycle (V1 or V2), a pick's kind review and QUALITY_V3 review start only while the Jev circuit
+breaker, which the research reviews share with the trade reviews, is `CLOSED`.
+- **While it is `OPEN` or `HALF_OPEN`**, the pick has no `RESEARCH_DECISION` or
+  `RESEARCH_QUALITY` yet (its research-context `status` stays `AWAITING_REVIEW`). The cycle
+  outputs carry one `RESEARCH_REVIEWS_DEFERRED` per breaker opening: `{cycle_id, gate:
+  "RESEARCH_REVIEW_BREAKER_GATE_V1", breaker_state, breaker_epoch, blocked_until,
+  runtime_scope, review_policy, waiting_picks, review_deadline}`, with idempotency key
+  `research:<cycle_id>:reviews-deferred:<runtime_scope>:<breaker_epoch>`. `review_deadline` is
+  the earliest ranking deadline of the waiting picks.
+- **Once it closes**, the picks are reviewed, ranked and published as above.
+- **A pick still unreviewed at its deadline** is NOT_RANKED `REVIEW_DEADLINE_PASSED` in a
+  ranking with `complete: false`, as before.
+- **A refusal that still happens** (the breaker opening between the check and the call) keeps
+  its code, `CIRCUIT_OPEN` or `QUALITY_CIRCUIT_OPEN`, as before, and is not retried.
+
+V2, B1 and B2 cycles are unchanged: a refused review is still `NEEDS_REVIEW` `CIRCUIT_OPEN`
+with an evidence task.
+
 #### System check at admission (`SYSTEM_CHECK_V1`, 2026-09-27)
 
-Package system-check (fixture evidence only; rules in `docs/packages/system-check.md`). No new
+Package system-check (fixture evidence only). No new
 route and no request field: these are admission outcomes, read through `/outputs`,
 `/cycles/{cycle_id}/outputs` (the `RESEARCH_*` events) and `/positions/{setup_id}/timeline`. A
 V3 selection (packet `report_schema_version: AGENT_RESEARCH_REPORT_V3`) that passes every
@@ -689,7 +712,8 @@ setup is created; V2 and legacy selections are unchanged.
 | `PRICE_MISMATCH` | permanent | \|live mid − `agent_current_price`\| / `agent_current_price` > 0.05 |
 | `STOP_ALREADY_HIT` | permanent | live bid ≤ `stop`, or the last trade ≤ `stop` |
 | `BREAKOUT_NOT_ENABLED` | permanent | entry type `BREAKOUT`: `entry_trigger` above the mid by more than 0.2% of the mid |
-| `SUPERSEDED_BY_NEW_RESEARCH` | permanent | a V3 selection of a later `run_slot` has been published |
+| `SUPERSEDED_BY_NEW_RESEARCH` | permanent | a V3 selection of a later `run_slot` has been published (under `RESEARCH_SCHEDULE_V2`: of a later full run, or of a later run for the same symbol, `RESEARCH_RUN_SUPERSESSION_V2`) |
+| `WITHDRAWN_BY_RESEARCH` | permanent | the proposing agent withdrew the selection ([`AGENT_RESEARCH_WITHDRAWAL_V1`](#post-apiv1labresearch-withdrawals-agent_research_withdrawal_v1)) |
 | `LIVE_PRICE_UNAVAILABLE` | transient | no stream quote at most 5 s old and no usable REST latest quote; retried next tick |
 
 The mid is (bid + ask) / 2. Entry type: `PULLBACK` (entry more than 0.2% below the mid),
@@ -723,11 +747,12 @@ is published, each older V3 setup still `WATCHING` becomes `INVALIDATED` with `r
 and `revocation_reason: SUPERSEDED_BY_NEW_RESEARCH` (one `REVOKE` with `run_slot`,
 `superseded_by_run_slot` and `supersession_rule`), and each older, unexpired V3 selection not
 yet admitted is declined with that reason. Open positions, working entries and V2 cycles are
-untouched.
+untouched. Under `RESEARCH_SCHEDULE_V2`, `RESEARCH_RUN_SUPERSESSION_V2` applies instead
+([below](#run-supersession-under-research_schedule_v2-research_run_supersession_v2)).
 
 #### Replacement of declined top-K picks (`TOPK_REPLACEMENT_V1`, 2026-09-27)
 
-Package replacement (fixture evidence only; rule in `docs/packages/replacement.md`). No new
+Package replacement (fixture evidence only). No new
 route or request field; the outcomes are read through `/cycles/{cycle_id}/outputs`, `/outputs`
 and the research context. Only cycles under `JEV_TOP_K_SELECTION_V1` are affected.
 
@@ -759,10 +784,21 @@ the decline nor anything else is written, the runtime appends `RUNTIME_REPLACEME
 (`runtime_id`, `cycle_id`, `item_key`, `selection_event_seq`, `declined_code`, `code`) once per
 runtime, selection and code, and the next tick retries.
 
+#### Replacement under the research loop (`TOPK_REPLACEMENT_V2`, 2026-09-29)
+
+No new
+route or field. For a top-K cycle accepted while the schedule was `RESEARCH_SCHEDULE_V2` (the
+`research_schedule` its `RESEARCH_STARTED` recorded), `TOPK_REPLACEMENT_V1`'s decision applies
+with two differences: the run is over only once a V3 selection of a later **daily (full)** run
+is published, not any later run; and an entry whose symbol a later run has already selected is
+passed over with code `SELECTED_BY_LATER_RUN` (that newer pick supersedes this run's under
+`RESEARCH_RUN_SUPERSESSION_V2`). The decision records `replacement_rule:
+"TOPK_REPLACEMENT_V2"`; its other fields are V1's. Cycles accepted under `RESEARCH_SCHEDULE_V1`
+keep V1.
+
 #### Crypto size and 24-hour hold (`JEV_MANAGED_RISK_V3`, `CRYPTO_24H_HOLD_V1`, 2026-09-27)
 
-Package crypto-size-hold (fixture evidence only; migration 022; rules in
-`docs/packages/crypto-size-hold.md`). No new route or request field: the HTTP caller still
+Package crypto-size-hold (fixture evidence only; migration 022). No new route or request field: the HTTP caller still
 supplies proposed levels only, never a size, classification or holding choice.
 
 - **Entry decisions under `JEV_MANAGED_RISK_V3` (crypto).** The decision `context.budget` is the
@@ -797,7 +833,7 @@ supplies proposed levels only, never a size, classification or holding choice.
 
 #### Crypto trigger version `CRYPTO_ALPACA_TRIGGER_V1` (2026-09-27)
 
-Package crypto-trigger (fixture evidence only; rule in `docs/packages/crypto-trigger.md`). No new
+Package crypto-trigger (fixture evidence only). No new
 route or request field; the outcomes are read through `/setups`, `/outputs` and
 `/positions/{setup_id}/timeline`. It applies to crypto setups admitted from a report-V3 packet
 (any selection rule); every other setup's trigger and records are unchanged.
@@ -844,7 +880,7 @@ when no read time was recorded and the quote's own time stands in), `quote_read_
 
 #### Gap resume `CRYPTO_GAP_RESUME_V1` (2026-09-27)
 
-Package gap-resume (fixture evidence only; rule in `docs/packages/gap-resume.md`). No new route or
+Package gap-resume (fixture evidence only). No new route or
 request field; read through `/setups`, `/outputs`, `/positions/{setup_id}/timeline` and the
 status. It applies to the setups of `CRYPTO_ALPACA_TRIGGER_V1` admitted from now on; every other
 setup is still revoked `DATA_FEED_FAILURE` on a market gap, with today's records.
@@ -878,7 +914,7 @@ source's codes), `problems`), `prints` (`count`, `lowest`, `lowest_at`, `lowest_
 
 #### Pick shadow outcomes and results views (`PICK_SHADOW_OUTCOME_V1`, `UNCHANGED_PLAN_REPLAY_V1`, package results, 2026-09-27)
 
-Fixture evidence only (fixture evidence rules in `docs/packages/results.md`). Two new,
+Fixture evidence only. Two new,
 purely read-only capabilities on top of the existing routes above: no request field, no
 broker call, no order and no risk authorization anywhere in this package.
 
@@ -1117,11 +1153,13 @@ or arrive through a Muse mutation route. Measurements expose cost evidence and c
 IDs, sampled-excursion coverage, and missing-data limitations. Execution-quality timing
 and slippage diagnostics are descriptive observations, not proof of strategy performance.
 
-Package fees-net-r (2026-09-26, fixture evidence only — see docs/packages/fees-net-r.md):
+Package fees-net-r (2026-09-26, fixture evidence only):
 fee evidence can also come from Alpaca's own `CFEE`/`FEE` account activities, read GET-only
 and matched to a fill by broker order id and time (source `ALPACA_PAPER_ACTIVITY` on the
 correction, alongside the existing operator `BROKER_ACTIVITY`/`BROKER_STATEMENT`/
-`LAB_FIXTURE`). Every measurement (`/results`, `/history/results`,
+`LAB_FIXTURE`). Alpaca's crypto rows carry no order id; from 2026-09-29 such a row binds by
+its amount to exactly one fill (`ALPACA_FEE_MATCH_V2`, docs/REFERENCE-RULES.md), and a
+row that fits more than one fill is counted `ambiguous`, never guessed. Every measurement (`/results`, `/history/results`,
 `/positions/{setup_id}/measurement`) now also carries `net_r` (net P&L over the
 reservation's authorized-quantity risk, the net analogue of the existing `test_r`) and
 `official_r` (the owner's R5 ruling: net P&L over the *filled* quantity times admitted
@@ -1208,7 +1246,7 @@ are decimal strings rounded to 0.0001 for display. The watchdog raises `JEV_BUDG
 
 ### Trade maintenance readback (`CRYPTO_MAINTENANCE_V1`, package maintenance, 2026-09-27)
 
-Rules: [packages/maintenance.md](packages/maintenance.md). No route and no request field was
+Rules: [REFERENCE-RULES.md](REFERENCE-RULES.md). No route and no request field was
 added; a maintained trade is read through the existing routes. `/setups`, `/positions` and
 `/results` states list `maintenance_policy` and `partial_entry_policy` (recorded at admission for
 a report-V3 crypto setup in the `JEV_MANAGED` arm; absent for every other setup),
@@ -1234,7 +1272,7 @@ tier), `STOP_REPLACED`,
 computes them and Jev chooses.
 
 Under `CRYPTO_MAINTENANCE_V3` (package jev-budget, 2026-09-28; rules in
-[packages/jev-budget.md](packages/jev-budget.md)) the requests, context, questions and decisions
+[REFERENCE-RULES.md](REFERENCE-RULES.md)) the requests, context, questions and decisions
 are V2's; a `POSITION_REVIEW_REQUEST`'s trigger (and its Jev identity) adds `spend_guard`
 (`version`, `tier`, `tier_event_seq`, `review_bar_seconds`, `routine_weight`), its routine
 reason is `BAR_1M`, `BAR_5M` or `BAR_15M` by tier, and a trade the budget does not allow to be
@@ -1244,7 +1282,7 @@ outputs route also carries `JEV_BUDGET_TIER_CHANGED` and `JEV_SPEND_GUARD_CONFIG
 
 ### 24-hour reviews and early exits (package day-review, 2026-09-27)
 
-Rules and versions: [packages/day-review.md](packages/day-review.md) (plan
+Rules and versions: [REFERENCE-RULES.md](REFERENCE-RULES.md) (plan
 `docs/CRYPTO-AGENT-LOOP.md` 4.6.3 and 4.6.4). Scope: an open trade whose state records
 `holding_policy` `CRYPTO_24H_REVIEW_V1`, (from package answer-rules) `CRYPTO_24H_REVIEW_V2` or
 (from package review-window, while `MANAGED_CRYPTO_WINDOW_JSON` is set) `CRYPTO_WINDOW_REVIEW_V1`,
@@ -1277,7 +1315,7 @@ minutes has at least 25 minutes to answer. Items:
 | `kind` | Fields |
 | --- | --- |
 | `DAY_REVIEW` | `review_id`, `setup_id`, `symbol`, `lifecycle_id`, `round` (`FIRST` until T; `DISCUSSION` for 15 minutes after Jev disagreed), `answer_due_at`, `review_at` (T), `review_number` (1 at the first T), `answer_route`, `answer_schema` (`AGENT_REVIEW_ANSWER_V1`), `request` (the stored request: `trade` with entry, quantity, stop, target, original levels, risk per coin, opened time, hours in the trade, bid, ask, quote time, unrealized P&L and P&L in R at the request; `level_changes`; `news_since_entry` (every source of the trade's position news); `options` (the stop and target options code computed at the request, or `null`); `original_pick` (kind, the agent's price and time, levels, stated reward-to-risk, thesis, why now, why these levels, risks, disproof)); in round `DISCUSSION` also `your_first_answer` and `jev_first_answer` (`answers`: each question's `choice` and `top_p`; `meanings`: each choice's fixed text; `chosen`: the option records Jev chose, under `CRYPTO_24H_REVIEW_V2` only the ones code would raise to: a unique most probable offered option) |
-| `EXIT_FLAG` | `flag_id`, `setup_id`, `symbol`, `lifecycle_id`, `raised_by` (`JEV`), `raised_at`, `answer_due_at` (15 minutes after the flag), `answer_route`, `answer_schema`, `jev_reasons` (`trade_reason`, `answers`, `trigger_reasons`), `trade` (the levels, quote, entry and risk per coin at the flag) |
+| `EXIT_FLAG` | `flag_id`, `setup_id`, `symbol`, `lifecycle_id`, `raised_by` (`JEV`), `raised_at`, `answer_due_at` (15 minutes after the flag), `answer_route`, `answer_schema`, `jev_reasons` (`trade_reason`, `answers`, `trigger_reasons`; on a `CRYPTO_MAINTENANCE_V5` trade also `question` — `invalidation_met` or `news_contradicts` — and `if_unanswered`: `EXIT` means no answer by `answer_due_at` sells the trade, `KEEP` keeps it), `trade` (the levels, quote, entry and risk per coin at the flag) |
 
 **`POST /api/v1/lab/reviews/{review_id}/answer`** (at most 32 KiB) accepts an
 `AGENT_REVIEW_ANSWER_V1` for the round open now:
@@ -1338,8 +1376,7 @@ per review), `EXIT_FLAG_RAISED`, `EXIT_FLAG_ASKED`, `EXIT_FLAG_AGENT_ANSWER`,
 
 ### Learning loop: outlooks, post-mortems and lessons (package learning-app, 2026-09-28)
 
-Owner-approved plan [LEARNING-LOOP-PLAN.md](LEARNING-LOOP-PLAN.md) (sections 2, 4–7; owner
-decisions of 2026-09-28). **Paper trading only.** Nothing here places or changes an order,
+Plan: [LEARNING-LOOP-PLAN.md](LEARNING-LOOP-PLAN.md) (sections 2, 4–7). **Paper trading only.** Nothing here places or changes an order,
 changes a trading rule or reaches Jev: outlooks, post-mortems and lessons are research-side
 records, and Jev's dossiers and questions are unchanged. Every record is one immutable
 `lab.managed_events` row with no setup (`setup_id` null), appended through the audited append;
@@ -1585,14 +1622,12 @@ mean_return_pct}], total_volume_usd, total_volume_vs_7d_avg}`.
 
 #### Nightly records: `MARKET_REALITY_V1`, `DAILY_SCORECARD_V1`, `WEEKLY_REVIEW_V1` and the recorded replays
 
-Written only by the nightly `jobs` service (package learning-app; `docs/RAILWAY-DEPLOYMENT.md`
-2.5), each an immutable `lab.managed_events` row with no setup, keyed so a rerun never records
+Written only by the nightly `jobs` service (package learning-app), each an immutable `lab.managed_events` row with no setup, keyed so a rerun never records
 twice. They add no route: the status credential reads them on `GET /api/v1/lab/outputs`, the
 owner through `cloud_runtime scorecard | market-review | weekly-review` in the ops shell, and a
 research agent only its own share through `lessons` (the outputs feed leaves every learning
 record out for a research-agent credential, its own outlooks and post-mortems included: it
-has their receipts). Rules and exact definitions:
-`docs/packages/learning-app.md`.
+has their receipts).
 
 | Kind | Key | Body (main fields) |
 | --- | --- | --- |
@@ -1602,3 +1637,288 @@ has their receipts). Rules and exact definitions:
 | `UNCHANGED_PLAN_REPLAY` | `unchanged-plan-replay:<source_event_seq>` | the `UNCHANGED_PLAN_REPLAY_V1` outcome of one applied raise or agreed early exit, once complete, with `setup_id`, `symbol`, `arm`, `agent_id`; never the trade's actual R (read live). `UNCHANGED_PLAN_REPLAY_V2` (package review-window) for a trade that recorded a window: the unchanged plan holds for that window instead of 24 hours |
 | `DAY_REVIEW_DECISION_REPLAY` | `day-review-decision-replay:<source_event_seq>` | `DAY_REVIEW_DECISION_REPLAY_V1`: one 24-hour decision against the one not taken (`decision`, `alternative`, the counterfactual exit and its R), once complete. `DAY_REVIEW_DECISION_REPLAY_V2` (package review-window) for a `CRYPTO_WINDOW_REVIEW_V1` trade: an EXIT is compared with continuing for the recorded window (`alternative` `CONTINUE_WINDOW_ON_LEVELS_IN_FORCE`, plus `window_seconds`) |
 
+### Research loop V2: withdrawals, supersession and the context V3 (package research-loop-app, 2026-09-29)
+
+The app side of [the research loop](RESEARCH-LOOP-V2.md): a daily full run plus update runs
+(`RESEARCH_SCHEDULE_V2`). Rules and authority:
+[REFERENCE-RULES](REFERENCE-RULES.md), 2026-09-29. Fixture evidence only. Nothing here
+sizes, orders or authorizes a trade, and nothing reaches Jev.
+
+#### `POST /api/v1/lab/research-withdrawals` (`AGENT_RESEARCH_WITHDRAWAL_V1`)
+
+A research agent withdraws its own unfilled report-V3 picks. On the research-agent routes: every
+research-agent credential and the legacy Muse credential (acting for `muse`); the status and
+operator credentials are 403 `TOKEN_ROLE_NOT_PERMITTED`. Without the service the route answers
+503 `RESEARCH_WITHDRAWAL_NOT_CONFIGURED`.
+
+| Field | Contract |
+| --- | --- |
+| `schema_version` | `AGENT_RESEARCH_WITHDRAWAL_V1` |
+| `withdrawal_id` | A UUID; the idempotency key, per agent |
+| `agent` | Exactly `agent_id` (the credential's agent) and `agent_version`, with the report agent block's patterns |
+| `items` | 1–30 `{symbol, reason}`: unique symbols in the universe form (`XRP/USD`, at most 32 characters), the reason trimmed, 1–300 characters |
+
+No other key is accepted. The body is at most 1,048,576 bytes (413
+`RESEARCH_WITHDRAWAL_TOO_LARGE`). The agent block is validated first (422
+`INVALID_RESEARCH_WITHDRAWAL` with its paths), then bound to the credential (403
+`AGENT_IDENTITY_MISMATCH`), then the whole body is screened for credentials, e-mail and 0x
+addresses (422 `SENSITIVE_EVIDENCE_REJECTED`) and validated (422 `INVALID_RESEARCH_WITHDRAWAL`,
+`errors` with paths and codes such as `DUPLICATE_SYMBOL_IN_WITHDRAWAL`; never the submitted
+values). A refusal stores nothing.
+
+Effect, per item, in one ledger transaction under the shared lock: each of the caller's own
+report-V3 setups on the symbol still `WATCHING` becomes `INVALIDATED` with `revoked: true` and
+`revocation_reason: WITHDRAWN_BY_RESEARCH` (one `REVOKE` keyed
+`research:withdrawn:<withdrawal_id>:<setup_id>` with `reason`, `withdrawal_id`,
+`withdrawal_reason` and `agent`); each of its own report-V3 selections on the symbol still
+offered for admission (unexpired, no setup, no decline) gets one `RESEARCH_ADMISSION_DECLINED`
+(key `research:admission-declined:<selection_event_seq>`: `cycle_id`, `item_key`, `revision`,
+`receipt_id`, `selection_event_seq`, `reason: WITHDRAWN_BY_RESEARCH`, `withdrawal_id`,
+`withdrawal_reason`, `agent`) and is never offered again or replaced. "Own" is the `agent`
+block the pick's packet recorded (the caller's agent; unattributed legacy records for the legacy
+credential). Setups past `WATCHING`, closed ones, non-V3 ones and every other agent's records are
+never touched. No broker call is made.
+
+The 200 response: `status: RESEARCH_WITHDRAWAL_RECORDED`, `schema_version`, `withdrawal_id`,
+`agent_id`, `agent_version`, `results`, `idempotent_replay`, `trade_authorized: false`. One
+result per item, in order: `{symbol, result, setup_ids, selections_declined}` with `result`
+`WITHDRAWN` (the revoked setups and the number of declined selections), `NOT_WATCHING` (nothing
+withdrawn: the caller's setup on the symbol has left `WATCHING` and is still live; its IDs) or
+`NONE`. One `RESEARCH_WITHDRAWAL` event (no setup, key
+`research-withdrawal:<agent_id>:<withdrawal_id>`) records `schema_version`, `withdrawal_id`,
+`agent`, `request_sha256`, `items`, `results` and `received_at`. An identical resend returns the
+stored response with `idempotent_replay: true`; a different body under the same ID is 409
+`WITHDRAWAL_ID_CONFLICT`. Admission refuses a withdrawn selection, even one it was admitting at
+that moment, with `WITHDRAWN_BY_RESEARCH` (permanent; the refusal names the `withdrawal_id`).
+In the research context's `last_run`, a withdrawn setup reads `INVALIDATED` with `setup_reason:
+WITHDRAWN_BY_RESEARCH`, and a withdrawn selection `DECLINED` with `decline_code:
+WITHDRAWN_BY_RESEARCH`.
+
+#### Run supersession under `RESEARCH_SCHEDULE_V2` (`RESEARCH_RUN_SUPERSESSION_V2`)
+
+While `MANAGED_RESEARCH_SCHEDULE_JSON` names a `daily` run, a V3 setup still `WATCHING` or a V3
+selection still offered for admission that answers run `r` is retired only when a published V3
+selection of a later run is from a full (daily) run, whatever its symbol, or is for the same
+symbol, whatever the run's kind. It is recorded exactly as `RESEARCH_RUN_SUPERSESSION_V1` (the
+same keys, `SUPERSEDED_BY_NEW_RESEARCH`, `run_slot`, `superseded_by_run_slot`) with
+`supersession_rule: RESEARCH_RUN_SUPERSESSION_V2`, and admission refuses such a selection the
+same way. Everything else stays until its own expiry; an adjusted pick Jev does not select
+supersedes nothing. A V3 selection is offered for admission from the tick after the one in which
+it was published at the latest, once a supersession pass has read it.
+
+#### Research context V3: watching setups and the V2 schedule (`RESEARCH_CONTEXT_V3`)
+
+`context_version: "RESEARCH_CONTEXT_V3"`: every V2 field unchanged, plus:
+
+| Field | Content |
+| --- | --- |
+| `watching_setups` | The caller's own report-V3 setups whose state is `WATCHING`, by symbol: exactly `setup_id`, `symbol`, `levels` (`entry_trigger`, `max_entry_price`, `stop`, `target`, decimal strings), `run_slot` (in the schedule's zone; as recorded without a schedule), `expires_at` and `signal_id`. `[]` without any, and for the status credential. `open_trades` is unchanged and lists filled trades only |
+| `schedule` (V2 only) | In this order: `version` (`RESEARCH_SCHEDULE_V2`), `timezone`, `runs`, `grace_minutes`, `daily`, `current_run_slot`, `current_run_kind` (`FULL` or `UPDATE`), `current_run_valid_until_limit` (the next full run after the current one plus the grace), `next_runs`, `next_run_kinds` (one kind per entry of `next_runs`). Under `RESEARCH_SCHEDULE_V1` the block is exactly V2's |
+
+### Stop-limit fallback and operator pause (`CRYPTO_STOP_BREACH_V2`, `OPERATOR_PAUSE_ENTRY_WAIT_V1`, package exit-and-pause, 2026-09-29)
+
+Rules: [REFERENCE-RULES.md](REFERENCE-RULES.md) (2026-09-29). Fixture evidence only
+(`tests/test_stop_breach.py`, `tests/test_pause_wait.py`). No route and no request field was
+added; both are read through the existing routes.
+
+- **State** (`/setups`, `/positions`, `/results`):
+  - `stop_breach_version`: `CRYPTO_STOP_BREACH_V2` on every crypto setup admitted from this
+    release; absent on older setups (V1) and on stocks.
+  - `stop_breach_marks` (V2): `stop` (the stop measured), `stop_since` (when the protection pass
+    first measured it), and the held-bid mark `bid_since`, `bid`, `bid_quote_at` (null without
+    one).
+  - `stop_breached_at`: the breach time. Under V1 it is the first fresh bid at or below the stop;
+    under V2 the pass that established the breach, null again after a stop change. Newly listed
+    for both.
+  - `stop_breach_evidence` (V2): the `STOP_BREACH_ESTABLISHED` body below; null until a breach
+    and after a stop change.
+  - `pause_wait_version`: `OPERATOR_PAUSE_ENTRY_WAIT_V1` on every setup admitted from this
+    release.
+- **`STOP_BREACH_ESTABLISHED`** (setup event on the outputs and timeline routes; one per stop
+  measurement, key `stop-breach-established:<setup_id>:<lifecycle_id>:<stop_since>`): `version`,
+  `lifecycle_id`, `stop`, `stop_since`, `breach_evidence` (`TRADE_PRINT` or `BID_HELD`),
+  `evidence_at` and `evidence_price` (the print's trade time and price, or the establishing
+  quote's time and bid), `trade_id` and `print_age_seconds` (a print), `held_since`,
+  `held_seconds` and `first_bid` (a held bid), `established_at`, `fallback_seconds` (5) and
+  `fallback_at`. The fallback's close keeps the exit reason `STOP_LIMIT_NOT_FILLED` under both
+  versions (protection plan, CANCEL and EXIT decisions, `exit_requested`, CLOSED reason).
+- **`OPERATOR_PAUSE_ENTRY_WAIT`** (setup event; at most one per setup and UTC minute, key
+  `operator-pause-entry-wait:<setup_id>:<minute>`): `reason` (`OPERATOR_PAUSE`), `version`,
+  `halt_ids` (the unreleased pauses), `trigger` (the trigger's `trade_price`, `trade_at`,
+  `trade_id`, `bid`, `ask`, `quote_at` and `quote_read_at`, those present) and `waited_at`. No
+  `TRIGGER_CONFIRMED` and no risk decision are written, and the state stays `WATCHING`. A setup
+  without the version is still refused at a trigger during a pause (`RISK_REJECTED`, reason
+  `RISK_HALT`), as is every setup under any other halt; under the daily-loss halt the reason is
+  `DAILY_RISK_HALT`.
+- The status's `execution_halts`, the watchdog's `HALT_OPERATOR_PAUSE` and the operator commands
+  are unchanged.
+
+
+### Coinbase as the reference market (`CRYPTO_COINBASE_TRIGGER_V1`, `CRYPTO_STOP_BREACH_V3`, package coinbase-reference, 2026-09-29)
+
+Rules: [REFERENCE-RULES.md](REFERENCE-RULES.md) (2026-09-29). Fixture evidence only
+(`tests/test_coinbase_reference.py`). No route and no request field was added. Report V3, the
+levels and the system check at admission are unchanged: an agent's picks are read exactly as
+before, and the entry order is still a limit at `max_entry_price` on Alpaca paper.
+
+- **State** (`/setups`, `/positions`, `/results`), for a report-V3 crypto pick of a coin with a
+  Coinbase USD product admitted from this release: `trigger_version`
+  `CRYPTO_COINBASE_TRIGGER_V1`, `stop_breach_version` `CRYPTO_STOP_BREACH_V3` and
+  `reference_product` (the Coinbase product, such as `BTC-USD`). Other setups are unchanged
+  (`CRYPTO_ALPACA_TRIGGER_V1` and `CRYPTO_STOP_BREACH_V2` for a coin without a product).
+- **`INVALIDATED`** revision `reason` under this trigger: `STOP_TRADED_BEFORE_TRIGGER` (a Coinbase
+  print at or below `stop`), `STOP_QUOTED_BEFORE_TRIGGER` (a fresh Coinbase bid at or below it)
+  or `DATA_FEED_FAILURE` (Alpaca's feed at a touch); never `PRICE_BEYOND_MAX_ENTRY`.
+- **`CRYPTO_TRIGGER_WAIT`** `reason` adds `COINBASE_FEED_UNHEALTHY` (the coin's Coinbase feed is
+  not healthy) and `ALPACA_ASK_ABOVE_MAX_ENTRY` (Coinbase touched; Alpaca's ask is above
+  `max_entry_price`); `trigger_version` names this version. `FRESH_QUOTE_UNAVAILABLE`,
+  `SPREAD_ABOVE_MAXIMUM` and `TOUCH_NOT_CURRENT` concern Alpaca's confirming quote.
+- **`crypto_trigger`** (in `TRIGGER_CONFIRMED`, `INVALIDATED` and waits): V1's fields for Alpaca's
+  confirming quote, plus `reference`: `provider` (`COINBASE_EXCHANGE`), `product_id`, `healthy`,
+  `code`, `as_of`, `heartbeat_received_at`, `low_print` and `touch_print` (`price`, `at`,
+  `received_at`, `trade_id`, `age_seconds`), `bid`, `ask`, `quote_at`, `quote_received_at`,
+  `quote_age_seconds`, `quote_read_age_seconds`, `quote_max_age_seconds`,
+  `print_max_age_seconds`, `quote_fresh`, `quote_code`. `TRIGGER_CONFIRMED` of this version is
+  the observation (Alpaca's quote and the `reference` record) plus `trigger_version` and
+  `crypto_trigger`; it has no `trade_price`. The entry decision's context adds
+  `reference_product`.
+- **`MARKET_PRINT_CONSUMED`** `reason` `ALPACA_PRINT_NOT_TRIGGER_EVIDENCE`: an Alpaca print of a
+  setup of this version, consumed unevaluated.
+- **`STOP_BREACH_ESTABLISHED`** and `stop_breach_evidence` under V3: `version`
+  `CRYPTO_STOP_BREACH_V3`, `breach_evidence` `COINBASE_PRINT` (with `received_at`), or V2's
+  `TRADE_PRINT` / `BID_HELD` with their fields, `fallback` (true for V2's evidence, read while the
+  Coinbase feed was unhealthy) and `reference` (the feed's health then); the other fields and the
+  key are V2's.
+- **Runtime events:** `RUNTIME_REFERENCE_CONNECTED` (`provider`, `channels`, `products`,
+  `refused`) when the requested products settle; `RUNTIME_REFERENCE_GAP` (`provider`, `reason`,
+  `code`) when a feed session ends on an error.
+- **Status** (`GET /api/v1/lab/status`): `reference_feed` (null without the feed):
+  `provider`, `endpoint`, `channels`, `available`, `connected`, `sessions`, `connected_at`,
+  `disconnected_at`, `wanted`, `requested`, `acknowledged`, `refused`, `healthy`, `unhealthy`
+  (product: code), `unhealthy_since`, `tape_gaps`, `last_message_age_seconds`,
+  `oldest_heartbeat_age_seconds`, `heartbeat_max_age_seconds` (3), `clock_tolerance_seconds` (3),
+  `tape_gap_hold_seconds` (10), `as_of`. The watchdog raises `REFERENCE_FEED_UNHEALTHY` after 300 s
+  of `unhealthy_since` and `REFERENCE_FEED_STATUS_UNAVAILABLE` for an unreadable section.
+
+### Unfilled crypto entries (`CRYPTO_ENTRY_WORKING_LIMIT_V1`, package entry-working-limit, 2026-09-29)
+
+Rules: [REFERENCE-RULES.md](REFERENCE-RULES.md) (2026-09-29). Fixture evidence only
+(`tests/test_entry_working.py`). No route and no request field was added; everything is read
+through the existing routes.
+
+- **State** (`/setups`, `/positions`, `/results`), on every crypto setup admitted from this
+  release:
+  - `entry_working_version`: `CRYPTO_ENTRY_WORKING_LIMIT_V1`; absent on older setups and stocks.
+  - `entry_acknowledged_at`: when the app recorded the broker's acknowledgement of the entry
+    (the start of its 300 s fill window); absent before the entry.
+  - `entry_stop_marks`: the stop check's marks before a fill (`stop`, `stop_since`, `bid_since`,
+    `bid`, `bid_quote_at`); present only once a held-bid mark started.
+  - `entry_working_cancel`: `reason` and `decided_at` of the decision that ended the entry (or its
+    remainder); absent otherwise.
+- **`ENTRY_WORKING_CANCEL`** (setup event on the outputs and timeline routes; at most one per
+  lifecycle, key `entry-working-cancel:<setup_id>:<lifecycle_id>`): `version`, `reason`,
+  `lifecycle_id`, `entry_order_ids`, `acknowledged_at`, `fill_window_seconds` (300),
+  `window_ends_at`, `order_age_seconds`, `filled_qty`, `remaining_qty`, `stop`, `stop_evidence`
+  (null for the window; for a stop: `stop_rule`, `stop`, `stop_since`, `breach_evidence`
+  (`COINBASE_PRINT`, `TRADE_PRINT` or `BID_HELD`) with its fields as in `STOP_BREACH_ESTABLISHED`,
+  and `fallback` and `reference` under `CRYPTO_STOP_BREACH_V3`), `decided_at`.
+- **Reasons.** `ENTRY_NOT_FILLED` (nothing filled 300 s after the acknowledgement) and
+  `STOP_CROSSED_BEFORE_FILL` (the stop's evidence traded first) are the `CLOSED` revision's
+  `reason` of a setup whose entry they ended with nothing filled, and the reason of its
+  `PROTECTION_PLAN` (`state` `CANCELING`) and CANCEL decisions. `ENTRY_REMAINDER_NOT_FILLED` is
+  the reason of the cancel of a partly filled entry's rest (`CRYPTO_PARTIAL_ENTRY_V1`), also in
+  `PARTIAL_ENTRY_REMAINDER_CANCEL` and `partial_entry_cancel`; that trade stays open. A setup
+  closed this way has no fill: like an entry that expired (`ENTRY_EXPIRED`), it is listed by
+  `/setups` but never by `/positions` or `/results`, and it is not a trade on the public
+  dashboard.
+- `PARTIAL_ENTRY_RETAINED` and `PARTIAL_ENTRY_REMAINDER_CANCEL` of a setup of this version add
+  `fill_window_ends_at`.
+
+### Report dry run and research guidelines (package agent-api, 2026-09-29)
+
+An external
+research agent that may not run the kit calls this API directly. Two research-agent routes
+serve such an agent. Fixture evidence only (`tests/test_research_validate.py`,
+`tests/test_muse_connection_examples.py`); not deployed. The report route, intake, selection,
+admission and execution are unchanged, and no schema, migration or setting was added.
+
+#### `POST /api/v1/lab/research-reports/validate` (`RESEARCH_REPORT_VALIDATE_V1`)
+
+The report-V3 intake's verdict for a body, with admission warnings; nothing is recorded.
+
+- **Credentials.** On the research-agent route list: each agent token and the legacy token;
+  the status token (GET only) and the operator token are 403 `TOKEN_ROLE_NOT_PERMITTED`. The
+  body's `agent` block is bound to the credential exactly as on the report route (403
+  `AGENT_IDENTITY_MISMATCH`).
+- **Order.** 503 `RESEARCH_REPORT_VALIDATE_NOT_CONFIGURED` without the service; then the rate
+  limit, per credential: one validation at a time and at most 12 in any rolling 60 seconds (429
+  `RESEARCH_REPORT_VALIDATE_RATE_LIMITED`, `Retry-After` in whole seconds; a refused call is
+  not counted); then the report route's own reading of the body, through the same handler code:
+  at most 1,048,576 bytes (413 `RESEARCH_REPORT_TOO_LARGE`), strict JSON object (422
+  `INVALID_MUSE_REPORT`), the agent binding. A body that is not `AGENT_RESEARCH_REPORT_V3` is 422
+  `REPORT_V3_REQUIRED`.
+- **The verdict** is `ResearchIntake.validate_report`: report-V3 intake's own steps in intake's
+  order, through the same methods (`_v3_intake`, the replay check, the universe snapshot, the
+  selection rule's activation, `_v3_verdict` with the report's age and expiry, each pick's
+  `check_pick` and `compile_pick_dossier` with the byte budgets). Every refusal is intake's,
+  status and body byte for byte (the report V3 section above). A recorded `report_id` with the
+  same content answers the stored receipt's verdict (`already_recorded: true`); changed content
+  is 422 `REPORT_IDEMPOTENCY_CONTENT_MISMATCH`.
+- **200 body:** `status` (`RESEARCH_REPORT_VALIDATED`), `validation_version`, `checked_at`,
+  `cycle_id`, `already_recorded`, `expires_at`, `submitted_count`, `contender_count`,
+  `rejected_count`, `skipped_count`, `item_results` (exactly the 202 receipt's),
+  `admission_warnings`, `recorded: false`, `trade_authorized: false`.
+- **`admission_warnings`**, one entry per pick in order: `index`, `signal_id`, `entry_type`
+  (`PULLBACK`, `IMMEDIATE`, `BREAKOUT` or null), `warnings` and `not_evaluated`. Each warning
+  is `{check, code, path, ...}` in admission's order, so the first names admission's refusal:
+
+  | `check` | `code` | Rule | Fields |
+  | --- | --- | --- | --- |
+  | `LEVELS` | `INVALID_OR_EXPIRED_SETUP` | `0 < stop < entry_trigger <= max_entry_price < target` and `target - max_entry_price >= 2 × (max_entry_price - stop)` (`ManagedExecution.admit`) | `rule`, or `reward_risk_at_max_entry` (4 places) and `minimum_reward_risk` |
+  | `ACTIVE_SYMBOL` | `ACTIVE_SYMBOL_ALREADY_MANAGED` | a crypto setup of the coin (matched as admission matches: no slash, upper case) in a non-terminal state, any agent's, other than a report-V3 setup still `WATCHING` that this pick's run supersedes under the configured schedule's `RESEARCH_RUN_SUPERSESSION_V1` or `_V2` | `setup_state` |
+  | `PRICE_GRID` | `CRYPTO_LEVEL_OFF_PRICE_GRID` | `crypto_execution.off_grid_levels` with the coin's `price_increment` | `price_increment`, `levels` |
+  | `STOP_DISTANCE`, `PRICE_MATCH`, `STOP_NOT_HIT`, `ENTRY_TYPE` | `STOP_DISTANCE_BELOW_MINIMUM`, `PRICE_MISMATCH`, `STOP_ALREADY_HIT`, `BREAKOUT_NOT_ENABLED` | `system_check.evaluate` (`SYSTEM_CHECK_V1`) on the pick's levels, agent price and run slot, as admission calls it | `stop_distance_fraction` and `minimum_stop_fraction`; `live_mid`, `price_deviation_fraction` and `price_mismatch_fraction`; `live_bid` and `live_last`; `live_mid`, `entry_offset_fraction` and `entry_type_band_fraction` |
+
+  `not_evaluated` entries are `{check, reason}`: `ALL` with `PICK_SCHEMA_INVALID`;
+  `PRICE_GRID` and the three live checks with `SYMBOL_NOT_IN_UNIVERSE`; `PRICE_GRID` with
+  `PRICE_INCREMENT_UNAVAILABLE` (an unusable increment; the universe lists none); the live
+  checks with `LIVE_PRICE_UNAVAILABLE` (no usable quote: 0 < bid <= ask and an aware quote time
+  not after the read) or `STOP_DISTANCE_FIRST` (the system check reads no price for a short
+  stop).
+- **Reads.** The ledger twice, outside any transaction and without the shared advisory lock:
+  intake's replay check and one read of the active crypto setups of the report's coins. The
+  research context's own caches for the universe (asset list, at most an hour old) and the
+  latest quotes and trades (one read for every coin, under 5 seconds old, shared with
+  `GET /research-context`); a market-data failure is `LIVE_PRICE_UNAVAILABLE`, never a pass.
+- **Writes.** None: no event, cycle, packet, dossier or idempotency record, no Jev request and
+  so no Jev spend. `ResearchIntake` holds no reviewer.
+
+#### `GET /api/v1/lab/research-guidelines` (`RESEARCH_GUIDELINES_ROUTE_V1`)
+
+The research guidelines text the app enforces. On the research-agent route list; the status
+token may read it (GET only); the operator token is 403. The body is constant for a release:
+
+| Field | Content |
+| --- | --- |
+| `route_version` | `RESEARCH_GUIDELINES_ROUTE_V1` |
+| `guidelines_version` | `MUSE_RESEARCH_GUIDELINES_V6`, the research context's `report_format.guidelines_version` |
+| `guidelines_sha256` | the SHA-256 of `text`'s UTF-8 bytes, the context's `report_format.guidelines_sha256` (`075acc02e74afd522b7ad432ac2e893c4a5eeac10fe9f2c0871f5684d819b94d`) |
+| `text` | the guidelines text, from the package (`muse_guidelines.RESEARCH_GUIDELINES`, the V6 constant the Railway image carries with `src/`) |
+| `trade_authorized` | `false` |
+
+### The crypto stream's capacity (`CRYPTO_STREAM_CAPACITY_V1`, six-day operation, 2026-09-29)
+
+Rules: [REFERENCE-RULES.md](REFERENCE-RULES.md) (2026-09-29). Fixture evidence only
+(`tests/test_managed_runtime.py`). No route and no request field was added.
+
+- **`CRYPTO_STREAM_CAPACITY_WAIT`** (outputs route; at most one per selection, key
+  `stream-capacity:<selection_event_seq>`): `version`, `symbol`, `capacity` (15),
+  `selection_event_seq`. The offered pick is held back because the crypto stream's 15 coins are
+  taken by active setups, Bitcoin and earlier picks; it is admitted as usual once a slot frees up.
+- **Status** (`GET /api/v1/lab/status`): `crypto_stream`: `version`, `capacity` (15), `wanted`
+  (the number of coins the crypto stream's plan subscribes) and `held_back` (the held-back picks'
+  coins, in selection order); `available: false` in place of the last two when the plan cannot
+  be read.
+- **`RUNTIME_MARKET_GAP`** with `reason` `MARKET_STREAM_PROVIDER_ERROR`: `code` is the provider's
+  numeric code, `ALPACA_STREAM_<n>` (`ALPACA_STREAM_405`: symbol limit exceeded), or
+  `ALPACA_STREAM_ERROR` without one; never the provider's message text.

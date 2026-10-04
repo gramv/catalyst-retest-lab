@@ -9,6 +9,11 @@
     python -m catalyst_lab.cloud_runtime market-review [--day YYYY-MM-DD]       # read-only
     python -m catalyst_lab.cloud_runtime weekly-review [--week-end YYYY-MM-DD] [--now]
     python -m catalyst_lab.cloud_runtime clear-protection-latch --reason "..."  # trader shell
+    python -m catalyst_lab.cloud_runtime exclude-from-stats --day YYYY-MM-DD --reason CODE  # trader
+    python -m catalyst_lab.cloud_runtime promote-strategy --strategy ID --history-report - \
+        --owner-ruling "..." [--owner-override-reason "..."] < results.json  # trader shell
+    python -m catalyst_lab.cloud_runtime demote-strategy --strategy ID --reason "..." \
+        --owner-ruling "..."                                                  # trader shell
     python -m catalyst_lab.cloud_runtime backup    # ops shell, through cloud_entry backup
 
 ``catalyst_lab.cloud_entry`` starts these as the non-root runtime user. Both require
@@ -27,21 +32,26 @@ trader  Today's ``app`` component: every managed worker loop plus the API. On st
         refused configuration exits 2; a startup that keeps failing for ten minutes exits 1.
 ops     The watchdog every 30 seconds (the same alarm rules as the Mac watchdog), an audit
         checkpoint every hour and a verified, pruned pg_dump backup every day, all written to
-        the Railway volume, with alerts through the existing notify path. It never holds a
-        broker, Jev or trader credential.
+        the Railway volume, with alerts through the existing notify path. Its own checks
+        (package ops-alarms): the nightly jobs' scorecard (LEARNING_JOBS_MISSED) and the
+        ledger's size (DATABASE_SIZE_HIGH) every five minutes, the ops volume's free space
+        (OPS_VOLUME_LOW) every tick. It never holds a broker, Jev or trader credential.
 jobs    The nightly learning jobs (``learning_jobs``): shadow outcomes, maintenance replays, the
         market reality, the scorecard and, after each week, the weekly review, each step
-        independent and logged with its code; then it exits 0 (a refused configuration exits
-        2). It holds only the trader's ledger connection (catalyst_risk, by reference), never a
-        broker or Jev key, and keeps no state. A Railway cron job must exit when done and a run
-        still going when the next is due makes Railway skip that one, so a watchdog ends the
-        process after ``JOBS_HARD_SECONDS`` whatever it is doing.
+        independent and logged with its code as it ends; then it exits 0 when every step
+        ended OK, else 1 (a failed or skipped step, an unreachable ledger; a refused
+        configuration exits 2). It holds only the trader's ledger connection (catalyst_risk,
+        by reference), never a broker or Jev key, and keeps no state. A Railway cron job must
+        exit when done and a run still going when the next is due makes Railway skip that one,
+        so a watchdog ends the process after ``JOBS_HARD_SECONDS`` whatever it is doing, with
+        exit 1. Its restart policy is NEVER: a failed run waits for the next night.
 """
 
 import argparse
 import http.server
 import json
 import os
+import shutil
 import signal
 import socket
 import sys
@@ -62,7 +72,10 @@ from catalyst_lab.managed_ops import (
     _private_directory,
     atomic_private_json,
     crash_loop_guard,
+    ledger_alarms,
+    ops_volume_alarms,
     private_bytes,
+    scorecard_due_day,
     status_alarms,
 )
 
@@ -82,6 +95,9 @@ BACKUP_EVERY = timedelta(days=1)
 AUDIT_RETRY = timedelta(minutes=5)
 BACKUP_RETRY = timedelta(minutes=30)
 HEARTBEAT_EVERY = timedelta(minutes=10)
+# The ledger check (the nightly scorecard and the database size, package ops-alarms): one
+# read-only connection every five minutes, and at once when the due day changes.
+LEDGER_CHECK_EVERY = timedelta(minutes=5)
 
 
 def log(component, event, **fields):
@@ -330,7 +346,7 @@ class OpsLoop:
     """One watchdog tick at a time; audit checkpoints and backups when they are due."""
 
     def __init__(self, config, release, *, transport=None, audit_repository=None,
-                 backup=None):
+                 backup=None, disk_usage=shutil.disk_usage):
         state = _private_directory(config.runtime.state_dir)
         self.config, self.release, self.transport = config, release, transport
         self.alarm_file = state / "alarms.json"
@@ -339,6 +355,8 @@ class OpsLoop:
         self.backups = state / "backups"
         self.audit_repository = audit_repository
         self.backup = backup
+        self.disk_usage = disk_usage
+        self.ledger = None  # The latest ledger check (``check_ledger``).
         self.last_alarms, self.last_logged = None, None
 
     def _repository(self):
@@ -439,6 +457,49 @@ class OpsLoop:
         except Exception:
             return None  # Best effort: the dead-man ping must still go out.
 
+    def check_ledger(self, now):
+        """The due day's ``DAILY_SCORECARD_V1`` (the jobs' key, ``scorecard_key``) and the
+        ledger's ``pg_database_size``, over the read-only catalyst_app connection (the size
+        needs only CONNECT on the database, which its login holds). A read that fails leaves
+        its fact out, with the failure's code: ``ledger_alarms`` then fails closed."""
+        from catalyst_lab.scorecard import scorecard_key
+
+        day = scorecard_due_day(now)
+        facts = {"checked_at": now.isoformat(), "scorecard_day": day.isoformat()}
+        try:
+            with self._repository().connect() as conn:
+                row = conn.execute(
+                    "SELECT event_seq FROM lab.managed_events WHERE idempotency_key=%s",
+                    (scorecard_key(day),)).fetchone()
+                facts["scorecard_recorded"] = row is not None
+                facts["database_bytes"] = conn.execute(
+                    "SELECT pg_database_size(current_database()) AS size").fetchone()["size"]
+        except Exception as exc:
+            facts["code"] = failure_code(exc)
+        return facts
+
+    def _ledger_check(self, now):
+        """The latest ledger check, repeated once it is ``LEDGER_CHECK_EVERY`` old or the due
+        day has changed (a failed one too: an unreachable ledger costs one connect timeout)."""
+        try:
+            age = now - datetime.fromisoformat(self.ledger["checked_at"])
+            current = (self.ledger["scorecard_day"] == scorecard_due_day(now).isoformat()
+                       and timedelta(0) <= age < LEDGER_CHECK_EVERY)
+        except (KeyError, TypeError, ValueError):
+            current = False
+        if not current:
+            self.ledger = self.check_ledger(now)
+        return self.ledger
+
+    def ops_volume(self):
+        """The ops volume's usage, by ``shutil.disk_usage`` of its mount path (the state
+        directory, which the configuration requires on the volume)."""
+        try:
+            usage = self.disk_usage(self.config.runtime.state_dir)
+            return {"total_bytes": usage.total, "free_bytes": usage.free}
+        except Exception as exc:
+            return {"code": failure_code(exc)}
+
     def tick(self, now=None):
         from catalyst_lab import notify
 
@@ -457,6 +518,8 @@ class OpsLoop:
             alarms.append("AUDIT_CHECKPOINT_FAILED")
         if schedule.get("backup_failed"):
             alarms.append("BACKUP_FAILED")
+        ledger, volume = self._ledger_check(now), self.ops_volume()
+        alarms += ledger_alarms(ledger) + ops_volume_alarms(volume)
         atomic_private_json(self.schedule_file, schedule)
         section = self.config.notify
         if section:
@@ -470,7 +533,7 @@ class OpsLoop:
         result = {"checked_at": now.isoformat(), "alarms": sorted(set(alarms)),
                   "mode": "PAPER_ONLY", "scope": "CLOUD_OPS_WATCHDOG",
                   "release_commit": self.release["release_commit"],
-                  "audit": audit, "backup": backup}
+                  "audit": audit, "backup": backup, "ledger": ledger, "ops_volume": volume}
         atomic_private_json(self.alarm_file, result)
         if (result["alarms"] != self.last_alarms or audit or backup or self.last_logged is None
                 or now - self.last_logged >= HEARTBEAT_EVERY):
@@ -516,6 +579,9 @@ def ops(environ=None, *, clock=time.time, stop=None, transport=None, verify_rele
 JOBS_SOFT_SECONDS = 20 * 60  # A step not started by then is skipped (JOB_TIME_LIMIT).
 JOBS_HARD_SECONDS = 30 * 60  # The process ends here whatever it is doing.
 JOBS_DATABASE_WAIT_SECONDS = 120
+# A step FAILED or SKIPPED (an unreachable ledger fails every step) or the hard stop: Railway
+# shows a failed run, and its restart policy NEVER keeps it from repeating (package ops-alarms).
+EXIT_JOBS_FAILED = 1
 
 
 def jobs_store(database_url):
@@ -538,7 +604,8 @@ def _step_fields(details):
 def jobs(environ=None, *, now=None, verify_release=None, store_factory=None,
          reader_factory=None, monotonic=time.monotonic, hard_exit=os._exit,
          hard_seconds=JOBS_HARD_SECONDS):
-    """The Railway cron ``jobs``: every learning step once, then exit 0 (see the module)."""
+    """The Railway cron ``jobs``: every learning step once, then exit 0 when every step ended
+    OK, else ``EXIT_JOBS_FAILED`` (see the module)."""
     from catalyst_lab.cloud_release import verify_image_release
     from catalyst_lab.learning_jobs import STEPS, StepResult, run_jobs
     from catalyst_lab.public_crypto_bars import PublicCryptoBarReader
@@ -553,7 +620,11 @@ def jobs(environ=None, *, now=None, verify_release=None, store_factory=None,
 
     def expire():
         log("jobs", "TIME_LIMIT_EXIT", seconds=hard_seconds)
-        hard_exit(0)
+        hard_exit(EXIT_JOBS_FAILED)
+
+    def logged(result):  # Each step's line as it ends: the hard stop keeps the finished ones.
+        log("jobs", "STEP", step=result.name, result=result.result, code=result.code,
+            **_step_fields(result.details))
 
     watchdog = threading.Timer(hard_seconds, expire)
     watchdog.daemon = True
@@ -566,21 +637,21 @@ def jobs(environ=None, *, now=None, verify_release=None, store_factory=None,
         except Exception as exc:
             code = failure_code(exc)
             results = [StepResult(name, "FAILED", code) for name in STEPS]
+            for result in results:
+                logged(result)
         else:
             reader = (reader_factory or PublicCryptoBarReader)()
             try:
                 results = run_jobs(store, reader, now=now or datetime.now(UTC),
-                                   deadline=started + JOBS_SOFT_SECONDS, monotonic=monotonic)
+                                   deadline=started + JOBS_SOFT_SECONDS, monotonic=monotonic,
+                                   on_result=logged)
             finally:
                 reader.close()
     finally:
         watchdog.cancel()
-    for result in results:
-        log("jobs", "STEP", step=result.name, result=result.result, code=result.code,
-            **_step_fields(result.details))
-    log("jobs", "DONE", failed=sum(r.result != "OK" for r in results),
-        seconds=int(monotonic() - started))
-    return 0
+    failed = sum(r.result != "OK" for r in results)
+    log("jobs", "DONE", failed=failed, seconds=int(monotonic() - started))
+    return EXIT_JOBS_FAILED if failed else 0
 
 
 # --- the owner's learning commands (ops shell, read-only) ---------------------------------------
@@ -705,6 +776,44 @@ def weekly_review(week_end=None, environ=None, *, out=None, repository=None, now
     return 0
 
 
+def daily_brief(day=None, environ=None, *, out=None, repository=None, now=None,
+                reader_factory=None):
+    """The owner's daily brief (``... cloud_runtime daily-brief [--day YYYY-MM-DD]``,
+    package learning-loop2): the recorded ``DAILY_BRIEF_V1`` of the day (default: yesterday),
+    else a read-only preview from the recorded reality and Alpaca's public bars (no key),
+    marked ``recorded: false``. The plain lines, then JSON."""
+    from catalyst_lab.daily_brief import compute_brief, recorded_brief
+    from catalyst_lab.public_crypto_bars import PublicCryptoBarReader
+
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    repo = repository or _learning_ledger(environ, out)
+    if repo is None:
+        return EXIT_REFUSED
+    now = now or datetime.now(UTC)
+    day = day or _yesterday(now)
+    try:
+        row = recorded_brief(repo, day)
+        if row is not None:
+            body = row["body"]
+        else:
+            reader = (reader_factory or PublicCryptoBarReader)()
+            try:
+                body = compute_brief(repo, reader, day, now=now)
+            finally:
+                reader.close()
+    except Exception as exc:
+        print("CLOUD_LEARNING_UNAVAILABLE: " + failure_code(exc), file=out)
+        return EXIT_STARTUP_FAILED
+    head = "recorded" if row is not None else "preview, not recorded"
+    text = "\n".join([f"({head})", *body["text"]])
+    _print_learning(out, text, {"recorded": row is not None,
+                                "event_seq": row["event_seq"] if row else None,
+                                "research_focus": body["research_focus"],
+                                "missed": body["missed"]})
+    return 0
+
+
 STATUS_KEYS = ("worker_state", "executor_ownership", "entry_ready", "last_reconciliation_at",
                "trade_stream_connected", "market_streams", "management_review_enabled",
                "error_code", "schema_version", "release_commit", "execution_halts",
@@ -819,6 +928,95 @@ def clear_protection_latch(reason, environ=None, *, out=None, repository=None):
     return 0
 
 
+def exclude_from_stats(day, reason, environ=None, *, out=None, repository=None, now=None):
+    """The owner's ``STATS_EXCLUSION_V1`` record (package public-page-v3), in the trader's
+    shell (``railway ssh --service trader -- python -m catalyst_lab.cloud_runtime
+    exclude-from-stats --day 2026-10-02 --reason UNMONITORED_OPERATION_2026-10-02``), over the
+    trader's own ``MANAGED_DATABASE_URL`` (the role that appends managed events; the ops
+    service's ledger login is read-only).
+
+    One audited ``STATS_EXCLUSION`` event per day, idempotent; no trade, fill, fee or event
+    changes. Refused for a day without trades, a day not over and a day with an open trade. No
+    broker call; the DSN, the password and driver text are never printed."""
+    from catalyst_lab.authorization import RiskRepository
+    from catalyst_lab.managed_store import ManagedStore
+    from catalyst_lab.stats_exclusion import record_exclusion
+
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    try:
+        url = cloud_config.database_url(environ, "MANAGED_DATABASE_URL",
+                                        on_railway=bool(environ.get("RAILWAY_ENVIRONMENT_ID")))
+    except CloudConfigError as exc:
+        print("CLOUD_STATS_EXCLUSION_REFUSED: " + exc.message(), file=out)
+        return EXIT_REFUSED
+    try:
+        repo = repository or RiskRepository(url)
+        repo.check_role()
+        result = record_exclusion(ManagedStore(repo), day, reason,
+                                  now=now or datetime.now(UTC))
+    except ValueError as exc:
+        code = str(exc)
+        print("CLOUD_STATS_EXCLUSION_REFUSED: " + (code if REFUSAL_CODE.fullmatch(code)
+                                                   else "INVALID"), file=out)
+        return EXIT_REFUSED
+    except Exception as exc:
+        print("CLOUD_STATS_EXCLUSION_FAILED: " + failure_code(exc), file=out)
+        return EXIT_STARTUP_FAILED
+    print(json.dumps({"action": "exclude-from-stats", "mode": "PAPER_ONLY", **result},
+                     sort_keys=True), file=out)
+    return 0
+
+
+def strategy_ladder(action, strategy_id, *, owner_ruling, reason=None, history_report=None,
+                    owner_override_reason=None, environ=None, out=None, repository=None,
+                    now=None, stdin=None):
+    """The owner's ``STRATEGY_PROMOTION_V1`` / ``STRATEGY_DEMOTION_V1`` (package plugin-c3) in the
+    trader's shell, over the trader's own ``MANAGED_DATABASE_URL`` (the role that appends managed
+    events). ``history_report`` is a path in the container or ``-`` (the results.json on
+    standard input). No broker call; the DSN and driver text are never printed."""
+    from catalyst_lab.authorization import RiskRepository
+    from catalyst_lab.managed_store import ManagedStore
+    from catalyst_lab.strategy_paper import demote, promote
+
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    try:
+        url = cloud_config.database_url(environ, "MANAGED_DATABASE_URL",
+                                        on_railway=bool(environ.get("RAILWAY_ENVIRONMENT_ID")))
+    except CloudConfigError as exc:
+        print("CLOUD_STRATEGY_LADDER_REFUSED: " + exc.message(), file=out)
+        return EXIT_REFUSED
+    try:
+        store = ManagedStore(repository or RiskRepository(url))
+        store.repo.check_role()
+        stamp = now or datetime.now(UTC)
+        if action == "promote-strategy":
+            if history_report == "-":
+                report = (stdin or sys.stdin.buffer).read()
+            elif history_report:
+                report = Path(history_report)
+            else:
+                raise ValueError("PROMOTION_HISTORY_REPORT_REQUIRED")
+            result = promote(store, strategy_id, history_report=report,
+                             owner_ruling_ref=owner_ruling,
+                             owner_override_reason=owner_override_reason,
+                             operator="RAILWAY_OPS_SHELL", now=stamp)
+        else:
+            result = demote(store, strategy_id, reason=reason, owner_ruling_ref=owner_ruling,
+                            operator="RAILWAY_OPS_SHELL", now=stamp)
+    except ValueError as exc:
+        code = str(exc)
+        print("CLOUD_STRATEGY_LADDER_REFUSED: " + (code if REFUSAL_CODE.fullmatch(code)
+                                                   else "INVALID"), file=out)
+        return EXIT_REFUSED
+    except Exception as exc:
+        print("CLOUD_STRATEGY_LADDER_FAILED: " + failure_code(exc), file=out)
+        return EXIT_STARTUP_FAILED
+    print(json.dumps(result, sort_keys=True), file=out)
+    return 0
+
+
 def backup_now(environ=None, *, out=None, now=None, take=None, cwd=None, release_root=None,
                euid=os.geteuid):
     """The owner's fresh backup before a guarded cloud migration (package cloud-migrate):
@@ -868,25 +1066,50 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("component", choices=("trader", "ops", "jobs", "status", "positions",
                                               "scorecard", "market-review", "weekly-review",
-                                              "clear-protection-latch", "backup"))
-    parser.add_argument("--reason", help="clear-protection-latch: why (10 to 500 characters)")
+                                              "daily-brief",
+                                              "clear-protection-latch", "backup",
+                                              "exclude-from-stats", "promote-strategy",
+                                              "demote-strategy"))
+    parser.add_argument("--reason", help="clear-protection-latch: why (10 to 500 characters); "
+                        "exclude-from-stats: the reason code")
     parser.add_argument("--day", type=date.fromisoformat,
-                        help="scorecard, market-review: the New York day (default yesterday)")
+                        help="scorecard, market-review: the New York day (default yesterday); "
+                        "exclude-from-stats: the day to leave out of the statistics")
     parser.add_argument("--week-end", type=date.fromisoformat,
                         help="weekly-review: the Sunday ending the week (default the latest)")
     parser.add_argument("--now", action="store_true",
                         help="weekly-review: compute the latest finished week, not recorded")
     parser.add_argument("--full", action="store_true",
                         help="scorecard: print the whole recorded body")
+    parser.add_argument("--strategy", help="promote-strategy, demote-strategy: the strategy id")
+    parser.add_argument("--history-report",
+                        help="promote-strategy: the history test's results.json, or - (stdin)")
+    parser.add_argument("--owner-ruling", help="promote-strategy, demote-strategy: the owner's "
+                        "ruling reference")
+    parser.add_argument("--owner-override-reason",
+                        help="promote-strategy: only if the owner insists past the ladder")
     args = parser.parse_args(argv)
+    if args.component in {"promote-strategy", "demote-strategy"}:
+        if not args.strategy or not args.owner_ruling or (
+                args.component == "demote-strategy" and args.reason is None):
+            parser.error(f"{args.component} requires --strategy and --owner-ruling"
+                         + (" and --reason" if args.component == "demote-strategy" else ""))
+        return strategy_ladder(args.component, args.strategy, owner_ruling=args.owner_ruling,
+                               reason=args.reason, history_report=args.history_report,
+                               owner_override_reason=args.owner_override_reason)
     if args.component == "clear-protection-latch":
         if args.reason is None:
             parser.error("clear-protection-latch requires --reason")
         return clear_protection_latch(args.reason)
+    if args.component == "exclude-from-stats":
+        if args.reason is None or args.day is None:
+            parser.error("exclude-from-stats requires --day and --reason")
+        return exclude_from_stats(args.day, args.reason)
     if args.reason is not None:
         parser.error("--reason is only for clear-protection-latch")
-    if args.day is not None and args.component not in {"scorecard", "market-review"}:
-        parser.error("--day is only for scorecard and market-review")
+    if args.day is not None and args.component not in {"scorecard", "market-review",
+                                                       "daily-brief"}:
+        parser.error("--day is only for scorecard, market-review and daily-brief")
     if (args.week_end is not None or args.now) and args.component != "weekly-review":
         parser.error("--week-end and --now are only for weekly-review")
     if args.full and args.component != "scorecard":
@@ -901,6 +1124,8 @@ def main(argv=None):
         return scorecard(args.day, full=args.full)
     if args.component == "market-review":
         return market_review(args.day)
+    if args.component == "daily-brief":
+        return daily_brief(args.day)
     if args.component == "weekly-review":
         return weekly_review(args.week_end, preview=args.now)
     if args.component == "jobs":

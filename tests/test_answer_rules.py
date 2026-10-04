@@ -87,11 +87,13 @@ def test_v1_maintenance_is_unchanged_and_v2_is_exact_and_admitted_in_the_maintai
     assert cm.recorded_policy_id({"maintenance_policy": V2_MAINTENANCE}) == (
         "CRYPTO_MAINTENANCE_V2")
     # Admission recorded V2 in the maintained arm from package answer-rules; from package
-    # jev-budget it records V3 (V2 plus the budget's cadence; tests/test_jev_budget_rules.py).
+    # jev-budget it records V3 (V2 plus the budget's cadence; tests/test_jev_budget_rules.py),
+    # from package trade-plan V4 (V3 with guarded stop raises; tests/test_trade_plan_rules.py).
+    # From package jev-b1 V5 (V4 with two yes/no questions; tests/test_jev_b1_rules.py).
     # The control arm and other setups as before.
-    assert cm.ADMITTED_MAINTENANCE == cm.CRYPTO_MAINTENANCE_V3
+    assert cm.ADMITTED_MAINTENANCE == cm.CRYPTO_MAINTENANCE_V5
     assert cm.admission_fields(V3_CRYPTO, JEV_MANAGED_ARM) == {
-        "maintenance_policy": cm.CRYPTO_MAINTENANCE_V3.record(),
+        "maintenance_policy": cm.CRYPTO_MAINTENANCE_V5.record(),
         "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}
     assert cm.admission_fields(V3_CRYPTO, FIXED_EXIT_ARM) == {
         "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}

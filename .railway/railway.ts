@@ -170,14 +170,16 @@ export default defineRailway(() => {
   // Package learning-app: the nightly learning jobs as a Railway cron service (owner decision of
   // 2026-09-28: not inside the trader, the only executor). Same image and entrypoint; one run
   // records the shadow outcomes, the maintenance replays, the day's market reality, its
-  // scorecard and, after each week, the weekly review, then exits 0. Railway runs a cron
-  // service's start command on the schedule, in UTC, and expects it to "execute a task, and
-  // terminate as soon as that task is finished"; a run still going when the next is due makes
-  // Railway skip that one (https://docs.railway.com/reference/cron-jobs), so the process ends
-  // itself after 30 minutes at the latest. 05:30 UTC is after midnight in New York all year
-  // (01:30 EDT, 00:30 EST). NEVER restart: a failed run waits for the next schedule instead of
-  // repeating (the default ON_FAILURE policy would restart it). Its one secret is the trader's
-  // catalyst_risk connection, by reference: no broker or Jev key, no token, no volume.
+  // scorecard and, after each week, the weekly review, then exits: 0 when every step ended OK,
+  // 1 when one failed or was skipped, the ledger was unreachable or the 30-minute stop ended it
+  // (package ops-alarms). Railway runs a cron service's start command on the schedule, in UTC,
+  // and expects it to "execute a task, and terminate as soon as that task is finished"; a run
+  // still going when the next is due makes Railway skip that one
+  // (https://docs.railway.com/reference/cron-jobs), so the process ends itself after 30 minutes
+  // at the latest. 05:30 UTC is after midnight in New York all year (01:30 EDT, 00:30 EST).
+  // NEVER restart: a failed run (exit 1) waits for the next schedule instead of repeating (the
+  // default ON_FAILURE policy would restart it). Its one secret is the trader's catalyst_risk
+  // connection, by reference: no broker or Jev key, no token, no volume.
   const jobs = service("jobs", {
     build: DOCKERFILE,
     start: "python -m catalyst_lab.cloud_entry jobs",

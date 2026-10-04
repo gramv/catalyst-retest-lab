@@ -10,11 +10,28 @@ in equity slices (``EQUITY_SLICE_RISK_CAPPED_V1``, ``JEV_MANAGED_RISK_V3`` crypt
 are rows of ``lab.account_risk_market_terms`` written with their policy row; ``slice_size``
 below is the Python mirror of ``lab.slice_sizing_failure``: it returns the largest quantity on
 the coin's increment that the SQL check accepts and the available cash can pay for.
+
+Migration 026 (package risk-pacing, ``JEV_MANAGED_RISK_V4``) adds daily loss limits to a
+policy's definition: rows of ``lab.account_risk_daily_limits`` written with their policy row.
+``DailyLimits`` is that row; ``daily_hard_loss_pct`` gives the engine's daily halt threshold
+(the policy's hard limit, else the 3% every earlier policy has always used) and
+``soft_limit_reached`` the V4 no-new-entries limit. The SQL account-risk check is unchanged:
+V4's 2% CRYPTO cap is a row value that ``lab.account_risk_failure`` already sums over every
+open CRYPTO reservation (all coins one cluster).
+
+Migration 031 (package plugin-c3, ``JEV_MANAGED_RISK_V5``) adds per-strategy open-risk caps to a
+policy's definition: rows of ``lab.account_risk_strategy_caps`` (by strategy source) written with
+their policy row. ``strategy_cap_failure`` is the Python mirror of ``lab.strategy_risk_failure``:
+every open reservation of the entry's strategy plus the entry above ``cap_pct`` x equity is
+``STRATEGY_RISK_CAP`` (a capacity reason: the setup waits, as for the market cap). A policy
+without a row for the strategy's source (every policy before V5, and research picks under V5)
+has no per-strategy cap, so its answers are unchanged.
 """
 
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC
 from decimal import Decimal, localcontext
 
 VENUE = "ALPACA_PAPER"
@@ -24,13 +41,32 @@ MANAGED_RISK_V2_POLICY_ID = "JEV_MANAGED_RISK_V2"
 # Migration 022: 10% equity slices capped at 0.5% planned risk; 5% crypto; three per sector.
 MANAGED_RISK_V3_POLICY_ID = "JEV_MANAGED_RISK_V3"
 EQUITY_SLICE_SIZING = "EQUITY_SLICE_RISK_CAPPED_V1"
+# Migration 026: V3 with a 2% crypto cap and daily loss limits in the policy (hard 3%, soft 2%).
+MANAGED_RISK_V4_POLICY_ID = "JEV_MANAGED_RISK_V4"
+# Migration 031: V4 plus a per-strategy open-risk cap (a mechanical plug-in at most 0.5% of equity).
+MANAGED_RISK_V5_POLICY_ID = "JEV_MANAGED_RISK_V5"
+STRATEGY_RISK_CAP = "STRATEGY_RISK_CAP"
+# A setup's strategy source (``lab.managed_setup_strategy_source``): a promoted strategy's signal
+# (STRATEGY_PAPER_PATH_V1's selection policy) is MECHANICAL; every other setup a research pick.
+MECHANICAL_SOURCE, RESEARCH_SOURCE = "MECHANICAL", "RESEARCH_REPORT"
+STRATEGY_SIGNAL_SELECTION_POLICY = "STRATEGY_SIGNAL_SELECTION_V1"
+DEFAULT_SETUP_STRATEGY = "PULLBACK_V1"
+# The daily halt of every policy without a daily-limits row (the engine's literal before V4).
+LEGACY_DAILY_HARD_LOSS_PCT = Decimal(".03")
+HARD_LOSS_ACTION, SOFT_LOSS_ACTION = "CANCEL_AND_FLATTEN", "NO_NEW_ENTRIES"
+# The soft limit: a system event once per policy and New York day (the day's latch), then one
+# wait event per setup and UTC minute for every trigger it holds back.
+SOFT_LIMIT_EVENT = "DAILY_SOFT_LOSS_LIMIT"
+SOFT_LIMIT_WAIT_EVENT = "DAILY_SOFT_LOSS_ENTRY_WAIT"
+SOFT_LIMIT_REASON = "DAILY_SOFT_LOSS_LIMIT"
 # Binding constraints of a slice-sized entry (the decision context's ``binding_constraint``).
 NOTIONAL_BINDING, RISK_BINDING, CAPITAL_BINDING = "NOTIONAL", "RISK", "CAPITAL"
 STOP_DISTANCE_BELOW_MINIMUM = "STOP_DISTANCE_BELOW_MINIMUM"
 _SIZING_PRECISION = 80  # Floor divisions are exact at this precision for any sane inputs.
 # Capacity rejections say the account is full right now; the setup itself is still valid.
 CAPACITY_REASONS = frozenset(
-    {"CORRELATION_LIMIT", "MAX_OPEN_PLANNED_RISK", "MARKET_RISK_CAP", "INSUFFICIENT_BUYING_POWER"}
+    {"CORRELATION_LIMIT", "MAX_OPEN_PLANNED_RISK", "MARKET_RISK_CAP", "INSUFFICIENT_BUYING_POWER",
+     STRATEGY_RISK_CAP}
 )
 FIXED_EXIT_ARM = "FIXED_EXIT"
 JEV_MANAGED_ARM = "JEV_MANAGED"
@@ -79,6 +115,44 @@ class MarketTerms:
 
 
 @dataclass(frozen=True)
+class DailyLimits:
+    """One ``lab.account_risk_daily_limits`` row (migration 026): fractions of the New York
+    day's starting equity. ``soft_loss_pct`` is None for a policy without a soft limit."""
+
+    policy_id: str
+    hard_loss_pct: Decimal
+    hard_action: str
+    soft_loss_pct: Decimal | None
+    soft_action: str | None
+    owner_ruling_ref: str
+
+    @classmethod
+    def from_row(cls, row):
+        limits = cls(
+            row["policy_id"],
+            Decimal(row["hard_loss_pct"]),
+            row["hard_action"],
+            None if row["soft_loss_pct"] is None else Decimal(row["soft_loss_pct"]),
+            row["soft_action"],
+            row["owner_ruling_ref"],
+        )
+        if limits.hard_action != HARD_LOSS_ACTION or (
+            limits.soft_loss_pct is not None and limits.soft_action != SOFT_LOSS_ACTION
+        ):  # The only actions the engine implements.
+            raise ValueError("RISK_POLICY_DAILY_ACTION_UNSUPPORTED")
+        return limits
+
+    def evidence(self):
+        return {
+            "hard_loss_pct": self.hard_loss_pct,
+            "hard_action": self.hard_action,
+            "soft_loss_pct": self.soft_loss_pct,
+            "soft_action": self.soft_action,
+            "owner_ruling_ref": self.owner_ruling_ref,
+        }
+
+
+@dataclass(frozen=True)
 class AccountRiskPolicy:
     policy_id: str
     engine: str
@@ -95,9 +169,13 @@ class AccountRiskPolicy:
     owner_ruling_ref: str
     # {market: MarketTerms} (migration 022); empty for every policy written before it.
     market_terms: dict = field(default_factory=dict)
+    # Migration 026; None for every policy written before it (the daily halt stays 3%).
+    daily_limits: DailyLimits | None = None
+    # Migration 031: {strategy source: cap fraction}; empty for every policy written before it.
+    strategy_caps: dict = field(default_factory=dict)
 
     @classmethod
-    def from_row(cls, row, terms=()):
+    def from_row(cls, row, terms=(), daily=None, strategy_caps=()):
         caps = json.loads(row["market_caps_json"], parse_float=Decimal, parse_int=Decimal)
         return cls(
             row["policy_id"],
@@ -114,6 +192,8 @@ class AccountRiskPolicy:
             row["fixed_exit_arm_pct"],
             row["owner_ruling_ref"],
             {t.market: t for t in (MarketTerms.from_row(r) for r in terms)},
+            DailyLimits.from_row(daily) if daily else None,
+            {r["strategy_source"]: Decimal(r["cap_pct"]) for r in strategy_caps},
         )
 
     def market_cap(self, market):
@@ -128,6 +208,16 @@ class AccountRiskPolicy:
         """Open trades allowed per theme in ``market``: the terms' limit, else the row's."""
         terms = self.terms(market)
         return terms.max_per_theme if terms is not None else self.max_per_theme
+
+    def daily_hard_loss_pct(self):
+        """The daily halt's loss fraction: the policy's hard limit, else the legacy 3%."""
+        if self.daily_limits is None:
+            return LEGACY_DAILY_HARD_LOSS_PCT
+        return self.daily_limits.hard_loss_pct
+
+    def daily_soft_loss_pct(self):
+        """The no-new-entries loss fraction, or None for a policy without a soft limit."""
+        return None if self.daily_limits is None else self.daily_limits.soft_loss_pct
 
     def stock_multiple(self, day_position):
         """Intraday buying-power multiple for a US stock entry; crypto is always cash-only."""
@@ -155,7 +245,15 @@ class AccountRiskPolicy:
             evidence["market_terms"] = {
                 market: terms.evidence() for market, terms in sorted(self.market_terms.items())
             }
+        if self.daily_limits is not None:  # Likewise: only policies with daily limits.
+            evidence["daily_limits"] = self.daily_limits.evidence()
+        if self.strategy_caps:  # Likewise: only policies with strategy caps (V5 on).
+            evidence["strategy_caps"] = dict(sorted(self.strategy_caps.items()))
         return evidence
+
+    def strategy_cap(self, source):
+        """The open-risk cap fraction of one strategy of ``source``, or None (no such cap)."""
+        return self.strategy_caps.get(source)
 
 
 def load_policy(conn, policy_id, *, engine=None):
@@ -174,10 +272,42 @@ def load_policy(conn, policy_id, *, engine=None):
         "SELECT * FROM lab.account_risk_market_terms WHERE policy_id=%s ORDER BY market",
         (policy_id,),
     ).fetchall()
-    policy = AccountRiskPolicy.from_row(row, terms)
+    daily = conn.execute(
+        "SELECT * FROM lab.account_risk_daily_limits WHERE policy_id=%s", (policy_id,)
+    ).fetchone()
+    caps = ()
+    if conn.execute("SELECT to_regclass('lab.account_risk_strategy_caps') IS NOT NULL AS present"
+                    ).fetchone()["present"]:
+        # Before migration 031 no policy can have a strategy cap (V5 is written by 031).
+        caps = conn.execute(
+            """SELECT * FROM lab.account_risk_strategy_caps WHERE policy_id=%s
+            ORDER BY strategy_source""", (policy_id,)
+        ).fetchall()
+    policy = AccountRiskPolicy.from_row(row, terms, daily, caps)
     if engine is not None and policy.engine != engine:
         raise ValueError("RISK_POLICY_ENGINE_MISMATCH")
     return policy
+
+
+def daily_loss_threshold(day_start_equity, fraction):
+    """The day's P&L at or below which a limit of ``fraction`` binds (a negative amount)."""
+    return -fraction * day_start_equity
+
+
+def soft_limit_reached(policy, total_pnl, day_start_equity):
+    """Whether the day's realized plus unrealized P&L has reached the policy's soft limit;
+    always False for a policy without one (every policy before V4)."""
+    fraction = policy.daily_soft_loss_pct()
+    return fraction is not None and total_pnl <= daily_loss_threshold(day_start_equity, fraction)
+
+
+def soft_limit_key(policy_id, session_date):
+    return f"daily-soft-loss-limit:{policy_id}:{session_date.isoformat()}"
+
+
+def soft_wait_key(setup_id, now):
+    minute = now.astimezone(UTC).replace(second=0, microsecond=0).isoformat()
+    return f"daily-soft-loss-entry-wait:{setup_id}:{minute}"
 
 
 @dataclass(frozen=True)
@@ -282,11 +412,61 @@ def account_risk_failure(conn, policy_id, market, sector, theme, equity, budget,
     ).fetchone()["reason"]
 
 
+def setup_strategy(record_json):
+    """``(strategy_id, source)`` of a setup's admitted packet, as ``lab.managed_setup_strategy``
+    and ``lab.managed_setup_strategy_source`` read it."""
+    record = record_json if isinstance(record_json, dict) else {}
+    strategy_id = record.get("strategy_id") or DEFAULT_SETUP_STRATEGY
+    source = (MECHANICAL_SOURCE if record.get("selection_policy")
+              == STRATEGY_SIGNAL_SELECTION_POLICY else RESEARCH_SOURCE)
+    return strategy_id, source
+
+
+def strategy_cap_failure(policy, source, held, budget, equity):
+    """The Python mirror of ``lab.strategy_risk_failure`` on its inputs: None, or
+    ``STRATEGY_RISK_CAP`` when the strategy's open planned risk ``held`` plus ``budget`` is above
+    the policy's cap for ``source`` x ``equity`` (exactly the cap passes). None for a source
+    without a cap. Exact Decimal comparison."""
+    cap = policy.strategy_cap(source)
+    if cap is None:
+        return None
+    with localcontext() as context:
+        context.prec = _SIZING_PRECISION
+        return STRATEGY_RISK_CAP if held + budget > cap * equity else None
+
+
+def strategy_open_risk(conn, record_json, *, venue=VENUE):
+    """The open planned risk of the setup's strategy on the venue (the SQL check's ``held``)."""
+    strategy_id, _ = setup_strategy(record_json)
+    return conn.execute(
+        """SELECT coalesce(sum(r.budget),0) AS held FROM lab.managed_active_reservations r
+        JOIN lab.managed_setups s USING(setup_id)
+        JOIN lab.managed_risk_decisions d ON d.decision_id=r.decision_id
+        WHERE coalesce(d.context->>'venue','ALPACA_PAPER')=%s
+        AND coalesce(nullif(s.record_json->>'strategy_id',''),%s)=%s""",
+        (venue, DEFAULT_SETUP_STRATEGY, strategy_id),
+    ).fetchone()["held"]
+
+
+def strategy_risk_failure(conn, policy_id, record_json, equity, budget, *, venue=VENUE):
+    """NULL, or ``STRATEGY_RISK_CAP`` (or an input/policy code) from ``lab.strategy_risk_failure``:
+    the one SQL per-strategy check the reservation trigger also asks."""
+    from psycopg.types.json import Jsonb
+
+    from catalyst_lab.repository import json_safe
+
+    return conn.execute(
+        "SELECT lab.strategy_risk_failure(%s,%s,%s,%s,%s) AS reason",
+        (policy_id, venue, Jsonb(json_safe(record_json)), equity, budget),
+    ).fetchone()["reason"]
+
+
 _BINDING = {
     "CORRELATION_UNKNOWN": "CORRELATION",
     "CORRELATION_LIMIT": "CORRELATION",
     "MAX_OPEN_PLANNED_RISK": "ACCOUNT_RISK_CAP",
     "MARKET_RISK_CAP": "MARKET_RISK_CAP",
+    STRATEGY_RISK_CAP: "STRATEGY_RISK_CAP",
     "INSUFFICIENT_BUYING_POWER": "BUYING_POWER",
     "BUYING_POWER_EVIDENCE_UNAVAILABLE": "BUYING_POWER",
     "CRYPTO_ACCOUNT_NOT_ACTIVE": "BUYING_POWER",

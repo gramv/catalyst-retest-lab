@@ -449,8 +449,8 @@ def test_refused_crypto_stop_limit_fallback_backs_off_alarms_at_five_and_complet
     [stop] = venue.orders_of("sell", "stop_limit")
     run = status_runtime(mx)
     venue.reject_market_sells = EXIT_REFUSAL_ALARM_THRESHOLD
-    engine.manage(sid, observation(mx, **GAP))  # The bid gaps through the stop.
-    venue.now += timedelta(seconds=2)
+    engine.manage(sid, observation(mx, **GAP))  # A print and the bid gap through the stop.
+    venue.now += timedelta(seconds=5)  # CRYPTO_STOP_BREACH_V2's grace.
     engine.manage(sid, observation(mx, **GAP))  # The stop-limit did not fill: cancel it.
     assert stop["status"] == "canceled"
     assert engine._load(sid)[1]["exit_requested"] == "STOP_LIMIT_NOT_FILLED"

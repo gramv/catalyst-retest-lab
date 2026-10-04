@@ -11,15 +11,19 @@ import httpx
 import pytest
 from psycopg.types.json import Jsonb
 
+from catalyst_lab import crypto_maintenance
 from catalyst_lab.alpaca import AlpacaCredentials
 from catalyst_lab.audit import verify_events
 from catalyst_lab.jev_review import JevReviewer, ReliabilityPolicy
+from catalyst_lab.managed_app import public_status
 from catalyst_lab.managed_runtime import (
+    CRYPTO_STREAM_SYMBOL_CAPACITY,
     ManagedRuntime,
     RuntimePolicy,
     build_runtime_from_env,
     engineering_runtime_policy,
 )
+from catalyst_lab.managed_service import STATUS_FIELDS
 from catalyst_lab.repository import json_safe
 from catalyst_lab.research_cycle import CyclePolicy, ResearchCycle
 from tests.test_complete_managed_cycle import external_muse_item
@@ -587,16 +591,539 @@ def test_market_queue_overflow_disconnects_and_blocks_entries():
     )
     original_gap = run.market_gap
 
-    def stop_on_gap(market, reason):
-        original_gap(market, reason)
+    def stop_on_gap(market, reason, **details):
+        original_gap(market, reason, **details)
         run.stop_event.set()
 
     run.market_gap = stop_on_gap
     run._market_stream_loop("CRYPTO")
     assert not run.market_connected["CRYPTO"] and "CRYPTO" in run.market_gaps
+    assert market_gaps(run) == [{"market": "CRYPTO", "reason": "MARKET_QUEUE_OVERLOAD",
+                                 "code": "MARKET_QUEUE_OVERLOAD"}]
     run.execution_once()
     assert run.execution.setups[0]["state"]["state"] == "INVALIDATED"
     assert not run.execution.triggered
+
+
+def market_gaps(run):
+    return [{k: v for k, v in body.items() if k != "runtime_id"}
+            for kind, body in run.execution.events if kind == "RUNTIME_MARKET_GAP"]
+
+
+class TextSocket(Socket):
+    """``Socket`` whose text frames arrive as they are, so a frame can be malformed."""
+
+    def recv(self, timeout):
+        if self.frames and isinstance(self.frames[0], str):
+            return self.frames.pop(0)
+        return super().recv(timeout)
+
+
+@pytest.mark.parametrize("frame,code", [
+    ("[{not json", "JSONDecodeError"),
+    ({"T": "t", "S": "BTC/USD", "p": "100", "i": 1}, "INVALID_MARKET_STREAM_FRAME"),
+    ([{"T": "t", "S": "BTC/USD", "p": "100", "i": 1}], "KeyError"),
+    ([{"T": "q", "S": "BTC/USD", "bp": "bid", "ap": "100.01", "t": NOW.isoformat()}],
+     "InvalidOperation"),
+    ([{"T": "q", "S": "BTC/USD", "bp": "99.99", "ap": "100.01",
+       "t": (NOW + timedelta(minutes=1)).isoformat()}], "INVALID_MARKET_TIMESTAMP"),
+])
+def test_a_malformed_market_message_ends_the_session_and_its_gap_records_the_cause(frame, code):
+    """Fail-closed as before: one malformed message ends the stream session, the market gap
+    blocks entries and the WATCHING setup is invalidated. From 2026-09-29 the gap event also
+    carries the sanitized cause (``failure_code``: the exception's own code, else its class
+    name, never message text); until then it recorded only MARKET_STREAM_DISCONNECTED_OR_GAP."""
+    run = runtime()
+    run.connector = lambda *_, **__: TextSocket(
+        [
+            [{"T": "success", "msg": "connected"}],
+            [{"T": "success", "msg": "authenticated"}],
+            [{"T": "subscription", "trades": ["BTC/USD"], "quotes": ["BTC/USD"]}],
+            frame,
+            [{"T": "t", "S": "BTC/USD", "p": "90", "i": 2, "t": NOW.isoformat()}],
+        ],
+        run,
+    )
+    original_gap = run.market_gap
+
+    def stop_on_gap(market, reason, **details):
+        original_gap(market, reason, **details)
+        run.stop_event.set()
+
+    run.market_gap = stop_on_gap
+    run._market_stream_loop("CRYPTO")
+    assert market_gaps(run) == [{"market": "CRYPTO",
+                                 "reason": "MARKET_STREAM_DISCONNECTED_OR_GAP", "code": code}]
+    assert not run.market_connected["CRYPTO"] and "CRYPTO" in run.market_gaps
+    assert not run.queued  # The session ended at the malformed message: no later print.
+    run.connected = run.research_healthy = True
+    run.execution_once()
+    assert run.execution.setups[0]["state"]["state"] == "INVALIDATED"
+    assert not run.execution.triggered and "test-only-secret" not in repr(run.execution.events)
+
+
+@pytest.mark.parametrize("error,code", [
+    ({"T": "error", "code": 405, "msg": "provider-text-not-kept"}, "ALPACA_STREAM_405"),
+    ({"T": "error", "code": 406, "msg": "provider-text-not-kept"}, "ALPACA_STREAM_406"),
+    ({"T": "error", "msg": "provider-text-not-kept"}, "ALPACA_STREAM_ERROR"),
+    ({"T": "error", "code": "405", "msg": "provider-text-not-kept"}, "ALPACA_STREAM_ERROR"),
+])
+def test_a_provider_error_records_the_providers_numeric_code_and_never_its_text(error, code):
+    """2026-09-29: the crypto stream failed every 30 s with MARKET_STREAM_PROVIDER_ERROR after
+    new picks widened its subscription, and the gap recorded nothing that could tell a symbol
+    limit from a connection limit. The session still ends fail-closed with the same reason; the
+    gap's code is now the provider's number, and the provider's message text is never kept."""
+    run = runtime()
+    run.connector = lambda *_, **__: Socket(
+        [
+            [{"T": "success", "msg": "connected"}],
+            [{"T": "success", "msg": "authenticated"}],
+            [{"T": "subscription", "trades": ["BTC/USD"], "quotes": ["BTC/USD"]}],
+            [error],
+        ],
+        run,
+    )
+    original_gap = run.market_gap
+
+    def stop_on_gap(market, reason, **details):
+        original_gap(market, reason, **details)
+        run.stop_event.set()
+
+    run.market_gap = stop_on_gap
+    run._market_stream_loop("CRYPTO")
+    assert market_gaps(run) == [{"market": "CRYPTO", "reason": "MARKET_STREAM_PROVIDER_ERROR",
+                                 "code": code}]
+    assert "provider-text-not-kept" not in repr(run.execution.events)
+    assert not run.market_connected["CRYPTO"] and "CRYPTO" in run.market_gaps
+
+
+def test_a_session_that_ends_without_an_error_records_no_cause():
+    run = runtime()
+    run.connector = lambda *_, **__: Socket(
+        [
+            [{"T": "success", "msg": "connected"}],
+            [{"T": "success", "msg": "authenticated"}],
+            [{"T": "subscription", "trades": ["BTC/USD"], "quotes": ["BTC/USD"]}],
+        ],
+        run,
+    )
+    run._market_stream_loop("CRYPTO")  # The socket stops the runtime once its frames run out.
+    assert market_gaps(run) == [{"market": "CRYPTO",
+                                 "reason": "MARKET_STREAM_DISCONNECTED_OR_GAP"}]
+
+
+# CRYPTO_STREAM_CAPACITY_V1 (2026-09-29): Alpaca serves 15 coins (30 trade and quote channels) on
+# one crypto stream connection. New picks widened the subscription from 13 to 19 coins, the
+# provider refused it (405) and every refusal ended the session for all 13 coins.
+COINS = tuple(f"C{n:02d}/USD" for n in range(1, 16))
+CAPACITY_NOTICE = "CRYPTO_STREAM_CAPACITY_WAIT"
+
+
+def crypto_setup(symbol, *, maintained=False):
+    """An OPEN crypto setup of the fake execution; ``maintained`` records the admitted
+    maintenance policy, so the crypto stream also wants Bitcoin."""
+    state = {"state": "OPEN"}
+    if maintained:
+        state["maintenance_policy"] = crypto_maintenance.ADMITTED_MAINTENANCE.record()
+    return {"setup_id": f"setup-{symbol}", "symbol": symbol, "market": "CRYPTO", "state": state,
+            "record_json": {"levels": {"stop": "95"}}}
+
+
+def offered(symbol, seq, market="CRYPTO"):
+    return {"market": market, "symbol": symbol, "selection_event_seq": seq}
+
+
+def full_stream(run):
+    """14 active crypto setups, the first maintained: with Bitcoin, 15 coins."""
+    run.execution.setups = [crypto_setup(c, maintained=c == COINS[0]) for c in COINS[:14]]
+
+
+def test_a_full_crypto_stream_holds_back_every_offered_pick():
+    """With 14 active setups and Bitcoin wanted the plan is exactly those 15 coins: every offered
+    pick is held back, in selection order and once per coin. The caller's read is used."""
+    run = runtime()
+    full_stream(run)
+    packets = [offered("NEW/USD", 41), offered("OTHER/USD", 42), offered("NEW/USD", 43)]
+    run._selected_packets = lambda: packets
+    wanted, held_back = run._stream_plan("CRYPTO")
+    assert wanted == {*COINS[:14], "BTC/USD"} and len(wanted) == CRYPTO_STREAM_SYMBOL_CAPACITY
+    assert held_back == ["NEW/USD", "OTHER/USD"]
+    assert run._desired_symbols("CRYPTO") == wanted
+    run._selected_packets = lambda: pytest.fail("the plan reads the ledger again")
+    assert run._stream_plan("CRYPTO", packets[1:2]) == (wanted, ["OTHER/USD"])
+
+
+def test_without_bitcoin_one_slot_is_kept_for_it():
+    """While no maintained setup is active the plan stops at 14 coins. Admitting a maintained
+    pick adds Bitcoin into the kept slot without displacing a coin; a Bitcoin pick takes it."""
+    run = runtime()
+    run.execution.setups = [crypto_setup(c) for c in COINS[:10]]
+    picks = [offered(f"P{n}/USD", 40 + n) for n in range(1, 7)]
+    run._selected_packets = lambda: picks
+    wanted, held_back = run._stream_plan("CRYPTO")
+    assert wanted == {*COINS[:10], "P1/USD", "P2/USD", "P3/USD", "P4/USD"}
+    assert held_back == ["P5/USD", "P6/USD"]
+    run.execution.setups.append(crypto_setup("P2/USD", maintained=True))  # Admitted.
+    run._selected_packets = lambda: [p for p in picks if p["symbol"] != "P2/USD"]
+    assert run._stream_plan("CRYPTO") == (wanted | {"BTC/USD"}, ["P5/USD", "P6/USD"])
+    run.execution.setups = [crypto_setup(c) for c in COINS[:10]]
+    run._selected_packets = lambda: [*picks, offered("BTC/USD", 47)]
+    assert run._stream_plan("CRYPTO") == (wanted | {"BTC/USD"}, ["P5/USD", "P6/USD"])
+
+
+def test_an_offered_pick_for_an_active_coin_takes_no_second_slot():
+    run = runtime()
+    run.execution.setups = [crypto_setup(c) for c in COINS[:12]]
+    run._selected_packets = lambda: [
+        offered(COINS[3], 41), offered("NEW/USD", 42), offered(COINS[7], 43),
+        offered("OTHER/USD", 44), offered("LAST/USD", 45),
+    ]
+    wanted, held_back = run._stream_plan("CRYPTO")
+    assert wanted == {*COINS[:12], "NEW/USD", "OTHER/USD"}  # 14, one slot kept for Bitcoin.
+    assert held_back == ["LAST/USD"]
+
+
+def test_a_held_back_pick_waits_with_one_notice_and_is_admitted_once_a_slot_frees_up():
+    """Admission skips a held-back pick, even with its coin acknowledged, and records one
+    CRYPTO_STREAM_CAPACITY_WAIT per selection (one ledger write however long it waits). Once a
+    trade closes, the next tick admits it as usual."""
+    run = runtime()
+    full_stream(run)
+    ready(run)
+    packet = offered("NEW/USD", 41)
+    run._selected_packets = lambda: [packet]
+    run.market_subscriptions["CRYPTO"] = {*COINS[:14], "BTC/USD", "NEW/USD"}
+    writes, write = [], run.execution._event
+
+    def counted(kind, body, setup_id=None, key=None):
+        writes.append(kind)
+        return write(kind, body, setup_id=setup_id, key=key)
+
+    run.execution._event = counted
+    for _ in range(3):
+        run.execution_once()
+    notice = {"version": "CRYPTO_STREAM_CAPACITY_V1", "symbol": "NEW/USD", "capacity": 15,
+              "selection_event_seq": 41}
+    assert run.execution.admitted == [] and run.ready()
+    assert [body for kind, body in run.execution.events if kind == CAPACITY_NOTICE] == [notice]
+    assert run.execution.keyed["stream-capacity:41"] == (CAPACITY_NOTICE, notice)
+    assert writes.count(CAPACITY_NOTICE) == 1
+    assert run.status()["crypto_stream"]["held_back"] == ["NEW/USD"]
+    run.execution.setups = [s for s in run.execution.setups if s["symbol"] != COINS[5]]  # Closed.
+    run.execution_once()
+    assert run.execution.admitted == [packet] and writes.count(CAPACITY_NOTICE) == 1
+    assert run.status()["crypto_stream"]["held_back"] == [] and run.error is None
+
+
+def test_the_us_stream_plan_and_admission_are_unchanged():
+    """Stocks keep every active setup's and offered pick's symbol, however many, and no stock
+    pick waits, while the crypto stream is full."""
+    run = runtime()
+    full_stream(run)
+    tickers = [f"TK{n:02d}" for n in range(1, 21)]
+    run.execution.setups += [
+        {"setup_id": f"setup-{t}", "symbol": t, "market": "US_STOCKS",
+         "state": {"state": "OPEN"}, "record_json": {"levels": {"stop": "95"}}}
+        for t in tickers[:10]
+    ]
+    packets = [offered(t, 40 + n, market="US_STOCKS") for n, t in enumerate(tickers[8:])]
+    run._selected_packets = lambda: packets
+    assert run._stream_plan("US") == (set(tickers), [])
+    assert run._desired_symbols("US") == set(tickers)
+    ready(run)
+    run.market_connected["US"], run.market_subscriptions["US"] = True, set(tickers)
+    run.execution_once()
+    assert run.execution.admitted == packets
+    assert not any(kind == CAPACITY_NOTICE for kind, _ in run.execution.events)
+
+
+class CappedStream(Socket):
+    """Alpaca's crypto stream and its limit, 15 coins (30 trade and quote channels): a subscribe
+    beyond it is answered with error 405 and changes nothing; every other request is
+    acknowledged with the whole subscription. Each idle read runs the next of ``steps`` (the
+    plan changes); once they are done the session ends."""
+
+    LIMIT = 15
+
+    def __init__(self, run, steps):
+        super().__init__([[{"T": "success", "msg": "connected"}]], run)
+        self.steps, self.coins, self.largest = list(steps), set(), 0
+
+    def send(self, message):
+        super().send(message)
+        request = self.sent[-1]
+        if request["action"] == "auth":
+            self.frames.append([{"T": "success", "msg": "authenticated"}])
+            return
+        coins = set(request["trades"])
+        after = self.coins | coins if request["action"] == "subscribe" else self.coins - coins
+        if len(after) > self.LIMIT:
+            self.frames.append([{"T": "error", "code": 405, "msg": "symbol limit exceeded"}])
+            return
+        self.coins, self.largest = after, max(self.largest, len(after))
+        self.frames.append([{"T": "subscription", "trades": sorted(after),
+                             "quotes": sorted(after)}])
+
+    def recv(self, timeout):
+        if not self.frames and self.steps:
+            self.steps.pop(0)()
+            raise TimeoutError
+        return super().recv(timeout)
+
+
+def test_the_market_stream_buffers_1024_frames():
+    """2026-09-30: with 64 frames a reader that fell behind stopped reading the socket, the
+    keepalive's pong went unread and the crypto stream closed every 45-100 s; it now buffers
+    as many frames as the Coinbase feed."""
+    from catalyst_lab.managed_runtime import MARKET_STREAM_MAX_QUEUE
+    run = runtime()
+    seen = {}
+
+    def connect(endpoint, **kwargs):
+        seen.update(kwargs)
+        return Socket([], run)
+
+    run.connector = connect
+    with pytest.raises(TimeoutError):
+        run.market_stream_session("CRYPTO")  # The fake socket has nothing to say.
+    assert seen["max_queue"] == MARKET_STREAM_MAX_QUEUE == 1024
+    assert seen["ping_interval"] == 20 and seen["ping_timeout"] == 20
+
+
+class _Close:
+    def __init__(self, code):
+        self.code = code
+
+
+class _Closed(Exception):
+    """websockets' ConnectionClosed shape: the received and sent close frames."""
+
+    def __init__(self, rcvd, sent):
+        super().__init__("sent 1011 (internal error) keepalive ping timeout")
+        self.rcvd, self.sent = rcvd, sent
+
+
+@pytest.mark.parametrize("rcvd,sent,code", [
+    (None, _Close(1011), "WS_CLOSED_NONE_1011"),
+    (_Close(1008), _Close(1008), "WS_CLOSED_1008_1008"),
+    (_Close(1006), None, "WS_CLOSED_1006_NONE"),
+])
+def test_a_closed_market_stream_records_its_close_codes(rcvd, sent, code):
+    """A closed connection's gap names who closed it and why (the close frames' codes), never
+    the exception's text; it recorded only ConnectionClosedError before."""
+    run = runtime()
+
+    class Closing(Socket):
+        def recv(self, timeout):
+            if not self.frames:
+                raise _Closed(rcvd, sent)
+            return super().recv(timeout)
+
+    run.connector = lambda *_, **__: Closing(
+        [
+            [{"T": "success", "msg": "connected"}],
+            [{"T": "success", "msg": "authenticated"}],
+            [{"T": "subscription", "trades": ["BTC/USD"], "quotes": ["BTC/USD"]}],
+        ],
+        run,
+    )
+    original_gap = run.market_gap
+
+    def stop_on_gap(market, reason, **details):
+        original_gap(market, reason, **details)
+        run.stop_event.set()
+
+    run.market_gap = stop_on_gap
+    run._market_stream_loop("CRYPTO")
+    assert market_gaps(run) == [{"market": "CRYPTO",
+                                 "reason": "MARKET_STREAM_DISCONNECTED_OR_GAP", "code": code}]
+    assert "keepalive" not in repr(run.execution.events)
+
+
+def test_a_busy_market_stream_reads_its_plan_once_a_poll_interval_not_every_frame():
+    """2026-09-30: the session read its plan (two ledger reads) after every frame, which capped
+    how fast it read; around US market events the provider cut the lagging connection every
+    2-5 minutes. 200 back-to-back quote frames now cost one plan read (the poll interval is
+    1 s), and an idle read still re-reads it at once."""
+    run = runtime()
+    calls = []
+
+    def plan(market):
+        calls.append(market)
+        return {"BTC/USD"}
+
+    run._desired_symbols = plan
+    quotes = [[{"T": "q", "S": "BTC/USD", "bp": "99.99", "ap": "100.01", "t": NOW.isoformat()}]
+              for _ in range(200)]
+    socket = Socket(
+        [
+            [{"T": "success", "msg": "connected"}],
+            [{"T": "success", "msg": "authenticated"}],
+            [{"T": "subscription", "trades": ["BTC/USD"], "quotes": ["BTC/USD"]}],
+            *quotes,
+        ],
+        run,
+    )
+    run.connector = lambda *_, **__: socket
+    run.market_stream_session("CRYPTO")  # Ends when the frames run out (an idle read).
+    assert run.policy.market_poll_seconds == 1
+    assert len(calls) <= 2  # The first read, and at most one more if a second passed.
+    assert run.market_subscriptions["CRYPTO"] == {"BTC/USD"}
+
+
+class LaggingStream(Socket):
+    """A stream whose acknowledgments arrive late: each request's answer (the whole
+    subscription after it) is held until the session reads with no plan change left to run.
+    ``steps`` change the plan, one per idle read, as a research update does within seconds."""
+
+    def __init__(self, run, steps):
+        super().__init__([[{"T": "success", "msg": "connected"}]], run)
+        self.steps, self.coins, self.answers = list(steps), set(), []
+
+    def send(self, message):
+        super().send(message)
+        request = self.sent[-1]
+        if request["action"] == "auth":
+            self.frames.append([{"T": "success", "msg": "authenticated"}])
+            return
+        coins = set(request["trades"])
+        self.coins = self.coins | coins if request["action"] == "subscribe" else self.coins - coins
+        self.answers.append([{"T": "subscription", "trades": sorted(self.coins),
+                              "quotes": sorted(self.coins)}])
+
+    def recv(self, timeout):
+        if not self.frames and self.steps:
+            self.steps.pop(0)()
+            raise TimeoutError
+        if not self.frames and self.answers:
+            self.frames.append(self.answers.pop(0))
+        return super().recv(timeout)
+
+
+def test_a_plan_change_waits_for_the_previous_subscription_to_be_acknowledged():
+    """2026-09-30 01:11 UTC: a research update retired, re-offered and admitted coins within
+    seconds; a second change was sent before the first was acknowledged, the first's late
+    answer listed a coin no longer requested, and MARKET_STREAM_SUBSCRIPTION_MISMATCH ended
+    the session twice. Now the second change waits for the first acknowledgment, the session
+    stays up, and both subscriptions are recorded in order (fails on the old code)."""
+    run = runtime()
+    plan = [{"AAA/USD", "BBB/USD", "NEW/USD"}]
+    run._desired_symbols = lambda market: set(plan[0])
+
+    def update_swaps_a_coin():
+        plan[0] = {"AAA/USD", "BBB/USD", "NEXT/USD"}
+
+    socket = LaggingStream(run, [update_swaps_a_coin])
+    run.connector = lambda *_, **__: socket
+    run.market_stream_session("CRYPTO")  # A mismatch would end it with an exception.
+    first, second = ["AAA/USD", "BBB/USD", "NEW/USD"], ["AAA/USD", "BBB/USD", "NEXT/USD"]
+    assert socket.sent[1:] == [
+        {"action": "subscribe", "trades": first, "quotes": first},
+        {"action": "unsubscribe", "trades": ["NEW/USD"], "quotes": ["NEW/USD"]},
+        {"action": "subscribe", "trades": ["NEXT/USD"], "quotes": ["NEXT/USD"]},
+    ]
+    assert run.market_subscriptions["CRYPTO"] == set(second)
+    assert [body["symbols"] for kind, body in run.execution.events
+            if kind == "RUNTIME_MARKET_CONNECTED"] == [first, second]
+
+
+def test_the_crypto_stream_session_never_asks_for_more_than_15_coins():
+    """Against a stream that refuses a 16th coin as Alpaca does, the first subscribe asks for
+    the plan's 15 coins; when a trade closes, its coin is unsubscribed before the held-back pick
+    is subscribed, so no request exceeds 15 and the session stays up. Before this version the
+    first request asked for 17 coins, and a swap subscribed first."""
+    run = runtime()
+    run.execution.setups = [crypto_setup(c, maintained=c == COINS[0]) for c in COINS[:13]]
+    picks = [offered("NEW/USD", 41), offered("NEXT/USD", 42), offered("LAST/USD", 43)]
+    run._selected_packets = lambda: list(picks)
+
+    def trade_closes():
+        run.execution.setups = [s for s in run.execution.setups if s["symbol"] != COINS[1]]
+
+    def pick_admitted():
+        run.execution.setups.append(crypto_setup("NEW/USD", maintained=True))
+        picks.pop(0)
+
+    socket = CappedStream(run, [trade_closes, pick_admitted])
+    run.connector = lambda *_, **__: socket
+    run.market_stream_session("CRYPTO")  # A provider error would end it with an exception.
+    first = {*COINS[:13], "BTC/USD", "NEW/USD"}
+    second = first - {COINS[1]} | {"NEXT/USD"}
+    assert socket.sent[1:] == [
+        {"action": "subscribe", "trades": sorted(first), "quotes": sorted(first)},
+        {"action": "unsubscribe", "trades": [COINS[1]], "quotes": [COINS[1]]},
+        {"action": "subscribe", "trades": ["NEXT/USD"], "quotes": ["NEXT/USD"]},
+    ]
+    assert socket.largest == 15 and run.market_subscriptions["CRYPTO"] == second
+    assert [body["symbols"] for kind, body in run.execution.events
+            if kind == "RUNTIME_MARKET_CONNECTED"] == [sorted(first), sorted(second)]
+    assert run._stream_plan("CRYPTO") == (second, ["LAST/USD"])
+
+
+def test_the_status_reports_the_crypto_stream_plan():
+    run = runtime()
+    full_stream(run)
+    run._selected_packets = lambda: [offered("NEW/USD", 41), offered("OTHER/USD", 42)]
+    status = run.status()
+    section = {"version": "CRYPTO_STREAM_CAPACITY_V1", "capacity": 15, "wanted": 15,
+               "held_back": ["NEW/USD", "OTHER/USD"]}
+    assert status["crypto_stream"] == section
+    assert public_status(status)["crypto_stream"] == section and "crypto_stream" in STATUS_FIELDS
+    freed = {**status, "crypto_stream": {**section, "held_back": ["OTHER/USD"]}}
+    assert ManagedRuntime._heartbeat_signature(freed) != ManagedRuntime._heartbeat_signature(
+        status)  # A changed plan is a change for the heartbeat record.
+
+    def unreadable():
+        raise RuntimeError("ledger unavailable")
+
+    run._selected_packets = unreadable
+    assert run.status()["crypto_stream"] == {"version": "CRYPTO_STREAM_CAPACITY_V1",
+                                             "capacity": 15, "available": False}
+
+
+class _Waits:
+    """``stop_event`` for a reconnect loop: records each wait and stops after ``limit``."""
+
+    def __init__(self, limit):
+        self.limit, self.seen = limit, []
+
+    def is_set(self):
+        return len(self.seen) >= self.limit
+
+    def wait(self, seconds):
+        self.seen.append(seconds)
+        return self.is_set()
+
+
+@pytest.mark.parametrize("loop", ["trade", "market"])
+def test_the_reconnect_wait_starts_again_after_a_session_that_stayed_up(monkeypatch, loop):
+    """Drops in a row double the wait; a drop after a session that stayed up at least
+    max_reconnect_seconds waits the first reconnect_seconds again. Until 2026-09-29 the wait
+    never reset, so a long-running process waited the 30-second cap after every drop."""
+    import catalyst_lab.managed_runtime as runtime_module
+
+    run = runtime()
+    first, cap = run.policy.reconnect_seconds, run.policy.max_reconnect_seconds
+    clock = [0.0]
+    durations = iter([0.1, 0.1, 0.1, cap + 1, 0.1])
+    monkeypatch.setattr(runtime_module, "_monotonic", lambda: clock[0])
+
+    def dropped(*_args):
+        clock[0] += next(durations)
+        raise ConnectionError("STREAM_DROPPED")
+
+    run.stop_event = _Waits(5)
+    if loop == "trade":
+        run.stream_session = dropped
+        run._stream_loop()
+    else:
+        run._desired_symbols = lambda market: {"BTC/USD"}
+        run.market_stream_session = dropped
+        run._market_stream_loop("CRYPTO")
+    assert run.stop_event.seen == [first, min(2 * first, cap), min(4 * first, cap), first,
+                                   min(2 * first, cap)]
+    assert runtime_module.reconnect_wait(cap, cap, run.policy) == first
+    assert runtime_module.reconnect_wait(cap, cap - 1, run.policy) == cap
 
 
 def test_old_queued_print_is_invalidated_instead_of_replayed_into_order():

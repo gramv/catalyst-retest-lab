@@ -40,7 +40,10 @@ V4_QUESTIONS = {"trade_reason", "action", "stop_option", "target_option"}
 
 class MaintenanceVenue(ManagedVenue):
     """The fake paper venue plus two refusals: a price replace (PATCH) of a crypto order, and a
-    sell stop-limit while a buy of the same coin is open (as a wash-trade guard might)."""
+    sell stop-limit while a buy of the same coin is open, as Alpaca paper's wash-trade guard did
+    live (CRV and PEPE, 2026-09-30). A buy whose cancel is pending counts as open here: Alpaca
+    keeps the order open until the cancel completes. That refusal is the fixture's assumption,
+    not observed live."""
 
     def __init__(self):
         super().__init__()
@@ -63,7 +66,8 @@ class MaintenanceVenue(ManagedVenue):
             payload = json.loads(request.content)
             if payload.get("type") == "stop_limit" and any(
                 o["symbol"] == payload["symbol"] and o["side"] == "buy"
-                and o["status"] in {"new", "partially_filled"} for o in self.orders.values()
+                and o["status"] in {"new", "partially_filled", "pending_cancel"}
+                for o in self.orders.values()
             ):
                 self.calls.append((request.method, request.url.path, request.content))
                 return httpx.Response(422, json={"message": "fixture potential wash trade"})
@@ -410,3 +414,28 @@ def to_boundary(mt, seconds=1):
     venue.now = cm.floor_time(venue.now, 900) + timedelta(seconds=900 + seconds)
     mt[0].reconciled_at = None
     assert mt[0].reconcile()["clean"]
+
+
+@pytest.fixture
+def pre_trade_plan_admission(monkeypatch):
+    """Admission as before package trade-plan: the maintained arm records
+    ``CRYPTO_MAINTENANCE_V3`` (no stop-raise guards) and a crypto setup records no
+    ``stop_limit_policy`` (the one-tick stop-limit), exactly as every setup admitted before
+    ``CRYPTO_MAINTENANCE_V4`` and ``CRYPTO_STOP_BREACH_V4``. The tests of those versions' own
+    behaviour use it; the new versions' are tests/test_trade_plan_*.py."""
+    from catalyst_lab import stop_breach
+
+    # A v1/v2_admission pin stays; V4 (package trade-plan) and V5 (package jev-b1) are later.
+    if cm.ADMITTED_MAINTENANCE in (cm.CRYPTO_MAINTENANCE_V4, cm.CRYPTO_MAINTENANCE_V5):
+        monkeypatch.setattr(cm, "ADMITTED_MAINTENANCE", cm.CRYPTO_MAINTENANCE_V3)
+    monkeypatch.setattr(stop_breach, "ADMITTED_STOP_LIMIT", None)
+
+
+@pytest.fixture
+def pre_jev_b1_admission(monkeypatch):
+    """Admission as before package jev-b1: the maintained arm records ``CRYPTO_MAINTENANCE_V4``
+    (V3's action questions with the stop-raise guards), exactly as every setup admitted before
+    ``CRYPTO_MAINTENANCE_V5``. The tests of V4's own behaviour use it; V5's are
+    tests/test_jev_b1_*.py."""
+    if cm.ADMITTED_MAINTENANCE is cm.CRYPTO_MAINTENANCE_V5:
+        monkeypatch.setattr(cm, "ADMITTED_MAINTENANCE", cm.CRYPTO_MAINTENANCE_V4)

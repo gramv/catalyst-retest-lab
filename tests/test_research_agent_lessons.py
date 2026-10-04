@@ -20,7 +20,14 @@ D = Decimal
 def bucket(**changes):
     return {"picks": 10, "admitted": 4, "filled": 2, "fill_rate": "0.5", "shadow_recorded": 8,
             "shadow_triggered": 6, "shadow_trigger_rate": "0.75", "shadow_r_count": 6,
-            "mean_shadow_r_net": "0.40", "shadow_hit_rate": "0.5", **changes}
+            "mean_shadow_r_net": "0.40", "shadow_hit_rate": "0.5", "shadow_resolved": 8,
+            "shadow_r_net_per_resolved_pick": "0.30", **changes}
+
+
+def per_pick(net, n, trigger_rate="0.5"):
+    """A bucket whose net R per resolved pick is ``net`` over ``n`` resolved picks."""
+    return bucket(shadow_r_net_per_resolved_pick=net, shadow_resolved=n,
+                  shadow_recorded=n, shadow_trigger_rate=trigger_rate)
 
 
 def lines(**changes):
@@ -31,14 +38,11 @@ def lines(**changes):
         "results": {"trades_closed": 9, "wins": 4, "losses": 5, "mean_r_net": "-0.12",
                     "r_net_count": 9},
         "fill_rate_by_distance": {
-            "0-1%": bucket(shadow_recorded=8, shadow_trigger_rate="0.75"),
-            "1-2%": bucket(shadow_recorded=6, shadow_trigger_rate="0.5"),
-            "3%+": bucket(shadow_recorded=9, shadow_trigger_rate="0")},
-        "results_by_timeframe": {"4h": bucket(shadow_r_count=6, shadow_hit_rate="0.67"),
-                                 "1d": bucket(shadow_r_count=5, shadow_hit_rate="0")},
-        "results_by_rule": {"A": bucket(shadow_r_count=6, shadow_hit_rate="0.5"),
-                            "B": bucket(shadow_r_count=6, shadow_hit_rate="0.4")},
-        "results_by_kind": {"CHART": bucket(shadow_r_count=3)},
+            "0-1%": per_pick("0.30", 8, "0.75"), "1-2%": per_pick("0.10", 6, "0.5"),
+            "3%+": per_pick("-0.05", 9, "0")},
+        "results_by_timeframe": {"4h": per_pick("0.25", 6), "1d": per_pick("-0.10", 5)},
+        "results_by_rule": {"A": per_pick("0.12", 6), "B": per_pick("0.08", 6)},
+        "results_by_kind": {"CHART": per_pick("0.50", 3)},
         "excerpt_drop_rate": {"picks_sent": 120, "dropped": 2, "rate": "0.02"},
         "stale_news_vetoes": {"news_picks_ranked": 10, "vetoed": 3, "rate": "0.3"},
         "dossier_size_rejections": {"picks_sent": 120, "rejected": 0, "rate": "0"},
@@ -82,28 +86,57 @@ def test_distance_buckets_match_the_scorecards(entry, expected):
 
 def test_hints_come_only_from_enough_evidence_with_a_real_spread():
     hints = {hint["dimension"]: hint for hint in lessons.derive_hints(full_lessons())}
-    assert set(hints) == {"distance_bucket", "timeframe"}  # Rule: spread 0.1; kind: 3 picks.
+    assert set(hints) == {"distance_bucket", "timeframe"}  # Rule: spread 0.04R; kind: 3 picks.
     distance = hints["distance_bucket"]
     assert distance["prefer"] == ["0-1%", "1-2%"] and distance["window"] == "7d"
-    assert distance["text"].startswith(
-        "entries 0-1% from price reached the entry 6 of 8 times, entries 3%+ from price 0 of 9")
+    assert distance["metric"] == lessons.METRIC == "shadow_r_net_per_resolved_pick"
+    # The long form would pass 200 characters: the short form keeps the figures and the order.
+    assert distance["text"] == (
+        "entries 0-1% from price +0.30R a pick over 8, entries 3%+ from price -0.05R over 9, "
+        "7d: rank entries 0-1% from price, entries 1-2% from price first")
+    assert hints["timeframe"]["text"] == (
+        "4-hour setups +0.25R a pick over 6 (entry reached 3); daily setups -0.10R a pick over "
+        "5 (entry reached 3); the last 7 days: rank 4-hour setups first")
+    assert distance["evidence"]["0-1%"] == {"n": 8, "net_r_per_pick": "0.30",
+                                            "trigger_rate": "0.75"}
     assert hints["timeframe"]["prefer"] == ["4h"]
-    assert "4-hour setups hit 4 of 6 times, daily setups 0 of 5" in hints["timeframe"]["text"]
+    for hint in hints.values():
+        assert len(hint["text"]) <= lessons.MAX_HINT_TEXT
+
+
+def test_net_r_decides_not_the_trigger_rate():
+    """Package learning-loop2 (L2): the bucket price reached most often but that lost money
+    ranks last; the trigger rate is only printed beside the net R."""
+    easy = lines(fill_rate_by_distance={"0-1%": per_pick("-0.20", 10, "0.90"),
+                                        "2-3%": per_pick("0.15", 10, "0.30")})
+    hint = lessons.derive_hint("distance_bucket", {"7d": easy})
+    assert hint["prefer"] == ["2-3%"]
+    assert hint["evidence"]["0-1%"]["trigger_rate"] == "0.90"
+
+
+def test_a_scorecard_before_the_per_pick_figure_is_read_from_its_mean():
+    """mean x triggered / recorded: 0.40 x 6 / 8 = 0.30R a pick."""
+    old = {k: v for k, v in bucket().items()
+           if k not in ("shadow_resolved", "shadow_r_net_per_resolved_pick")}
+    net, n, rate = lessons.net_per_pick(old)
+    assert (net, n, rate) == (D("0.3"), 8, D("0.75"))
+    untriggered = {**old, "mean_shadow_r_net": None, "shadow_r_count": 0}
+    assert lessons.net_per_pick(untriggered)[:2] == (D(0), 8)
+    assert lessons.net_per_pick({})[:2] == (None, 0)
 
 
 def test_the_30_day_lines_answer_only_when_the_7_day_lines_lack_evidence():
-    thin = lines(results_by_timeframe={"4h": bucket(shadow_r_count=2)})
+    thin = lines(results_by_timeframe={"4h": per_pick("0.25", 2)})
     hints = {hint["dimension"]: hint for hint in lessons.derive_hints(full_lessons(**{"7d": thin}))}
     assert hints["timeframe"]["window"] == "30d"
-    flat = lines(fill_rate_by_distance={"0-1%": bucket(shadow_trigger_rate="0.5"),
-                                        "3%+": bucket(shadow_trigger_rate="0.45")})
+    flat = lines(fill_rate_by_distance={"0-1%": per_pick("0.10", 8, "0.5"),
+                                        "3%+": per_pick("0.05", 8, "0.45")})
     hints = {hint["dimension"] for hint in lessons.derive_hints(full_lessons(**{"7d": flat}))}
     assert "distance_bucket" not in hints  # Enough evidence, no difference: no hint.
 
 
 def test_a_rule_lesson_never_writes_a_rule_tag_the_scorecard_would_read():
-    rules = lines(results_by_rule={"A": bucket(shadow_r_count=6, shadow_hit_rate="0.67"),
-                                   "B": bucket(shadow_r_count=6, shadow_hit_rate="0.17")})
+    rules = lines(results_by_rule={"A": per_pick("0.40", 6), "B": per_pick("-0.30", 6)})
     hint = lessons.derive_hint("rule", {"7d": rules})
     assert hint["prefer"] == ["A"] and "rule-" not in hint["text"].lower()
     assert "the stop under the whole window's low" in hint["text"]
@@ -156,7 +189,7 @@ def test_the_summary_reads_every_part_of_the_lessons():
     found = full_lessons()
     text = "\n".join(lessons.summary_lines(found, lessons.derive_hints(found)))
     for expected in ("price reached the entry, by distance: 0-1% 0.75 over 8",
-                     "shadow hit rate by timeframe: 4h 0.67 over 6",
+                     "shadow hit rate by timeframe: 4h 0.50 over 6",
                      "stale-news vetoes: 3 of 10",
                      "causes {'MARKET_WIDE': 3, 'COIN_NEWS': 1}",
                      "Outlook graded on 2026-09-28", "12 direction hits of 30",

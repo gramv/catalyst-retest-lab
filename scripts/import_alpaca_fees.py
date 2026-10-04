@@ -1,13 +1,14 @@
 """Operator-only Alpaca fee reconciliation (package fees-net-r); no trading action.
 
 Reads CFEE/FEE account activities from Alpaca Paper (GET only, through the existing
-read-only transport) since the last completed run, matches each activity to a
-recorded managed fill by broker order id and time, and appends idempotent cost
-evidence through the existing FILL_COST_CORRECTION event path (source
-ALPACA_PAPER_ACTIVITY). This is the on-demand CLI counterpart of the app's own
-periodic ``ManagedExecution.fee_backfill`` (wired into the runtime's reconciliation
-cadence). It never places, amends or cancels an order, and never migrates, seeds or
-inserts fixtures into a database.
+read-only transport) since the last completed run (or the earliest fill of the last 7
+days still without fee evidence, if earlier), matches each activity to a recorded
+managed fill by broker order id and time, or by ALPACA_FEE_MATCH_V2 for a row without
+an order id, and appends idempotent cost evidence through the existing
+FILL_COST_CORRECTION event path (source ALPACA_PAPER_ACTIVITY). This is the on-demand
+CLI counterpart of the app's own periodic ``ManagedExecution.fee_backfill`` (wired into
+the runtime's reconciliation cadence). It never places, amends or cancels an order, and
+never migrates, seeds or inserts fixtures into a database.
 
     python -m scripts.import_alpaca_fees --config PATH [--lookback-hours 24]
 """
@@ -18,7 +19,12 @@ from datetime import UTC, datetime, timedelta
 
 from catalyst_lab.alpaca import AlpacaCredentials, AlpacaReadOnly
 from catalyst_lab.authorization import RiskRepository
-from catalyst_lab.managed_analytics import import_alpaca_fee_activities
+from catalyst_lab.managed_analytics import (
+    fee_match_fills,
+    fee_match_fills_after,
+    import_alpaca_fee_activities,
+    pending_fee_window_start,
+)
 from catalyst_lab.managed_ops import load_private_config
 from catalyst_lab.managed_store import ManagedStore
 
@@ -39,7 +45,10 @@ def run(config, *, lookback_hours=DEFAULT_LOOKBACK_HOURS):
             anchor = conn.execute(
                 "SELECT min(filled_at) AS at FROM lab.managed_fills"
             ).fetchone()["at"]
+        pending = pending_fee_window_start(conn, now=datetime.now(UTC), lookback=lookback)
     after = anchor - lookback if anchor is not None else None
+    if pending is not None and (after is None or pending < after):
+        after = pending
     if after is None:
         return {"status": "NO_FILLS_RECORDED_YET"}
     broker = AlpacaReadOnly(AlpacaCredentials(env["APCA_API_KEY_ID"], env["APCA_API_SECRET_KEY"]))
@@ -48,9 +57,7 @@ def run(config, *, lookback_hours=DEFAULT_LOOKBACK_HOURS):
     finally:
         broker.close()
     with store.repo.connect() as conn:
-        fills = conn.execute(
-            "SELECT * FROM lab.managed_fills WHERE filled_at>=%s", (after,)
-        ).fetchall()
+        fills = fee_match_fills(conn, fee_match_fills_after(after, activities))
     summary = import_alpaca_fee_activities(store, fills, activities, recorded_at=datetime.now(UTC))
     summary["window_after"] = after.isoformat()
     with store.transaction() as conn:

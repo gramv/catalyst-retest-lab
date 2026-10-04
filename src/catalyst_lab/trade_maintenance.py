@@ -52,6 +52,16 @@ facts (version, tier, its event, the cadence and the review's ``routine_weight``
 reviews it stands for) in its trigger and its Jev identity, where the meter reads the weight.
 V1 and V2 trades are never governed.
 
+``CRYPTO_MAINTENANCE_V5`` (package jev-b1; ``maintenance_v5``) asks two yes/no questions
+instead: a routine review at every completed 15-minute bar, at once on a completed hour, new
+agent news or a 3% Bitcoin move since the trade's last request, and the next two completed
+5-minute bars after a counted yes (``_due_v5``); the request carries ``CONTEXT_V6`` with the
+streaks before it, the bar it is asked on and the state hash (``_request_v5``); the decision
+reads ``MAINTENANCE_ANSWER_RULE_V3``, folds the lifecycle's earlier V5 decisions and applies
+this answer in its own transaction, and raises a confirmed question's early-exit flag
+(``_decide_v5``). V5 never changes a level; the spend guard's ``EXHAUSTED`` tier still
+withholds its reviews.
+
 ``MANAGED_MANAGEMENT_REVIEWS=DISABLED`` sends nothing (one POSITION_REVIEW_SKIPPED per trade
 lifecycle); protection and the partial-entry rule run unchanged in the execution loop.
 """
@@ -62,7 +72,8 @@ from decimal import Decimal as D
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from catalyst_lab import crypto_maintenance as cm
-from catalyst_lab import exit_flags, jev_budget
+from catalyst_lab import exit_flags, jev_budget, trade_plan
+from catalyst_lab import maintenance_v5 as mv5
 from catalyst_lab.jev_contract import JEV_MODEL, digest, encoded, strict_json, validated_answers
 from catalyst_lab.jev_review import ReviewResult
 from catalyst_lab.maintenance_dossier import (
@@ -165,6 +176,13 @@ class TradeMaintenance:
         # Its own bounded reader (one REST quote read per pass, one per symbol per 5 s), so
         # review quotes never spend the protection tick's budget.
         self.live_prices = live_prices or LivePriceReader(bars, clock=clock)
+        # A decision reads its quote through its own reader, one REST read per concurrent review
+        # and pass. An answer slower than the 5 s reuse window found the pass's one REST read
+        # spent on its own request and recorded no quote. On 2026-09-28, under the 8 s review
+        # budget, 85% of answers slower than 5 s did, so a stop raise in one was refused
+        # CURRENT_QUOTE_UNAVAILABLE. The freshness rules are the reader's, unchanged.
+        self.decision_prices = LivePriceReader(self.live_prices.source, clock=clock,
+                                               rest_reads_per_tick=max_inflight)
         self._bar_cache = {}
         self._inflight = {}
         self._noted = set()
@@ -174,6 +192,8 @@ class TradeMaintenance:
         self.guard_decision = None
         self.last_pass_at = None
         self.observe = None  # The runtime's stream-row reader, set by each pass.
+        # CRYPTO_MAINTENANCE_V5: Bitcoin's latest streamed price, read once per pass.
+        self.btc_latest = None
 
     @property
     def store(self):
@@ -297,14 +317,23 @@ class TradeMaintenance:
         """The lifecycle's last ``limit`` maintenance reviews, oldest first, as
         ``maintenance_dossier.review_history_row`` reads them (context V5 and
         ``JEV_DAY_REVIEW_CONTEXT_V2``): each MAINTENANCE_DECISION with its request's offered
-        option prices."""
+        option prices.
+
+        The last ``limit`` decisions are chosen first, and each one's request is the latest
+        earlier request with its ID (2026-10-01: joining every decision of the lifecycle to every
+        request grew with the square of the reviews; at RENDER's 489th review it took 9.1 s of
+        the 10 s review deadline, and every review expired before it was sent)."""
         rows = conn.execute(
-            """SELECT d.body AS decision,r.body->'context'->'options' AS options
-            FROM lab.managed_events d LEFT JOIN lab.managed_events r
-              ON r.setup_id=d.setup_id AND r.kind='POSITION_REVIEW_REQUEST'
-              AND r.body->>'request_id'=d.body->>'request_id'
-            WHERE d.setup_id=%s AND d.kind=%s AND d.body->>'lifecycle_id'=%s
-            ORDER BY d.event_seq DESC LIMIT %s""",
+            """SELECT d.body AS decision,r.options
+            FROM (SELECT setup_id,event_seq,body FROM lab.managed_events
+                  WHERE setup_id=%s AND kind=%s AND body->>'lifecycle_id'=%s
+                  ORDER BY event_seq DESC LIMIT %s) d
+            LEFT JOIN LATERAL (
+              SELECT q.body->'context'->'options' AS options FROM lab.managed_events q
+              WHERE q.setup_id=d.setup_id AND q.kind='POSITION_REVIEW_REQUEST'
+                AND q.event_seq<d.event_seq AND q.body->>'request_id'=d.body->>'request_id'
+              ORDER BY q.event_seq DESC LIMIT 1) r ON true
+            ORDER BY d.event_seq DESC""",
             (setup_id, DECISION_EVENT, lifecycle, limit),
         ).fetchall()
         history = []
@@ -342,13 +371,15 @@ class TradeMaintenance:
 
     # --- quotes and bars -----------------------------------------------------------------
 
-    def _quote(self, symbol, row):
+    def _quote(self, symbol, row, reader=None):
         """A quote fresh by read time: the stream's if received within 5 s, else one bounded
-        REST read; None when neither is available."""
+        REST read; None when neither is available. ``reader`` defaults to the pass's reader
+        (a decision passes its own)."""
         received = (row or {}).get("quote_received_at")
         received = _aware(received) if isinstance(received, str) else received
         try:
-            return self.live_prices.read(symbol, row, by_read_time=True, received_at=received)
+            return (reader or self.live_prices).read(symbol, row, by_read_time=True,
+                                                     received_at=received)
         except LivePriceUnavailable:
             return None
 
@@ -393,6 +424,7 @@ class TradeMaintenance:
         now = self.now()
         self.last_pass_at, self.observe = now, observe
         self.live_prices.new_tick()
+        self.decision_prices.new_tick()
         setups = [s for s in setups if (s.get("state") or {}).get("state") == "OPEN"
                   and cm.active(s.get("state"))]
         if not self.reviews_enabled:
@@ -404,6 +436,8 @@ class TradeMaintenance:
         # its first read loads the month's receipts.
         self.guard_decision = await asyncio.to_thread(self._guard_decision, now) if any(
             cm.guarded(cm.recorded_policy(s["state"])) for s in setups) else None
+        latest = getattr(benchmark, "latest", None) if benchmark_ready else None
+        self.btc_latest = latest() if callable(latest) else None
         if benchmark is not None and benchmark_ready and setups:
             shock = benchmark.check(now)
             if shock is not None:
@@ -516,7 +550,9 @@ class TradeMaintenance:
             return None
         if state.get("exit_requested") or state.get("stop_replace"):
             return None
-        levels = {k: _num(v) for k, v in setup["record_json"]["levels"].items()}
+        # CRYPTO_TRADE_PLAN_V1: R and the initial levels are the plan's (trade_plan.py).
+        levels = trade_plan.initial_levels(
+            {k: _num(v) for k, v in setup["record_json"]["levels"].items()}, state)
         risk = cm.r_per_coin(levels)
         stop, target = _num(state["stop"]), _num(state["target"])
         opened_at = _aware(state["opened_at"])
@@ -524,10 +560,13 @@ class TradeMaintenance:
         # minutes, or no review at all while the budget is exhausted).
         policy = cm.recorded_policy(state)
         bar_seconds, guard = policy.review_bar_seconds, None
+        v5 = cm.is_v5(policy)
         if cm.guarded(policy):
             guard = self.guard_decision or jev_budget.unavailable(
                 now, "JEV_SPEND_GUARD_NOT_EVALUATED")
             bar_seconds = policy.review_bar_seconds_for(guard.tier)
+            if v5 and bar_seconds is not None:  # V5: its own cadence below EXHAUSTED.
+                bar_seconds = policy.review_bar_seconds
         with self.store.repo.connect() as conn:  # Reads only: no ledger lock each pass.
             if not self._entry_complete(conn, sid, lifecycle):
                 return None  # Reviews start once the entry is filled or its rest cancelled.
@@ -537,7 +576,7 @@ class TradeMaintenance:
                 conn, sid, lifecycle, 0)}
         served = (last["body"].get("trigger") or {}).get("served", {}) if last else {}
         served_bar_end = _aware(served["bar_end"]) if served.get("bar_end") else None
-        if isinstance(policy, cm.MaintenancePolicyV2) and bar_seconds is not None:
+        if isinstance(policy, cm.MaintenancePolicyV2) and bar_seconds is not None and not v5:
             served_bar_end = self._skip_in_flight(setup, policy, last, served_bar_end,
                                                   opened_at, now, bar_seconds)
         # Triggers need the stream's current quote (a thin coin's unchanged quote is not
@@ -565,6 +604,10 @@ class TradeMaintenance:
         if bar_seconds is None:  # V3: the budget allows no review now (triggers wait).
             self._withheld_by_budget(setup, guard)
             return None
+        if v5:
+            return self._due_v5(setup, row, now, last=last, guard=guard, bid=bid, stop=stop,
+                                target=target, entry=entry, risk=risk, levels=levels,
+                                opened_at=opened_at)
         with self.store.repo.connect() as conn:
             unserved = [(r["body"]["trigger"], r["body"]["level"], r["event_seq"])
                         for r in self._triggers(conn, sid, lifecycle,
@@ -599,6 +642,56 @@ class TradeMaintenance:
                 "shock_seq": max([r["event_seq"] for r in shocks],
                                  default=served.get("shock_seq") or 0),
             },
+        }
+
+    @staticmethod
+    def _v5_decisions(conn, setup_id, lifecycle):
+        """CRYPTO_MAINTENANCE_V5: the lifecycle's earlier V5 decision bodies, oldest first."""
+        rows = conn.execute(
+            """SELECT body FROM lab.managed_events WHERE setup_id=%s AND kind=%s
+            AND body->>'lifecycle_id'=%s AND body->>'policy_id'=%s ORDER BY event_seq""",
+            (setup_id, DECISION_EVENT, lifecycle, cm.MAINTENANCE_V5_VERSION),
+        ).fetchall()
+        return [row["body"] for row in rows]
+
+    def _due_v5(self, setup, row, now, *, last, guard, bid, stop, target, entry, risk, levels,
+                opened_at):
+        """CRYPTO_MAINTENANCE_V5's cadence (``maintenance_v5.due_reasons``): the due item, or
+        None. Milestone and near-level triggers are recorded above but are not V5 reasons."""
+        sid, lifecycle = setup["setup_id"], setup["state"].get("lifecycle_id")
+        served = (last["body"].get("trigger") or {}).get("served", {}) if last else {}
+        # Confirm mode matters only on a 5-minute bar not yet served, so the trade's decisions
+        # are folded at most once per 5-minute bar, never on every (once-a-second) pass.
+        mark = served.get("bar_5m_end")
+        fresh_bar = mark is None or mv5.asked_bar_end(now) > _aware(mark)
+        with self.store.repo.connect() as conn:
+            news_revision = self._news_revision(conn, setup, lifecycle)
+            history = mv5.fold(self._v5_decisions(conn, sid, lifecycle)) if fresh_bar else None
+        served_news = served.get("news_revision", setup["revision"])
+        reference = (served.get("btc_reference") or {}).get("price")
+        latest = self.btc_latest
+        reasons = mv5.due_reasons(
+            now=now, opened_at=opened_at, served=served,
+            news_changed=news_revision is not None and served_news is not None
+            and news_revision > served_news,
+            btc_move=mv5.btc_moved(latest[0] if latest else None,
+                                   _num(reference) if reference is not None else None),
+            confirm_from=history.confirm_from() if history is not None else None,
+            last_requested_at=_aware(last["body"]["requested_at"]) if last else None,
+        )
+        if not reasons:
+            return None
+        return {
+            "setup": setup, "setup_id": sid, "lifecycle_id": lifecycle, "row": row, "bid": bid,
+            "stop": stop, "target": target, "entry": entry, "risk": risk, "levels": levels,
+            "reasons": reasons, "near_target_exempt": False, "triggers": [], "shocks": [],
+            "news_revision": news_revision,
+            # A V5 review stands for itself in the meter's per-minute projection (weight 1).
+            "spend_guard": {**guard.facts(), "review_bar_seconds": cm.V5_REVIEW_BAR_SECONDS,
+                            "routine_weight": 1} if guard is not None else None,
+            "served": {**mv5.served_marks(now), "news_revision": news_revision,
+                       "btc_reference": {"price": str(latest[0]), "at": latest[1].isoformat()}
+                       if latest else None},
         }
 
     def _skip_in_flight(self, setup, policy, last, served_bar_end, opened_at, now, bar_seconds):
@@ -726,6 +819,8 @@ class TradeMaintenance:
         # The setup's own version (V1 or V2, recorded at admission): its record is the
         # context's policy, so the answer is read by that version's rule even after a restart.
         policy = cm.recorded_policy(state)
+        if cm.is_v5(policy):
+            return await self._request_v5(item, rank, setup, state, qty, protection, policy)
         v5 = policy.context_version == cm.CONTEXT_V5_VERSION
         if (_num(state["stop"]), _num(state["target"])) != (item["stop"], item["target"]):
             return None
@@ -765,14 +860,19 @@ class TradeMaintenance:
                                    entry + risk * milestone if milestone else None)
                        if v is not None)
         worst_bid = min(v for v in (best["low"], quote.bid) if v is not None)
+        # CRYPTO_MAINTENANCE_V4: the stop-raise guards (None under V1-V3: options unchanged).
+        guards = cm.raise_guards(
+            policy, hourly_range=cm.hourly_range(bars["bars_1h"], now)[0],
+            last_raise_at=cm.last_stop_raise(state), target_cap=trade_plan.target_cap(state))
         options = {
             "stop": [o.record() for o in cm.stop_options(
                 bars_15m=bars["bars_15m"], bars_1h=bars["bars_1h"], now=now, bid=quote.bid,
                 entry=entry, current_stop=item["stop"], best_bid=best_bid, risk=risk,
-                increment=increment)],
+                increment=increment, guards=guards)],
             "target": [o.record() for o in cm.target_options(
                 bars_15m=bars["bars_15m"], bars_1h=bars["bars_1h"], now=now, bid=quote.bid,
-                current_target=item["target"], increment=increment)],
+                current_target=item["target"], increment=increment,
+                target_cap=guards.target_cap if guards is not None else None)],
         }
         selection = {
             "pick_review": self._selection_judgment(packet.get("receipt_id")),
@@ -823,7 +923,10 @@ class TradeMaintenance:
             "state": compiled.state, "options": options,
             "basis": {"stop": item["stop"], "target": item["target"], "entry": entry,
                       "risk_per_coin": risk, "increment": increment, "qty": qty,
-                      "quote": quote.evidence(), "bid": quote.bid},
+                      "quote": quote.evidence(), "bid": quote.bid,
+                      # CRYPTO_MAINTENANCE_V4 only (earlier versions' contexts are unchanged).
+                      **({"raise_guards": {**guards.record(), "best_bid": best_bid}}
+                         if guards is not None else {})},
             "policy": policy.record(), "expires_at": expires.isoformat(),
             "manifest": compiled.manifest,
             "retained": {"protection_orders": [o["id"] for o in protection],
@@ -844,6 +947,101 @@ class TradeMaintenance:
                             "near_target_exempt": item["near_target_exempt"],
                             "triggers": item["triggers"], "shock_events": item["shocks"],
                             "priority_rank": rank, "served": item["served"],
+                            **({"spend_guard": item["spend_guard"]}
+                               if item.get("spend_guard") is not None else {})},
+            }, sid, f"maintenance-review:{sid}:{lifecycle}:{served_key}")
+            if row["body"]["request_id"] != request_id:
+                return None  # These facts were already served by an earlier request.
+        self._inflight[str(sid)] = {"request_id": request_id, "low": quote.bid,
+                                    "high": quote.bid}
+        return {"setup": setup, "setup_id": sid, "lifecycle_id": lifecycle,
+                "request_id": request_id, "context": context, "requested_at": now,
+                "reasons": item["reasons"]}
+
+    async def _request_v5(self, item, rank, setup, state, qty, protection, policy):
+        """CRYPTO_MAINTENANCE_V5: build and record one review request with ``CONTEXT_V6`` (the
+        unsettled news, the streaks before it, the bar it is asked on and the state hash);
+        None when it cannot be built."""
+        sid, lifecycle = item["setup_id"], item["lifecycle_id"]
+        if (_num(state["stop"]), _num(state["target"])) != (item["stop"], item["target"]):
+            return None
+        quote = self._quote(setup["symbol"], item["row"])
+        if quote is None:
+            self._unavailable(setup, "CURRENT_QUOTE_UNAVAILABLE", "LIVE_PRICE_UNAVAILABLE")
+            return None
+        if quote.bid <= item["stop"]:
+            return None  # The stop is firing: protection owns the trade now.
+        bars, issues = await self._bar_sets(setup["symbol"])
+        if issues:
+            self._unavailable(setup, "COMPLETED_BARS_UNAVAILABLE",
+                              sorted({i.code for i in issues})[0])
+            return None
+        now = self.now()
+        packet = setup["record_json"]
+        pick = packet.get("state") or packet
+        with self.store.repo.connect() as conn:
+            news = self._news_since_entry(conn, sid, lifecycle)
+            history = mv5.fold(self._v5_decisions(conn, sid, lifecycle))
+        unsettled = [n for n in news if history.unsettled(mv5.news_id(n))]
+        hourly = cm.hourly_range(bars["bars_1h"], now)[0]
+        try:
+            compiled = mv5.compile_state(
+                now=now, symbol=setup["symbol"], pick=pick, plan_levels=item["levels"],
+                stop=item["stop"], entry=item["entry"], risk=item["risk"], bid=quote.bid,
+                opened_at=_aware(state["opened_at"]), hourly_range=hourly, news=unsettled,
+                budget=policy.state_byte_budget, **bars)
+        except ContextBudgetUnsatisfiable as exc:
+            self._note_once(SKIPPED_EVENT, {
+                "reason": exc.code, "lifecycle_id": lifecycle,
+                "state_byte_budget": exc.budget, "smallest_state_bytes": exc.state_bytes,
+                "manifest": exc.manifest, "policy_id": policy.policy_id,
+            }, f"position-review-skipped:{sid}:{lifecycle}:{exc.code}", sid)
+            return None
+        expires = min(now + timedelta(seconds=cm.REVIEW_DEADLINE_SECONDS),
+                      _aware(state["hard_exit_at"]))
+        if expires <= now:
+            return None  # The exit is due: nothing is left to maintain.
+        identity = {
+            "candidate_id": str(sid), "position_id": str(sid), "lifecycle_id": lifecycle,
+            "context_revision": state["revision"], "news_revision": item["news_revision"],
+            "exit_policy": EXIT_POLICY, "cohort": MANAGED_COHORT,
+            "strategy_version": setup["strategy_version"],
+            "maintenance_policy_id": policy.policy_id,
+        }
+        if item.get("spend_guard") is not None:
+            identity["spend_guard"] = item["spend_guard"]
+        asked = mv5.asked_for(compiled.state)
+        request_id = str(uuid4())
+        context_json = encoded(json_safe({
+            "context_version": policy.context_version, "identity": identity,
+            "state": compiled.state,
+            "basis": {"stop": item["stop"], "target": item["target"], "entry": item["entry"],
+                      "risk_per_coin": item["risk"], "qty": qty, "quote": quote.evidence(),
+                      "bid": quote.bid, "hourly_range": hourly,
+                      "questions": list(asked),
+                      "asked_bar_end": mv5.asked_bar_end(now).isoformat(),
+                      "state_hash": compiled.state_hash,
+                      "news_shown": list(compiled.news_shown),
+                      "streaks_before": history.record()},
+            "policy": policy.record(), "expires_at": expires.isoformat(),
+            "manifest": compiled.manifest,
+            "retained": {"protection_orders": [o["id"] for o in protection],
+                         "trigger_events": [], "shock_events": []},
+        }))
+        context = ManagedContext(context_json, digest(context_json))
+        served_key = digest(encoded(json_safe(item["served"])))
+        with self.store.transaction() as conn:
+            current = self.store.state(conn, sid)
+            if (current.get("revision") != state["revision"]
+                    or self._pending_request(conn, sid, lifecycle) is not None):
+                return None
+            row = self._event(conn, REQUEST_EVENT, {
+                "request_id": request_id, "context_hash": context.context_hash,
+                "context": context.data, "expires_at": context.expires_at, "requested_at": now,
+                "trigger": {"policy_id": policy.policy_id, "reasons": item["reasons"],
+                            "near_target_exempt": False, "triggers": [], "shock_events": [],
+                            "priority_rank": rank, "served": item["served"],
+                            "questions": list(asked),
                             **({"spend_guard": item["spend_guard"]}
                                if item.get("spend_guard") is not None else {})},
             }, sid, f"maintenance-review:{sid}:{lifecycle}:{served_key}")
@@ -884,15 +1082,18 @@ class TradeMaintenance:
         (``answer_reader``): V1's consistency rules, or ``MAINTENANCE_ANSWER_RULE_V2`` whose
         decision body also records ``answer_rule`` and ``option_use``. ``review_status`` stays
         the transport's whole-answer flag (any uncertain answer), which V2 does not act on."""
+        policy = cm.policy_from_record(context.data["policy"])
+        if cm.is_v5(policy):
+            return self._decide_v5(setup_id, request_id, context, result, requested_at,
+                                   reasons, policy)
         now = self.now()
         basis = context.data["basis"]
         options = context.data["options"]
-        policy = cm.policy_from_record(context.data["policy"])
         lifecycle = context.identity["lifecycle_id"]
         answered_at = self._answered_at(result)
         setup, state = self.execution._load(setup_id)
         row = self._current_row(setup)
-        quote = self._quote(setup["symbol"], row)
+        quote = self._quote(setup["symbol"], row, self.decision_prices)
         body = {
             "policy_id": policy.policy_id, "lifecycle_id": lifecycle,
             "request_id": request_id, "context_hash": context.context_hash,
@@ -932,6 +1133,100 @@ class TradeMaintenance:
                                                        "code": answer.held_code})
         return self._apply(setup_id, request_id, context, answer, body, quote, answered_at, now,
                            requested_at)
+
+    def _decide_v5(self, setup_id, request_id, context, result, requested_at, reasons, policy):
+        """CRYPTO_MAINTENANCE_V5: exactly one outcome for one answered (or failed) review.
+
+        ``MAINTENANCE_ANSWER_RULE_V3`` reads each asked Noul (YES/NO/UNCERTAIN); the streaks are
+        folded from the lifecycle's earlier decisions and this answer applied, in the decision's
+        own transaction. A confirmed question raises its early-exit flag (``FLAGGED``);
+        otherwise the review is ``HELD`` (action ``CONFIRMING`` while a streak runs, else
+        ``HOLD``). No level is ever changed here. Each decision records every asked question's
+        probability and verdict, its streak effect, the state hash and the bar it was asked on
+        (the calibration record joins these to outcomes)."""
+        now = self.now()
+        basis = context.data["basis"]
+        lifecycle = context.identity["lifecycle_id"]
+        answered_at = self._answered_at(result)
+        setup, state = self.execution._load(setup_id)
+        quote = self._quote(setup["symbol"], self._current_row(setup), self.decision_prices)
+        body = {
+            "policy_id": policy.policy_id, "lifecycle_id": lifecycle,
+            "request_id": request_id, "context_hash": context.context_hash,
+            "receipt_ids": list(result.receipt_ids), "requested_at": _text(requested_at),
+            "answered_at": _text(answered_at), "decided_at": now.isoformat(),
+            "trigger_reasons": reasons, "review_status": result.status,
+            "quote": quote.evidence() if quote else None,
+            "levels_before": {"stop": state.get("stop"), "target": state.get("target")},
+            "entry": basis["entry"], "risk_per_coin": basis["risk_per_coin"],
+            "qty": basis["qty"], "answer_rule": policy.answer_rule,
+            "questions": basis["questions"], "asked_bar_end": basis["asked_bar_end"],
+            "state_hash": basis["state_hash"], "news_shown": basis["news_shown"],
+        }
+        if result.status != "RECORDED" and result.reason != "UNCERTAIN_JUDGMENT":
+            return self._record(setup_id, request_id, {
+                **body, "outcome": FAILED, "code": result.reason or "REVIEW_UNAVAILABLE",
+                "action": None, "answers": None})
+        answer = mv5.read_answer(result.answers, basis["questions"])
+        body["answers"] = answer.verdicts or None
+        discard = self._discard_reason(state, lifecycle, basis, quote, requested_at, now,
+                                       setup_id)
+        if discard is not None:
+            return self._record(setup_id, request_id, {**body, "outcome": DISCARDED,
+                                                       "code": discard, "action": None},
+                                obsolete=discard)
+        if answer.code is not None:
+            return self._record(setup_id, request_id, {**body, "outcome": REFUSED,
+                                                       "code": answer.code, "action": None})
+        with self.store.transaction() as conn:
+            existing = conn.execute("SELECT body FROM lab.managed_events WHERE idempotency_key=%s",
+                                    ("maintenance-decision:" + request_id,)).fetchone()
+            if existing:
+                return existing["body"]
+            history = mv5.fold(self._v5_decisions(conn, setup_id, lifecycle))
+            effects = history.apply(answer.verdicts, bar_end=basis["asked_bar_end"],
+                                    state_hash=basis["state_hash"],
+                                    news_shown=basis["news_shown"])
+            body["verdicts"] = {name: {**answer.verdicts[name], **effects[name]}
+                                for name in answer.verdicts}
+            body["streaks_after"] = history.record()
+            confirmed = [name for name in mv5.QUESTIONS
+                         if effects.get(name, {}).get("effect") == mv5.CONFIRMED]
+            if not confirmed:
+                running = any(s.count > 0 for s in history.streaks.values())
+                full = {**body, "outcome": HELD, "code": None,
+                        "action": "CONFIRMING" if running else cm.HOLD}
+            else:
+                flags = []
+                for name in confirmed:
+                    flag, created = exit_flags.raise_exit_flag(
+                        self.store, conn, setup_id=setup_id, lifecycle_id=lifecycle,
+                        side="JEV", question=name,
+                        raised_by={"request_id": request_id,
+                                   "receipt_ids": list(result.receipt_ids),
+                                   "context_hash": context.context_hash},
+                        reasons={"question": name, "policy_id": policy.policy_id,
+                                 "answer_rule": policy.answer_rule,
+                                 "if_unanswered": mv5.IF_UNANSWERED[name],
+                                 "trade_reason": None, "action": cm.FLAG,
+                                 "answers": body["verdicts"], "trigger_reasons": reasons},
+                        evidence={"levels": body["levels_before"], "quote": body["quote"],
+                                  "entry": body["entry"],
+                                  "risk_per_coin": body["risk_per_coin"],
+                                  "asked_bar_end": basis["asked_bar_end"],
+                                  "state_hash": basis["state_hash"],
+                                  **({"observed": context.state.get("observed")}
+                                     if name == mv5.INVALIDATION_MET else
+                                     {"news_ids": basis["news_shown"]})},
+                        raised_at=now, reference=f"{request_id}:{name}",
+                    )
+                    flags.append({"question": name, "flag_id": flag["body"]["flag_id"],
+                                  "created": created})
+                full = {**body, "outcome": FLAGGED, "code": None, "action": cm.FLAG,
+                        "flag_id": flags[0]["flag_id"], "flag_created": flags[0]["created"],
+                        "flags": flags}
+            self._write_decision(conn, setup_id, request_id, full)
+        return json_safe(full)
 
     def _current_row(self, setup):
         observe = getattr(self, "observe", None)
@@ -1035,11 +1330,13 @@ class TradeMaintenance:
             else:
                 low, high = self._bid_extremes(setup_id, body["lifecycle_id"],
                                                _aware(requested_at), quote.bid)
+                guards, best_bid = v4_guards(basis, state, high)
                 code = cm.check_change(
                     old_stop=old_stop, new_stop=new_stop, old_target=old_target,
                     new_target=new_target, bid=quote.bid, min_bid=low, max_bid=high,
                     answered_at=answered_at or now, now=now,
-                    increment=_num(basis["increment"]),
+                    increment=_num(basis["increment"]), guards=guards, best_bid=best_bid,
+                    entry=_num(basis["entry"]), risk=_num(basis["risk_per_coin"]),
                 )
             full = {**body, **change, "outcome": REFUSED if code else APPLIED, "code": code}
             if code is None:
@@ -1054,6 +1351,8 @@ class TradeMaintenance:
                         "applied_at": now.isoformat(),
                     }
                     full["stop_replace_path"] = cm.PATCH_REPLACE
+                    if "raise_guards" in basis:  # V4: the 15-minute spacing starts now.
+                        changes[cm.STOP_RAISED_AT] = now.isoformat()
                 after = self.store.transition(conn, setup_id, state["state"], **changes)
                 full["levels_after"] = {"stop": after["stop"], "target": after["target"]}
             self._write_decision(conn, setup_id, request_id, full)
@@ -1142,6 +1441,20 @@ class TradeMaintenance:
             "failing_reviews": failing,
             "last_pass_at": self.last_pass_at.isoformat() if self.last_pass_at else None,
         }
+
+
+def v4_guards(basis, state, high):
+    """``(guards, best_bid)`` for applying a change reviewed on ``basis``: a
+    ``CRYPTO_MAINTENANCE_V4`` request's recorded guards, with the last raise read from the
+    current ``state`` (a raise applied since the request counts) and the best bid raised by
+    ``high`` (the highest bid since the request); ``(None, None)`` for V1-V3 requests."""
+    recorded = basis.get("raise_guards")
+    if recorded is None:
+        return None, None
+    guards = cm.RaiseGuards.from_record(recorded)
+    guards = cm.RaiseGuards(guards.hourly_range, cm.last_stop_raise(state), guards.target_cap)
+    best = [_num(v) for v in (recorded.get("best_bid"), high) if v is not None]
+    return guards, max(best) if best else None
 
 
 def _text(value):

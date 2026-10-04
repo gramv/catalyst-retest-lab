@@ -1,4 +1,4 @@
-"""EXPERIMENT_DASHBOARD_V1: the dashboard's own arithmetic and wording, without a database."""
+"""EXPERIMENT_DASHBOARD_V1 and V2: the dashboard's arithmetic and wording, without a database."""
 
 import json
 import re
@@ -24,6 +24,7 @@ from catalyst_lab.experiment_report import (
     failed_reviews_today,
     feed,
     jev_action,
+    latest_runs,
     level_change,
     level_move,
     next_run,
@@ -677,6 +678,84 @@ def test_next_run_follows_the_schedule_and_an_unreadable_one_shows_none():
     assert doc["agents"]["research"][0]["next_run_at"] == "2026-10-02T12:00:00+00:00"
 
 
+# --- RESEARCH_SCHEDULE_V2: a daily full run plus update runs (package research-loop-app) ---------
+
+LOOP = {**TWO_HOURS, "daily": "08:00"}
+DAILY_SLOT = datetime(2026, 10, 1, 12, tzinfo=UTC)  # 08:00 New York: today's daily run
+
+
+def test_the_v2_schedule_in_words_names_the_daily_run_and_the_updates():
+    assert schedule_summary(LOOP, NOW) == {  # NOW is 12:00 New York.
+        "text": "Daily at 08:00 + updates every 2 hours", "timezone": "America/New_York",
+        "times": TWO_HOURS["runs"], "next_run_at": datetime(2026, 10, 1, 18, tzinfo=UTC),
+        "daily": "08:00", "next_run_kind": "UPDATE",
+        "next_full_run_at": datetime(2026, 10, 2, 12, tzinfo=UTC)}
+    alone = schedule_summary({"timezone": "America/New_York", "runs": ["08:00"],
+                              "daily": "08:00"}, NOW)
+    assert (alone["text"], alone["next_run_kind"]) == ("Daily at 08:00", "FULL")
+    uneven = {"timezone": "UTC", "runs": ["08:00", "14:00", "20:00"], "daily": "08:00"}
+    assert schedule_summary(uneven, NOW)["text"] == "Daily at 08:00 + 2 updates a day"
+    # A V1 schedule keeps its words and exactly its keys.
+    assert schedule_summary(TWO_HOURS, NOW) == {
+        "text": "Every 2 hours", "timezone": "America/New_York", "times": TWO_HOURS["runs"],
+        "next_run_at": datetime(2026, 10, 1, 18, tzinfo=UTC)}
+    doc = build_dashboard(snapshot(), schedule=LOOP)
+    assert doc["agents"]["schedule"]["text"] == "Daily at 08:00 + updates every 2 hours"
+
+
+def update_rows(run_no=3, slot=CYCLE_SLOT):
+    """An update run: CCC/USD selected again (adjusted levels) and a new coin, GGG/USD."""
+    received, ranked = slot + timedelta(minutes=10), slot + timedelta(minutes=25)
+    rows = []
+    for symbol, rank in (("CCC/USD", 1), ("GGG/USD", 2)):
+        rows.append(decision_row("PICK", received, actor="RESEARCH_AGENT", agent="claude",
+                                 symbol=symbol, trade_no=None, run_no=run_no, action="CHART",
+                                 entry=D("99.5"), stop=D("97.5"), target=D("104.5"),
+                                 note=f"why {symbol}"))
+        rows.append(decision_row("SELECTION", ranked, symbol=symbol, trade_no=None,
+                                 run_no=run_no, outcome="SELECTED", jev_rank=rank))
+    return rows
+
+
+def loop_snapshot(as_of):
+    runs = [slot_run(0, DAILY_SLOT - timedelta(days=1)),
+            slot_run(1, DAILY_SLOT - timedelta(hours=2)),  # 06:00: the previous day's update.
+            slot_run(2, DAILY_SLOT), slot_run(3, CYCLE_SLOT),
+            slot_run(4, CYCLE_SLOT + timedelta(hours=2), ranked=False)]
+    trades = [trade_row(5, closed=False, symbol="AAA/USD", price="101", price_at=as_of,
+                        entry_at=DAILY_SLOT + timedelta(minutes=28)),
+              trade_row(6, symbol="BBB/USD", entry_at=NOW - timedelta(hours=5),
+                        exit_at=NOW - timedelta(hours=1))]
+    return snapshot(status=status(as_of=as_of), runs=runs, trades=trades,
+                    cycle_picks=cycle_rows(run_no=2, slot=DAILY_SLOT) + update_rows())
+
+
+def test_under_v2_the_current_cycle_is_the_daily_run_and_its_updates():
+    """Today's daily run (run 2) and the 10:00 update (run 3) are one cycle, valid until the
+    next daily run plus the grace; the daily run's CCC, selected again by the update, reads
+    as replaced; the unranked 12:00 update awaits Jev."""
+    agents = build_dashboard(loop_snapshot(NOW + timedelta(minutes=15)), schedule=LOOP)["agents"]
+    cycle = agents["cycle"]
+    assert (cycle["runs"], cycle["run_no"], cycle["run_at"], cycle["valid_until"],
+            cycle["live"]) == ([2, 3], 3, "2026-10-01T12:00:00+00:00",
+                               "2026-10-02T13:00:00+00:00", True)
+    assert [(p["symbol"], p["run_no"], p["status"], p["status_text"])
+            for p in cycle["picks_list"]] == [
+        ("AAA/USD", 2, "IN_TRADE", "In trade #5"), ("CCC/USD", 3, "NO_ENTRY", "No entry yet"),
+        ("BBB/USD", 2, "CLOSED", "Closed #6"), ("GGG/USD", 3, "NO_ENTRY", "No entry yet"),
+        ("CCC/USD", 2, "REPLACED", "Replaced by a later pick"),
+        ("DDD/USD", 2, "NOT_SELECTED", "Not selected"),
+        ("EEE/USD", 2, "NOT_SELECTED", "Not selected"),
+        ("FFF/USD", 2, "NO_VERDICT", "No verdict")]
+    assert agents["pending_run"]["run_no"] == 4
+    assert agents["jev"]["cycle"]["since"] == "2026-10-01T12:25:00+00:00"  # The daily ranking.
+    # Under V1 the same runs make the newest ranked slot the cycle, exactly as before.
+    v1 = build_dashboard(loop_snapshot(NOW + timedelta(minutes=15)), schedule=TWO_HOURS)
+    assert (v1["agents"]["cycle"]["runs"], v1["agents"]["cycle"]["valid_until"]) == (
+        [3], "2026-10-01T17:00:00+00:00")
+    assert "REPLACED" not in {p["status"] for p in v1["agents"]["cycle"]["picks_list"]}
+
+
 # --- Words -------------------------------------------------------------------------------------
 
 
@@ -856,6 +935,13 @@ def test_title_override_and_the_fixture_label():
     assert build_dashboard(snapshot(), title="   ")["title"] == DEFAULT_TITLE
 
 
+def test_latest_runs_are_each_agents_newest_run():
+    runs = [{"run_no": 1, "agent": "muse"}, {"run_no": 2, "agent": "grogbot"},
+            {"run_no": 3, "agent": "muse"}, {"run_no": 4, "agent": "muse"}]
+    assert latest_runs(runs) == [2, 4]
+    assert latest_runs([]) == []
+
+
 def test_agent_cards_list_the_latest_picks_in_jevs_order_and_only_their_own_answers():
     picks = [decision_row("PICK", NOW, actor="RESEARCH_AGENT", agent="claude", symbol=s,
                           trade_no=None, run_no=2, action="CHART", entry=D("1.10"),
@@ -889,7 +975,9 @@ def test_agent_cards_list_the_latest_picks_in_jevs_order_and_only_their_own_answ
     assert jev["latest_selection"] == {"run_no": 2, "agent": "claude",
                                        "at": "2026-10-01T12:25:00+00:00", "picks": 20,
                                        "selected": 10, "passed": 6, "vetoed": 2,
-                                       "not_ranked": 2}
+                                       "not_ranked": 2,
+                                       "symbols": ["DOT", "UNI", "AAVE", "ARB", "RENDER",
+                                                   "FIL", "BCH", "PEPE", "SHIB", "GRT"]}
     assert all(d["actor"] == "JEV" for d in jev["decisions"])
 
 
@@ -925,7 +1013,311 @@ def test_no_document_field_name_is_a_private_identifier():
 
 
 def test_the_dashboard_rules_are_recorded_in_the_package_doc():
+    if not (ROOT / "docs" / "packages").is_dir():
+        pytest.skip("history doc not shipped in the public export")
     doc = (ROOT / "docs" / "packages" / "experiment-page.md").read_text()
-    assert DASHBOARD_VERSION in doc
+    # V3's own record (package public-page-v3) names the version; V1's rules stay in the first.
+    assert DASHBOARD_VERSION in (ROOT / "docs" / "packages" / "public-page-v3.md").read_text()
     for rule in ("fees pending", "New York", "180", "catalyst_public"):
         assert rule in doc, rule
+
+
+# --- EXPERIMENT_DASHBOARD_V2 (package public-page) --------------------------------------------
+
+from catalyst_lab.experiment_report import (  # noqa: E402
+    day_limits,
+    entry_market,
+    market_block,
+    open_risk,
+    regime_words,
+    results,
+    system_line,
+    trade_plan,
+    trade_story,
+    traded_row,
+    wait_event,
+)
+
+
+def page_status(**overrides):
+    return {"risk_policy": "JEV_MANAGED_RISK_V4", "risk_pct": D("0.005"),
+            "crypto_cap_pct": D("0.02"), "hard_loss_pct": D("0.03"), "soft_loss_pct": D("0.02"),
+            "day_start_equity": D("10000"), "day_start_observed_at": NOW - timedelta(hours=11),
+            "soft_limit_at": None, "soft_limit_pnl": None, "daily_halt_at": None,
+            "daily_halt_pnl": None, "execution_halts": 0, "execution_halt_reason": None,
+            "execution_halt_at": None, "pacing_wait_at": None, "pacing_wait_reason": None,
+            "pacing_release_kind": None, "pacing_release_until": None,
+            "pacing_median_1h_return": None, "pacing_recent_entries": None, "soft_wait_at": None,
+            "newest_admitted_at": NOW, "rules_risk_policy": "JEV_MANAGED_RISK_V4",
+            "rules_trade_plan_policy": "CRYPTO_TRADE_PLAN_V1",
+            "rules_maintenance_policy": "CRYPTO_MAINTENANCE_V4",
+            "rules_entry_pacing_policy": "CRYPTO_ENTRY_PACING_V1",
+            "rules_stop_limit_policy": "CRYPTO_STOP_BREACH_V4",
+            "rules_since": NOW - timedelta(hours=6), **overrides}
+
+
+def page_trade(trade_no, *, plan=True, **overrides):
+    row = {"trade_no": trade_no, "admitted_at": NOW - timedelta(hours=6),
+           "risk_policy": "JEV_MANAGED_RISK_V4" if plan else "JEV_MANAGED_RISK_V3",
+           "trade_plan_policy": "CRYPTO_TRADE_PLAN_V1" if plan else None,
+           "maintenance_policy": "CRYPTO_MAINTENANCE_V4" if plan else "CRYPTO_MAINTENANCE_V3",
+           "entry_pacing_policy": "CRYPTO_ENTRY_PACING_V1" if plan else None,
+           "stop_limit_policy": "CRYPTO_STOP_BREACH_V4" if plan else None,
+           "holding_policy": None, "plan_stop": D("96") if plan else None,
+           "plan_target": D("106") if plan else None, "plan_target_cap": D("106"),
+           "hourly_range": D("2"), "hourly_range_fraction": D("0.02"), "range_floor": D("96"),
+           "stop_basis": "HOURLY_RANGE_FLOOR", "target_basis": "PLAN_CAP",
+           "stop_range_multiple": D("2"), "target_r_multiple": D("1.5"),
+           "window_minutes": D("1440"), "risk_stop": D("96") if plan else D("98"),
+           "risk_usd": D("41") if plan else D("20"), "regime_day_tag": None,
+           "regime_prior_day_tag": None, "regime_btc_1h": None, "regime_btc_4h": None,
+           "regime_median_coin_1h": None, "regime_median_coin_1h_pct": None}
+    return {**row, **overrides}
+
+
+def heartbeat_status(**overrides):
+    return status(**{"last_heartbeat_at": NOW - timedelta(seconds=30), **overrides})
+
+
+@pytest.mark.parametrize("overrides,page,state,reason", [
+    ({}, {}, "TRADING", None),
+    ({"last_heartbeat_at": None}, {}, "STOPPED", None),
+    ({}, {"pacing_wait_at": NOW - timedelta(seconds=40), "pacing_wait_reason": "MARKET_DROP",
+          "pacing_median_1h_return": D("-0.031")}, "PAUSED", "MARKET_DROP"),
+    ({}, {"pacing_wait_at": NOW - timedelta(minutes=6), "pacing_wait_reason": "MARKET_DROP"},
+     "TRADING", None),  # An older wait no longer holds entries back.
+    ({}, {"pacing_wait_at": NOW, "pacing_wait_reason": "ENTRY_RATE_LIMIT"}, "PAUSED",
+     "ENTRY_RATE_LIMIT"),
+    ({}, {"pacing_wait_at": NOW, "pacing_wait_reason": "MACRO_EVENT_WINDOW",
+          "pacing_release_kind": "CPI", "pacing_release_until": NOW + timedelta(minutes=30)},
+     "PAUSED", "MACRO_EVENT_WINDOW"),
+    ({}, {"soft_limit_at": NOW - timedelta(hours=1), "pacing_wait_at": NOW,
+          "pacing_wait_reason": "MARKET_DROP"}, "SOFT_LIMIT", "DAILY_SOFT_LOSS_LIMIT"),
+    ({"daily_loss_halt_today": True}, {"daily_halt_at": NOW - timedelta(hours=2),
+                                       "soft_limit_at": NOW - timedelta(hours=3)},
+     "HALTED", "DAILY_LOSS_LIMIT"),
+    ({"active_halts": 1}, {"execution_halt_reason": "OPERATOR_PAUSE"}, "PAUSED",
+     "OPERATOR_PAUSE"),
+    ({"active_halts": 1}, {"execution_halt_reason": "BROKER_EVENT_REQUIRES_MANUAL_REVIEW"},
+     "HALTED", "BROKER_EVENT_REQUIRES_MANUAL_REVIEW"),
+])
+def test_the_status_line_states_and_their_precedence(overrides, page, state, reason):
+    line = system_line(heartbeat_status(**overrides), page_status(**page), NOW)
+    assert (line["state"], line["reason"]) == (state, reason)
+    assert line["rules_since"] == NOW - timedelta(hours=6)
+
+
+def test_the_status_line_words_name_the_cause_and_when_entries_resume():
+    halted = system_line(heartbeat_status(daily_loss_halt_today=True), page_status(
+        daily_halt_at=datetime(2026, 10, 1, 19, 24, tzinfo=UTC)), NOW)
+    assert halted["text"] == ("Daily loss limit reached at 15:24 ET. Open trades were sold; new "
+                              "entries resume at 00:00 ET.")
+    assert halted["resume_at"] == datetime(2026, 10, 2, 4, tzinfo=UTC)  # NY midnight
+    soft = system_line(heartbeat_status(), page_status(
+        soft_limit_at=datetime(2026, 10, 1, 15, 2, tzinfo=UTC)), NOW)
+    assert soft["text"].startswith("Daily loss reached the −2.00% soft limit at 11:02 ET: no new "
+                                   "entries today")
+    drop = system_line(heartbeat_status(), page_status(
+        pacing_wait_at=NOW, pacing_wait_reason="MARKET_DROP",
+        pacing_median_1h_return=D("-0.0312")), NOW)
+    assert drop["text"] == ("Market drop: new entries wait while the median coin is down 2% in "
+                            "an hour (now −3.12%).")
+    cpi = system_line(heartbeat_status(), page_status(
+        pacing_wait_at=NOW, pacing_wait_reason="MACRO_EVENT_WINDOW", pacing_release_kind="CPI",
+        pacing_release_until=datetime(2026, 10, 1, 13, 15, tzinfo=UTC)), NOW)
+    assert cpi["text"] == "CPI release window: no new entries until 09:15 ET."
+    assert cpi["resume_at"] == datetime(2026, 10, 1, 13, 15, tzinfo=UTC)
+
+
+def test_the_limits_bar_spans_seven_sixths_of_the_hard_limit():
+    closed = [{"pnl_usd": D("-260.97"), "fees_pending": True},
+              {"pnl_usd": None, "fees_pending": True}]
+    live = [{"pnl_usd": D("-48.13")}, {"pnl_usd": None}]
+    limits = day_limits(page_status(day_start_equity=D("9917")), live, closed)
+    assert (limits["pnl_usd"], limits["realized_usd"], limits["open_usd"]) == (
+        D("-309.10"), D("-260.97"), D("-48.13"))
+    assert (limits["open_unpriced"], limits["fees_pending"]) == (1, 2)
+    # Scale 3.5%: soft at 2/3.5, hard at 3/3.5, the loss 3.117% at 0.8905 of the bar.
+    assert (limits["soft_at"], limits["hard_at"], limits["loss_fraction"]) == (
+        D("0.5714"), D("0.8571"), D("0.8905"))
+    assert (limits["soft_pct"], limits["hard_pct"], limits["pnl_pct"]) == (
+        D("2.00"), D("3.00"), D("-3.12"))
+    assert (limits["soft_limit_usd"], limits["hard_limit_usd"]) == (D("-198.34"), D("-297.51"))
+    gain = day_limits(page_status(), [{"pnl_usd": D("40")}], [])
+    assert gain["loss_fraction"] == D("0.0000") and gain["pnl_pct"] == D("0.40")
+    beyond = day_limits(page_status(), [], [{"pnl_usd": D("-900"), "fees_pending": False}])
+    assert beyond["loss_fraction"] == D("1.0000")  # The bar never overflows.
+    unknown = day_limits(page_status(day_start_equity=None), [], [])
+    assert unknown["hard_at"] is None and unknown["pnl_pct"] is None
+    legacy = day_limits(page_status(soft_loss_pct=None), [], [])
+    assert legacy["soft_at"] is None and legacy["hard_at"] == D("0.8571")
+
+
+def test_open_risk_is_the_planned_risk_against_the_crypto_cap():
+    risk = open_risk(page_status(), [{"risk_usd": D("41")}, {"risk_usd": D("59")},
+                                     {"risk_usd": None}], None)
+    assert (risk["risk_usd"], risk["risk_pct"], risk["cap_pct"], risk["fraction"],
+            risk["unknown"]) == (D("100"), D("1.00"), D("2.00"), D("0.5000"), 1)
+    none = open_risk(page_status(), [], None)
+    assert (none["risk_pct"], none["fraction"], none["trades"]) == (D("0.00"), D("0.0000"), 0)
+
+
+def test_regime_words_leave_unknown_parts_out():
+    words = regime_words("UP/HIGH/BROAD/SELLOFF")
+    assert words == {"tag": "UP/HIGH/BROAD/SELLOFF",
+                     "words": "Bitcoin uptrend, high volatility, most coins above their 20-day "
+                              "average",
+                     "short": "Uptrend, high volatility, sell-off", "selloff": True}
+    partial = regime_words("UNKNOWN/NORMAL/UNKNOWN/UNKNOWN")
+    assert (partial["words"], partial["short"], partial["selloff"]) == (
+        "normal volatility", "normal volatility", None)
+    assert regime_words(None) is None
+    regimes = [{"day": "2026-09-30", "tag": "UP/HIGH/BROAD/SELLOFF",
+                "worst_hour_start": datetime(2026, 9, 30, 18, tzinfo=UTC),
+                "worst_hour_pct": D("-3.21")}]
+    market = market_block(regimes, page_status(), date(2026, 10, 1))
+    assert (market["day"], market["is_today"], market["worst_hour_pct"], market["pacing_rule"]) \
+        == ("2026-09-30", False, D("-3.2"), True)
+    assert market_block([], None, date(2026, 10, 1)) == {"day": None, "pacing_rule": False}
+    at_entry = entry_market(page_trade(1, regime_median_coin_1h="DOWN",
+                                       regime_median_coin_1h_pct=D("-1.27"),
+                                       regime_day_tag="UP/HIGH/BROAD/SELLOFF"))
+    assert at_entry["words"] == ("Median coin −1.3% the hour before · day: uptrend, high "
+                                 "volatility, sell-off")
+    assert entry_market(page_trade(1)) is None
+
+
+def test_the_traded_levels_are_the_plans_and_r_uses_the_plans_risk():
+    row = trade_row(1, risk="20")  # research stop 98, target 105, risk 20
+    traded = traded_row(row, page_trade(1))
+    assert (traded["planned_stop"], traded["planned_target"], traded["planned_risk_usd"]) == (
+        D("96"), D("106"), D("41"))
+    assert (traded["research_stop"], traded["research_target"]) == (D("98"), D("105"))
+    trade = closed_trade(traded)
+    assert trade["planned_stop"] == D("96") and trade["pnl_r"] == D("10") / D("41")
+    unchanged = traded_row(row, page_trade(1, plan=False))
+    assert (unchanged["planned_stop"], unchanged["planned_risk_usd"]) == (D("98"), D("20"))
+    plan = trade_plan(row, page_trade(1))
+    assert (plan["research_stop"], plan["stop"], plan["research_target"], plan["target"]) == (
+        D("98"), D("96"), D("105"), D("106"))
+    assert plan["stop_rule"] == "2× the hourly range (2.00%) below the entry"
+    assert plan["target_rule"] == "Capped at 1.5R above the entry" and plan["window_hours"] == 24
+    kept = trade_plan(row, page_trade(1, stop_basis="RESEARCH_STOP",
+                                      target_basis="RESEARCH_TARGET"))
+    assert kept["stop_rule"].startswith("Research stop kept")
+    assert kept["target_rule"] == "Research target kept: under the 1.5R cap"
+    assert trade_plan(row, page_trade(1, plan=False)) is None
+
+
+def test_the_story_adds_the_plan_and_the_waits_before_the_buy():
+    row = traded_row(trade_row(1), page_trade(1))
+    trade = closed_trade(row)
+    plan = trade_plan(trade_row(1), page_trade(1, admitted_at=NOW - timedelta(hours=5, minutes=30)))
+    waits = [{"trade_no": 1, "wait_kind": "PACING", "reason": "MARKET_DROP",
+              "first_at": NOW - timedelta(hours=5, minutes=14),
+              "last_at": NOW - timedelta(hours=5, minutes=11), "waits": 4,
+              "worst_median_1h_return": D("-0.0234"), "release_kind": None}]
+    pick = decision_row("PICK", NOW - timedelta(hours=7), actor="RESEARCH_AGENT", agent="muse",
+                        entry=D("100"), stop=D("98"), target=D("105"), run_no=3, note="Reason.")
+    story = trade_story(row, trade, [pick], plan=plan, waits=waits)
+    kinds = [e["kind"] for e in story["events"]]
+    assert kinds == ["PICK", "PLAN", "WAIT", "BUY", "LEVELS_SET", "EXIT", "RESULT"]
+    plan_line, wait_line = story["events"][1], story["events"][2]
+    assert plan_line["text"] == "Plan set: stop 98 → 96, target 105 → 106, 24-hour window"
+    assert plan_line["actor"] == "APP"
+    assert wait_line["text"] == "Entry waited: market dropping" and wait_line["actor"] == "PACING"
+    assert wait_line["note"] == "4 checks · Median coin −2.34% over an hour at the worst"
+    assert story["events"][4]["text"] == "Stop set at 96, target 106"  # the traded levels
+    assert story["levels"][0]["stop"] == D("96")
+    macro = wait_event({**waits[0], "reason": "MACRO_EVENT_WINDOW", "release_kind": "FOMC",
+                        "waits": 1, "worst_median_1h_return": None})
+    assert (macro["text"], macro["note"]) == ("Entry waited: FOMC release window", "1 check")
+
+
+def test_results_split_by_market_and_by_rules_and_hide_small_averages():
+    def closed_item(no, day, pnl, r, pending=False):
+        at = datetime(2026, 9, day, 18, tzinfo=UTC)
+        return {"trade_no": no, "exit_at": at, "pnl_usd": D(pnl), "pnl_r": D(r),
+                "fees_pending": pending}
+
+    closed = [closed_item(1, 28, "-10", "-0.5"), closed_item(2, 28, "5", "0.25", True),
+              closed_item(3, 29, "8", "0.4"), closed_item(4, 30, "-3", "-0.1")]
+    regimes = [{"day": "2026-09-28", "tag": "UP/HIGH/BROAD/SELLOFF"},
+               {"day": "2026-09-29", "tag": "UP/NORMAL/BROAD/NO_SELLOFF"}]
+    current = tuple(page_status()["rules_" + f] for f in (
+        "risk_policy", "trade_plan_policy", "entry_pacing_policy", "stop_limit_policy"))
+    v3 = ("JEV_MANAGED_RISK_V3", None, None, None)
+    keys = {1: v3, 2: v3, 3: current, 4: current}
+    out = results(closed, [], regimes, page_status(), keys)
+    assert (out["selloff_days"]["trades"], out["selloff_days"]["days"],
+            out["selloff_days"]["pnl_usd"]) == (2, 1, D("-5"))
+    assert (out["other_days"]["trades"], out["untagged"]) == (1, 1)
+    rules = out["rules"]
+    assert (rules["earlier"]["trades"], rules["current"]["trades"]) == (2, 2)
+    assert rules["earlier"]["verified"] == 1 and rules["earlier"]["avg_net_r"] is None
+    assert rules["current"]["since"] == NOW - timedelta(hours=6)
+    assert (rules["earlier"]["first_day"], rules["earlier"]["last_day"]) == (
+        "2026-09-28", "2026-09-28")
+    many = [closed_item(10 + i, 29, "1", "0.1") for i in range(30)]
+    big = results(many, [], regimes, page_status(), dict.fromkeys(range(10, 40), current))
+    assert big["rules"]["current"]["avg_net_r"] == D("0.100")  # 30 fee-verified: shown
+    nothing = results(closed, [], [], None, keys)
+    assert nothing["rules"]["current"]["trades"] == 0 and nothing["rules"]["earlier"][
+        "trades"] == 4
+
+
+def test_the_after_sale_block_has_no_data_source_yet_and_is_omitted():
+    doc = build_dashboard(snapshot(trades=[trade_row(1)], page_trades=[page_trade(1)],
+                                   page_status=page_status()))
+    trade = doc["past"]["closed_trades"][0]
+    assert trade["after_exit"] is None and trade["plan"]["stop"] == "96"
+    assert doc["system"]["state"] == "STOPPED" and doc["results"]["rules"]["current"][
+        "trades"] == 1
+
+
+def test_limits_measure_the_day_from_the_v2_basis_when_an_equity_follows_it():
+    v2 = page_status(day_start_equity=D("9590.78"),
+                     day_start_basis="ACCOUNT_EQUITY_AT_NY_MIDNIGHT_V2",
+                     day_start_observed_at=NOW - timedelta(hours=11), equity_usd=D("9612.40"),
+                     equity_at=NOW - timedelta(hours=1), baseline_corrected_at=NOW - timedelta(
+                         hours=10), baseline_corrected_from=D("9877.3"))
+    trades = [{"pnl_usd": D("-50"), "fees_pending": False}]
+    limits = day_limits(v2, [], trades)
+    assert (limits["measure"], limits["pnl_usd"], limits["realized_usd"]) == (
+        "ACCOUNT_EQUITY", D("21.62"), D("-50"))
+    assert limits["baseline_corrected_from_usd"] == D("9877.3")
+    stale = day_limits({**v2, "equity_at": NOW - timedelta(hours=12)}, [], trades)
+    assert (stale["measure"], stale["pnl_usd"]) == ("TRADES", D("-50"))  # Equity before basis.
+    row = day_limits(page_status(day_start_basis="ALPACA_LAST_EQUITY", equity_usd=D("9612.4"),
+                                 equity_at=NOW), [], trades)
+    assert row["measure"] == "TRADES"
+
+
+def test_v5_words_name_each_question_its_probability_and_streak():
+    from catalyst_lab.experiment_report import v5_repeated, v5_words
+
+    def q(p, verdict, effect="RESET", streak=0):
+        return {"p": D(p), "verdict": verdict, "effect": effect, "streak": streak}
+
+    assert v5_words({"invalidation": q("0.08", "NO")}, "HELD") == "Invalidation met? no (0.08)"
+    assert v5_words({"invalidation": q("0.86", "YES", "COUNTED", 2),
+                     "news": q("0.5", "UNCERTAIN", "NEUTRAL")}, "HELD") == (
+        "Invalidation met? yes (0.86), 2 of 3 · news contradicts? unsure (0.50)")
+    assert v5_words({"invalidation": q("0.91", "YES", "CONFIRMED")}, "FLAGGED") == (
+        "Invalidation met? yes (0.91), 3 of 3: flagged for an early exit")
+    assert v5_words({}, "FAILED") == "Review failed"
+    assert v5_repeated({"v5_ps": [D("0.2"), D("0.05")], "v5_verdicts": {"NO", "UNCERTAIN"}},
+                       "4+") == "Held: invalidation met? no or unsure, 4+ reviews in a row " \
+                                "(p 0.05–0.20)"
+
+
+def test_a_withdrawn_soft_latch_leaves_trading_with_its_words():
+    line = system_line(heartbeat_status(), page_status(
+        soft_limit_withdrawn_latch_at=datetime(2026, 10, 1, 7, 10, tzinfo=UTC),
+        soft_limit_withdrawn_at=NOW - timedelta(hours=4)), NOW)
+    assert (line["state"], line["reason"]) == ("TRADING", "SOFT_LIMIT_WITHDRAWN")
+    assert line["text"] == ("New entries allowed. The soft limit of 03:10 ET was withdrawn after "
+                            "the day's start was corrected.")
+    kept = system_line(heartbeat_status(), page_status(soft_limit_at=NOW, soft_limit_kept=True),
+                       NOW)
+    assert kept["state"] == "SOFT_LIMIT" and kept["text"].endswith("start was corrected.")

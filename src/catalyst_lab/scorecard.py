@@ -25,6 +25,29 @@ cause of each notable trade's latest post-mortem). ``overall`` adds ``maintenanc
 recorded replay of the window's trades by decision type, actual official R minus the
 counterfactual's net R), ``arms`` (Jev-managed against the control arm), ``costs`` (the Jev
 meter's estimate and verified trading fees) and, in the ``1d`` window, the per-trade list.
+
+Package learning-measure (2026-10-02; owner: "yes, pull those two fixes forward"), additive:
+net R is reported only over fee-verified trades, always beside the count of closed trades
+(``results``: ``r_net_count`` of ``trades_closed``, ``fees_verified_share``, the reasons of the
+unverified ones, and the gross R of every closed trade for comparison); each per-trade line has
+its ``r_net`` (null until its fees are verified), ``gross_r``, ``fees_status``, its
+``MARKET_REGIME_V1`` tags and its recorded versions; ``overall`` adds ``dimensions`` (results
+by regime and by recorded version, ``result_dimensions``) and, in the ``1d`` window,
+``late_fee_settlements``: trades of the 7 days before whose own day's scorecard was recorded
+before their fees posted (Alpaca posts crypto fees in a daily batch after this job runs) and
+whose net R is known now.
+
+Package jev-b3 (2026-10-03), additive: the ``1d`` ``overall`` adds ``jev``
+(``JEV_CALIBRATION_V1``, ``jev_calibration.day_counts``): the day's Jev probabilities by source
+(top-K pick reviews, answered maintenance reviews), how many have their outcome recorded and
+how many are pending (most of a day's are, since an outcome needs 24 hours), and the records to
+date.
+
+Package strategy-c1 (2026-10-03, STRATEGY_REGISTRY_V1), additive: ``overall`` adds
+``strategies`` (``strategy_shadow.strategy_section``): the window's closed paper trades by their
+stamped strategy (``live_paper``) and the mechanical strategies' simulated outcomes by signal time
+(``shadow``), each labelled, with every strategy's stage on the promotion ladder; and
+``dimensions`` adds ``by_strategy``.
 """
 
 import re
@@ -34,7 +57,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 
 from catalyst_lab.agent_identity import agent_fields
+from catalyst_lab.execution_quality import trade_execution
 from catalyst_lab.jev_budget import CONFIG_EVENT, KINDS, SpendConfig, kind_of
+from catalyst_lab.jev_calibration import day_counts
 from catalyst_lab.learning_intake import POST_MORTEM_EVENT, day_bounds
 from catalyst_lab.learning_replays import (
     DAY_REPLAY_EVENT,
@@ -43,14 +68,27 @@ from catalyst_lab.learning_replays import (
     counterfactual_r,
     decision_type,
     recorded_replays,
+    scale_of,
 )
 from catalyst_lab.managed_engineering import is_engineering
 from catalyst_lab.managed_measurement import managed_measurement
 from catalyst_lab.managed_store import COHORT
 from catalyst_lab.market_reality import sector_map, sector_of
+from catalyst_lab.market_regime import REGIME_VERSION, recorded_regimes, recorded_trade_regimes
 from catalyst_lab.pick_outcomes import SHADOW_EVENT_KIND, cycle_picks, rank_bucket
 from catalyst_lab.repository import json_safe
 from catalyst_lab.research_report_v3 import REPORT_SCHEMA_V3
+from catalyst_lab.result_dimensions import (
+    CELL_MINIMUM,
+    a_versions,
+    dimensions,
+    recorded_versions,
+    regime_line,
+    unverified_reason,
+)
+from catalyst_lab.stats_exclusion import excluded_setups_of
+from catalyst_lab.strategies import DEFAULT_STRATEGY_ID, strategy_id_of
+from catalyst_lab.strategy_shadow import strategy_section
 from catalyst_lab.unchanged_plan import UNCHANGED_PLAN_METHOD, UNCHANGED_PLAN_WINDOW_METHOD
 
 D = Decimal
@@ -73,6 +111,8 @@ SOURCE_REJECTION = "INVALID_SOURCE_EVIDENCE"
 DOSSIER_REJECTION = "DOSSIER_OVER_BUDGET"
 EXIT_KINDS = {
     "BROKER_EXIT": "STOP", "STOP_LIMIT_NOT_FILLED": "STOP", "STOP_CROSSED_DURING_REPLACE": "STOP",
+    # CRYPTO_STOP_EXECUTION_V1 (package exec-d): the app's own exit of a reference-confirmed stop.
+    "STOP_EMULATED_EXIT": "STOP",
     "TARGET_EXIT": "TARGET", "EARLY_EXIT_AGREED": "EARLY_EXIT",
     "DAY_REVIEW_EXIT": "TWENTY_FOUR_HOUR_EXIT", "DAY_REVIEW_DEADLINE_EXIT": "TWENTY_FOUR_HOUR_EXIT",
     "HOLD_24H_EXIT": "TWENTY_FOUR_HOUR_EXIT", "TIME_EXIT": "TWENTY_FOUR_HOUR_EXIT",
@@ -84,6 +124,7 @@ SELECTION_GROUPS = (("selected", ("TOP_K", "REPLACEMENT")), ("passed", ("NOT_SEL
 DECISION_TYPES = ("STOP_RAISE", "TARGET_RAISE", "STOP_AND_TARGET_RAISE", "EARLY_EXIT",
                   "DAY_REVIEW_CONTINUE", "DAY_REVIEW_EXIT")
 TERMINAL_UNFILLED = {"EXPIRED_UNTRIGGERED", "INVALIDATED", "RISK_REJECTED", "REJECTED"}
+LATE_SETTLEMENT_DAYS = 7  # Earlier scored days whose unverified trades are looked up again.
 FOUR = D("0.0001")
 LIMITATIONS = (
     "Shadow outcomes are 1-minute-bar approximations with an assumed taker fee; only picks "
@@ -192,6 +233,7 @@ class Pick:
     sector: str
     shadow: dict | None
     setup: dict | None
+    traded_shadow: dict | None = None  # TRADED_LEVELS_V1: the plan's levels' shadow outcome.
 
 
 @dataclass
@@ -215,6 +257,11 @@ class Trade:
     exit_reason: str | None
     measurement: dict
     fixture_tainted: bool
+    versions: dict | None = None
+    regime: dict | None = None
+    strategy_id: str = DEFAULT_STRATEGY_ID
+    execution: dict | None = None  # EXECUTION_QUALITY_V1 (package exec-d).
+    r_basis: dict | None = None  # Official R's scale (TRADED_LEVELS_V1, package learning-loop2).
 
     @property
     def r_net(self):
@@ -227,12 +274,25 @@ class Trade:
         return _number(self.measurement.get("gross_realized_pnl"))
 
     @property
-    def notability_r(self):
-        """Official R, else gross P&L over the same denominator (fees pending)."""
-        if self.r_net is not None:
-            return self.r_net
+    def gross_r(self):
+        """Gross P&L over the official R's denominator (planned filled risk), fees aside."""
         gross, risk = self.gross_pnl, _number(self.measurement.get("planned_filled_risk"))
         return gross / risk if gross is not None and risk else None
+
+    @property
+    def fees_status(self):
+        return unverified_reason(self.measurement, self.fixture_tainted) or "VERIFIED"
+
+    def item(self):
+        """This trade as ``result_dimensions`` reads it."""
+        return {"r_net": self.r_net, "win": None if self.gross_pnl is None
+                else self.gross_pnl > 0, "regime": self.regime, "versions": self.versions or {},
+                "strategy_id": self.strategy_id, "execution": self.execution}
+
+    @property
+    def notability_r(self):
+        """Official R, else gross P&L over the same denominator (fees pending)."""
+        return self.r_net if self.r_net is not None else self.gross_r
 
     @property
     def exit_kind(self):
@@ -288,11 +348,14 @@ def load_cycles(repository, start, end, *, now, classified):
                 FROM lab.managed_events WHERE kind='RESEARCH_PACKET'
                 AND body->>'cycle_id'=%s ORDER BY event_seq""", (cycle_id,),
             ).fetchall()}
+            shadow_rows = conn.execute(
+                """SELECT body FROM lab.managed_events WHERE kind=%s
+                AND body->'pick'->>'cycle_id'=%s ORDER BY event_seq""",
+                (SHADOW_EVENT_KIND, cycle_id)).fetchall()
             shadows = {(r["body"]["pick"]["item_key"], r["body"]["pick"]["revision"]):
-                       r["body"]["outcome"] for r in conn.execute(
-                           """SELECT body FROM lab.managed_events WHERE kind=%s
-                           AND body->'pick'->>'cycle_id'=%s ORDER BY event_seq""",
-                           (SHADOW_EVENT_KIND, cycle_id)).fetchall()}
+                       r["body"]["outcome"] for r in shadow_rows}
+            traded = {(r["body"]["pick"]["item_key"], r["body"]["pick"]["revision"]):
+                      (r["body"].get("traded_plan") or {}).get("outcome") for r in shadow_rows}
             setup_ids = [r.setup_id for r in records if r.setup_id]
             setups = {str(s["setup_id"]): s for s in conn.execute(
                 """SELECT s.setup_id, s.record_json, t.body AS state,
@@ -319,6 +382,7 @@ def load_cycles(repository, start, end, *, now, classified):
                 sector=sector_of(record.symbol, classified),
                 shadow=shadows.get((record.item_key, record.revision)),
                 setup=setup,
+                traded_shadow=traded.get((record.item_key, record.revision)),
             ))
         cycles.append(Cycle(cycle_id=cycle_id, agent=agent, run_slot=slot,
                             item_results=list(row["item_results"] or []), picks=picks))
@@ -353,6 +417,10 @@ def load_trades(repository, start, end):
             engineering.append(closed_at)
             continue
         measurement = managed_measurement(repository, row["setup_id"])
+        with repository.connect() as conn:
+            execution = trade_execution(
+                conn, row["setup_id"], state,
+                planned_filled_risk=measurement.get("planned_filled_risk"))
         tainted = any(item.get("source") == "LAB_FIXTURE"
                       for item in measurement.get("cost_evidence") or [])
         record = row["record_json"] or {}
@@ -363,7 +431,14 @@ def load_trades(repository, start, end):
             opened_at=row["opened_at"], closed_at=closed_at,
             exit_reason=state.get("reason") or state.get("exit_requested"),
             measurement=measurement, fixture_tainted=tainted,
+            versions=recorded_versions(record, state),
+            strategy_id=strategy_id_of(state, record),
+            execution=json_safe(execution),
+            r_basis=scale_of(record, state),
         ))
+    regimes = recorded_trade_regimes(repository, [t.setup_id for t in trades])
+    for trade in trades:
+        trade.regime = regimes.get(trade.setup_id)
     return trades, engineering
 
 
@@ -497,22 +572,34 @@ def results(trades):
     wins = sum(1 for t in trades if t.gross_pnl is not None and t.gross_pnl > 0)
     losses = sum(1 for t in trades if t.gross_pnl is not None and t.gross_pnl <= 0)
     r_values = [t.r_net for t in trades if t.r_net is not None]
+    gross = [t.gross_r for t in trades if t.gross_r is not None]
     holds = [t.hold_hours for t in trades if t.hold_hours is not None]
     return {
         "trades_closed": len(trades), "wins": wins, "losses": losses,
         "win_rate": rate(wins, wins + losses), "r_net_count": len(r_values),
         "mean_r_net": mean(r_values), "sum_r_net": _q(sum(r_values, D(0))) if r_values else None,
+        # Net R covers the fee-verified trades only; these say how many of the closed that is.
+        "r_net_scope": "FEE_VERIFIED_TRADES_ONLY",
+        "fees_verified_share": rate(len(r_values), len(trades)),
+        "gross_r_count": len(gross), "mean_gross_r": mean(gross),
         "fees_unverified": sum(1 for t in trades if t.r_net is None),
+        "fees_unverified_by_reason": dict(sorted(Counter(
+            t.fees_status for t in trades if t.r_net is None).items())),
         "exit_reasons": dict(sorted(Counter(t.exit_reason or "UNKNOWN" for t in trades).items())),
         "mean_hold_hours": mean(holds),
     }
 
 
-def shadow_net_r(pick):
-    outcome = pick.shadow
+def shadow_net_r(pick, outcome=None):
+    outcome = pick.shadow if outcome is None else outcome
     if not outcome or not outcome.get("data_complete") or outcome.get("net_r") is None:
         return None
     return D(str(outcome["net_r"]))
+
+
+def traded_net_r(pick):
+    """The shadow net R on the admitted setup's traded levels (TRADED_LEVELS_V1), or None."""
+    return shadow_net_r(pick, pick.traded_shadow) if pick.traded_shadow else None
 
 
 def selection(picks):
@@ -521,12 +608,16 @@ def selection(picks):
         members = [p for p in picks if rank_bucket(p.record) in buckets]
         recorded = [p for p in members if p.shadow is not None]
         values = [v for v in (shadow_net_r(p) for p in members) if v is not None]
+        traded = [v for v in (traded_net_r(p) for p in members) if v is not None]
         groups[name] = {
             "picks": len(members), "shadow_recorded": len(recorded),
             "pending": len(members) - len(recorded),
             "triggered": sum(1 for p in recorded if p.shadow.get("triggered")),
             "shadow_r_count": len(values), "mean_shadow_r_net": mean(values),
             "shadow_hit_rate": rate(sum(1 for v in values if v > 0), len(values)),
+            # TRADED_LEVELS_V1 (package learning-loop2): admitted picks on the plan's levels,
+            # beside the research levels above (which every pick, selected or not, shares).
+            "traded_plan_r_count": len(traded), "mean_traded_plan_shadow_r_net": mean(traded),
         }
         means[name] = mean(values)
     groups["selected_minus_passed_mean_shadow_r_net"] = (
@@ -541,6 +632,10 @@ def bucket_line(picks):
     recorded = [p for p in picks if p.shadow is not None]
     triggered = [p for p in recorded if p.shadow.get("triggered")]
     values = [v for v in (shadow_net_r(p) for p in picks) if v is not None]
+    total = sum(values, D(0))
+    # Package learning-loop2 (L2): net R per resolved pick, a pick the shadow never filled
+    # counting 0 R -- what sending a pick of this bucket earned -- for the lessons' ranking.
+    resolved = [p for p in recorded if p.shadow.get("data_complete")]
     return {
         "picks": len(picks), "admitted": len(admitted), "filled": len(filled),
         "fill_rate": rate(len(filled), len(admitted)), "shadow_recorded": len(recorded),
@@ -548,6 +643,9 @@ def bucket_line(picks):
         "shadow_trigger_rate": rate(len(triggered), len(recorded)),
         "shadow_r_count": len(values), "mean_shadow_r_net": mean(values),
         "shadow_hit_rate": rate(sum(1 for v in values if v > 0), len(values)),
+        "sum_shadow_r_net": _q(total) if values else None,
+        "shadow_resolved": len(resolved),
+        "shadow_r_net_per_resolved_pick": _q(total / len(resolved)) if resolved else None,
     }
 
 
@@ -593,8 +691,12 @@ def trade_line(trade, post_mortems, *, with_arm):
         "exit_reason": trade.exit_reason, "exit_kind": trade.exit_kind,
         "gross_pnl_usd": trade.measurement.get("gross_realized_pnl"),
         "net_pnl_usd": trade.measurement.get("net_pnl"), "r_net": _q(trade.r_net),
+        "gross_r": _q(trade.gross_r), "fees_status": trade.fees_status,
         "fees_verified": bool(trade.measurement.get("fees_verified"))
         and not trade.fixture_tainted,
+        "regime": regime_line(trade.regime), "a_versions": a_versions(trade.versions),
+        # EXECUTION_QUALITY_V1 (package exec-d): fee rate, maker/taker, exit path, stop slippage.
+        "execution": trade.execution,
         "win": trade.gross_pnl > 0 if trade.gross_pnl is not None else None,
         "best_r": trade.measurement.get("observed_mfe_r"),
         "worst_r": trade.measurement.get("observed_mae_r"),
@@ -637,7 +739,8 @@ def maintenance(trades, replays, *, items):
         if trade is None:
             continue
         kind = decision_type(replay["kind"], body)
-        actual, counterfactual = trade.r_net, counterfactual_r(replay["kind"], body)
+        actual = trade.r_net
+        counterfactual = counterfactual_r(replay["kind"], body, getattr(trade, "r_basis", None))
         difference = actual - counterfactual if actual is not None and counterfactual is not None \
             else None
         groups.setdefault(kind, []).append(difference)
@@ -710,6 +813,38 @@ def costs(trades, calls, config, source):
     }
 
 
+def late_fee_settlements(repository, day, trades):
+    """Trades of the ``LATE_SETTLEMENT_DAYS`` days before ``day`` that their own day's recorded
+    scorecard listed without verified fees and whose net R is known now."""
+    pending = {}
+    for back in range(1, LATE_SETTLEMENT_DAYS + 1):
+        earlier = day - timedelta(days=back)
+        row = recorded_scorecard(repository, earlier)
+        lines_ = (((row or {}).get("body") or {}).get("windows", {}).get("1d", {})
+                  .get("overall", {}).get("trades") or [])
+        for line in lines_:
+            if not line.get("fees_verified"):
+                pending[line["setup_id"]] = earlier.isoformat()
+    settled = [t for t in trades if t.setup_id in pending and t.r_net is not None]
+    return {
+        "count": len(settled), "mean_r_net": mean([t.r_net for t in settled]),
+        "items": [{"setup_id": t.setup_id, "symbol": t.symbol, "closed_at": t.closed_at,
+                   "scored_day": pending[t.setup_id], "r_net": _q(t.r_net),
+                   "gross_r": _q(t.gross_r)} for t in settled],
+        "still_unverified": sorted(sid for sid in pending
+                                   if sid not in {t.setup_id for t in settled}),
+    }
+
+
+def exclusion_section(trades, excluded):
+    """The window's trades left out by ``STATS_EXCLUSION_V1`` records, with their days."""
+    hit = [excluded[t.setup_id] for t in trades if t.setup_id in excluded]
+    return {"version": "STATS_EXCLUSION_V1", "excluded_trades": len(hit),
+            "included_trades": len(trades) - len(hit),
+            "days": sorted({h["day"] for h in hit}),
+            "reasons": sorted({h["reason"] for h in hit})}
+
+
 def lines(cycles, trades, post_mortems, *, start, end, items):
     return {
         "start": start, "end": end, "funnel": funnel(cycles), "results": results(trades),
@@ -734,11 +869,15 @@ def compute_scorecard(repository, day, *, now):
     earliest, _ = day_bounds(day - timedelta(days=WINDOWS[-1][1] - 1))
     with repository.connect() as conn:
         classified = sector_map(conn)
+        regime = recorded_regimes(conn, [day]).get(day.isoformat())
+    day_regime = None if regime is None else {
+        k: regime.get(k) for k in ("regime_version", "tag", "computed_at")}
     all_cycles = load_cycles(repository, earliest, day_end, now=now, classified=classified)
     all_trades, engineering_closes = load_trades(repository, earliest, day_end)
     post_mortems = latest_post_mortems(repository)
     replays = recorded_replays(repository, [t.setup_id for t in all_trades])
     config, source = spend_estimate(repository)
+    excluded = excluded_setups_of(repository)  # STATS_EXCLUSION_V1 (package public-page-v3).
     windows = {}
     for name, days in WINDOWS:
         start, _ = day_bounds(day - timedelta(days=days - 1))
@@ -751,9 +890,21 @@ def compute_scorecard(repository, day, *, now):
             maintenance=maintenance(trades, replays, items=items), arms=arms(trades),
             costs=costs(trades, jev_calls(repository, start, day_end), config, source),
             engineering_excluded=engineering,
+            dimensions=dimensions([t.item() for t in trades]),
+            # STRATEGY_REGISTRY_V1: paper trades and shadow outcomes per strategy, apart.
+            strategies=strategy_section(repository, [t.item() for t in trades], start=start,
+                                        end=day_end),
+            # STATS_EXCLUSION_V1: ``results`` keeps every trade; this view leaves out the
+            # trades of owner-excluded days, with their count.
+            stats_exclusions=exclusion_section(trades, excluded),
+            results_excluding_exclusions=results(
+                [t for t in trades if t.setup_id not in excluded]),
         )
         if items:
             overall["trades"] = [trade_line(t, post_mortems, with_arm=True) for t in trades]
+            overall["late_fee_settlements"] = late_fee_settlements(repository, day, all_trades)
+            overall["regime"] = day_regime
+            overall["jev"] = day_counts(repository, start, day_end)
         agents = {}
         for agent in sorted({c.agent for c in all_cycles} | {t.agent for t in all_trades}):
             agents[agent] = lines([c for c in cycles if c.agent == agent],
@@ -773,6 +924,8 @@ def compute_scorecard(repository, day, *, now):
             "replay_methods": [UNCHANGED_PLAN_METHOD, DAY_REPLAY_METHOD,
                                UNCHANGED_PLAN_WINDOW_METHOD, DAY_REPLAY_WINDOW_METHOD],
             "selection_groups": {name: list(b) for name, b in SELECTION_GROUPS},
+            "r_net_scope": "FEE_VERIFIED_TRADES_ONLY", "regime_version": REGIME_VERSION,
+            "dimension_cell_minimum": CELL_MINIMUM,
         },
         "limitations": list(LIMITATIONS),
     })

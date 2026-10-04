@@ -20,7 +20,7 @@ from catalyst_lab.account_risk import (
     FROZEN_V1_POLICY_ID,
     LEGACY_MANAGED_POLICY_ID,
     MANAGED_RISK_V2_POLICY_ID,
-    MANAGED_RISK_V3_POLICY_ID,
+    MANAGED_RISK_V4_POLICY_ID,
     account_risk_failure,
     load_policy,
 )
@@ -68,9 +68,11 @@ def test_seeded_policy_rows_carry_today_and_the_approved_v2_numbers(er):
         legacy = load_policy(conn, LEGACY_MANAGED_POLICY_ID, engine="MANAGED")
         v2 = load_policy(conn, MANAGED_RISK_V2_POLICY_ID, engine="MANAGED")
         count = conn.execute("SELECT count(*) AS n FROM lab.account_risk_policies").fetchone()
-    # Migration 022 adds JEV_MANAGED_RISK_V3 (tests/test_crypto_size_hold.py); the three seeded
-    # here carry no market terms, so every earlier rule keeps its fixed budget.
-    assert count["n"] == 4
+    # Migration 022 adds JEV_MANAGED_RISK_V3 (tests/test_crypto_size_hold.py) and 026
+    # JEV_MANAGED_RISK_V4 (tests/test_risk_v4.py) and 031 JEV_MANAGED_RISK_V5
+    # (tests/test_risk_v5.py); the three seeded here carry no market terms, so every earlier rule
+    # keeps its fixed budget.
+    assert count["n"] == 6
     assert v1.market_terms == legacy.market_terms == v2.market_terms == {}
     assert (v1.risk_pct, v1.account_cap_pct, v1.max_per_sector, v1.max_per_theme) == (
         D("0.01"), D("0.02"), 1, 1)
@@ -94,9 +96,10 @@ def test_seeded_policy_rows_carry_today_and_the_approved_v2_numbers(er):
         load_policy(conn, "NO_SUCH_POLICY")
 
 
-def test_deploy_example_names_the_seeded_v3_managed_row(er):
+def test_deploy_example_names_the_seeded_v4_managed_row(er):
     """Parity between the launch example and the database rows (no numbers live in JSON).
-    The example names JEV_MANAGED_RISK_V3 since migration 022 (package crypto-size-hold)."""
+    The example named JEV_MANAGED_RISK_V3 from migration 022 (package crypto-size-hold) and
+    names JEV_MANAGED_RISK_V4 since migration 026 (package risk-pacing)."""
     example = json.loads((Path(__file__).resolve().parents[1] / "deploy" /
                           "private-paper.example.json").read_text())
 
@@ -108,7 +111,7 @@ def test_deploy_example_names_the_seeded_v3_managed_row(er):
         return None
 
     policy_id = find(example)
-    assert policy_id == MANAGED_RISK_V3_POLICY_ID
+    assert policy_id == MANAGED_RISK_V4_POLICY_ID
     with er.connect() as conn:
         assert load_policy(conn, policy_id, engine="MANAGED").policy_id == policy_id
 
@@ -143,7 +146,8 @@ def test_policy_rows_are_owner_only_immutable_audited_and_v1_is_frozen(er):
             'ACCOUNT_RISK_POLICIES',to_jsonb(p),p.event_seq)) AS ok
             FROM lab.account_risk_policies p"""
         ).fetchone()
-    assert rows["n"] == rows["ok"] == 4  # The three 016 seeds and 022's JEV_MANAGED_RISK_V3.
+    # The three 016 seeds, 022's JEV_MANAGED_RISK_V3 and 026's JEV_MANAGED_RISK_V4.
+    assert rows["n"] == rows["ok"] == 6  # With V5 (migration 031).
     assert verify_events(er.export_events())["valid"]
 
 

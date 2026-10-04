@@ -11,6 +11,8 @@ the ledger. No broker, provider, network or owner-ledger contact.
 from datetime import timedelta
 from decimal import Decimal as D
 
+import pytest
+
 from catalyst_lab import crypto_maintenance as cm
 from catalyst_lab import jev_budget as jb
 from catalyst_lab.audit import verify_events
@@ -32,10 +34,15 @@ from tests.maintenance_fixtures import (
     trigger,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.maintenance_fixtures import v2_admission as v2_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 from tests.test_jev_budget_meter import call
+
+# Every setup here is admitted as before package trade-plan (CRYPTO_MAINTENANCE_V3 or earlier,
+# the one-tick stop-limit); the new versions are tests/test_trade_plan_*.py.
+pytestmark = pytest.mark.usefixtures("pre_trade_plan_admission")
 
 WATCHDOG = {"tick_max_age_seconds": 15, "reconciliation_max_age_seconds": 90,
             "research_max_age_seconds": 180}

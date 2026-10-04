@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 from catalyst_lab.agent_identity import LEGACY_AGENT_ID, validated_agent_tokens
+from catalyst_lab.ai_mode import NO_AI_MODE
 from catalyst_lab.jev_contract import strict_json
 from catalyst_lab.learning_intake import LearningIntake, LearningPolicy
 from catalyst_lab.managed_classification import (
@@ -29,6 +30,8 @@ from catalyst_lab.position_news import PositionNewsService
 from catalyst_lab.research_context import CryptoAssetReader, ResearchContextService
 from catalyst_lab.research_report_v3 import ResearchCapabilityUnavailable
 from catalyst_lab.research_schedule import ResearchSchedule
+from catalyst_lab.research_validate import ReportValidator
+from catalyst_lab.research_withdrawal import ResearchWithdrawals
 from catalyst_lab.scan_sources import AlpacaMarketSource
 from catalyst_lab.trade_review import TradeReviewService
 
@@ -50,7 +53,8 @@ class AppSettings:
     # Plan 1.3: one research-agent credential per agent ID ({agent_id: token}); ``token``
     # remains the legacy identity (agent ``muse``). None or empty configures no agent token.
     agent_tokens: Mapping[str, str] | None = field(default=None, repr=False)
-    # MANAGED_RESEARCH_SCHEDULE_JSON (RESEARCH_SCHEDULE_V1). None: report V3 is refused (503).
+    # MANAGED_RESEARCH_SCHEDULE_JSON (RESEARCH_SCHEDULE_V1 or _V2). None: report V3 is refused
+    # (503). The execution's run supersession follows its version (package research-loop-app).
     research_schedule: ResearchSchedule | None = None
 
     def __post_init__(self):
@@ -237,6 +241,12 @@ def public_status(raw):
         # JEV_SPEND_GUARD_V1 (package jev-budget): the month's Jev spend, projections,
         # budget and tier (JEV_BUDGET_THROTTLED / _TIGHT / _EXHAUSTED on a change).
         "jev_budget": raw.get("jev_budget"),
+        # CRYPTO_COINBASE_TRIGGER_V1 / CRYPTO_STOP_BREACH_V3: Coinbase's public feed, the products
+        # it serves and each unhealthy product's code (null without the feed).
+        "reference_feed": raw.get("reference_feed"),
+        # CRYPTO_STREAM_CAPACITY_V1: the coins the crypto stream wants against its capacity
+        # (15) and the offered picks held back until a slot frees up.
+        "crypto_stream": raw.get("crypto_stream"),
     }
 
 
@@ -254,6 +264,24 @@ def create_application(runtime, settings, *, source_factory=AlpacaMarketSource,
     context = research_context if research_context is not None else research_context_for(
         runtime, settings, source_factory, reviews=reviews
     )
+    # Package research-loop-app: admission and the runtime's retirement pass supersede by the
+    # version of the schedule intake uses (RESEARCH_RUN_SUPERSESSION_V2 under
+    # RESEARCH_SCHEDULE_V2), set before the runtime starts.
+    configure = getattr(runtime.execution, "configure_research_schedule", None)
+    if callable(configure):
+        configure(settings.research_schedule)
+    # Package agent-api: report-V3 intake's dry run with admission warnings (writes nothing).
+    validator = ReportValidator(runtime.research, context, repo=runtime.execution.repo,
+                                max_seconds=settings.report_seconds)
+    # NO_AI_MODE_V1 (package oss-packaging, ai_mode.py): no research report can wait on a judge,
+    # so the report intake and its dry run are not served (503 MUSE_REPORT_INTAKE_NOT_CONFIGURED
+    # and RESEARCH_REPORT_VALIDATE_NOT_CONFIGURED).
+    reports_served = getattr(runtime, "ai_mode", None) != NO_AI_MODE
+
+    def submit_report(raw):
+        return asyncio.to_thread(runtime.research.start_report, raw,
+                                 max_seconds=settings.report_seconds, v3=context.intake())
+
     app = create_managed_app(
         runtime.research,
         runtime.execution.store,
@@ -264,16 +292,17 @@ def create_application(runtime, settings, *, source_factory=AlpacaMarketSource,
         runtime_status=status,
         # Report V3 bodies also receive the schedule and the tradable universe; V2 and legacy
         # bodies never read them.
-        report_submit=lambda raw: asyncio.to_thread(
-            runtime.research.start_report, raw, max_seconds=settings.report_seconds,
-            v3=context.intake(),
-        ),
+        report_submit=submit_report if reports_served else None,
         position_news=PositionNewsService(runtime.execution.store, clock=runtime.now),
         research_context=context,
         trade_reviews=reviews,
         health_check_database=health_check_database,
         # Package learning-app: the agents' outlooks and post-mortems (never sent to Jev).
         learning_intake=learning_intake_for(runtime, settings, context),
+        # Package research-loop-app: an agent withdraws its own unfilled picks (no broker call).
+        research_withdrawals=ResearchWithdrawals(runtime.execution.store, clock=runtime.now),
+        report_validate=((lambda raw: asyncio.to_thread(validator.validate, raw))
+                         if reports_served else None),
     )
 
     def initialize_classifications():

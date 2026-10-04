@@ -29,6 +29,18 @@ def isolate_provider_credentials(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def pre_trade_plan_ledger_default(request, monkeypatch):
+    """Package trade-plan: on a schema-27 ledger an engine plans report-V3 crypto picks
+    (CRYPTO_TRADE_PLAN_V1). Tests written before it admit on research levels, as their engines
+    always did; a test marked ``trade_plan`` (or passing ``trade_plan_enabled=True``) gets the
+    plan."""
+    if request.node.get_closest_marker("trade_plan") is None:
+        from catalyst_lab import trade_plan
+
+        monkeypatch.setattr(trade_plan, "ADMITTED", None)
+
+
+@pytest.fixture(autouse=True)
 def no_external_test_connections(monkeypatch):
     """Tests use private Unix-socket PostgreSQL and fake broker transports only."""
     original_connect = socket.socket.connect

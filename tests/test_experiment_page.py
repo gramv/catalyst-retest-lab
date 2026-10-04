@@ -9,6 +9,7 @@ demo experiment. The service never calls an exchange: every price comes from the
 
 import json
 import re
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
@@ -24,8 +25,9 @@ from catalyst_lab.experiment_page import (
     CSP,
     DEFAULT_PORT,
     FONT_FILES,
-    PRICE_HISTORY_ORIGIN,
+    STALE_LIMIT_SECONDS,
     ExperimentRefused,
+    ReportCache,
     create_experiment_app,
     parse_args,
 )
@@ -48,9 +50,8 @@ CENT = D("0.01")
 SOURCE = Path(experiment_page.__file__).parent
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
-HEADINGS = ("Summary", "Positions", "Closed trades", "Research", "Jev", "Latest picks",
-            "Performance")
-MARKET_DATA = PRICE_HISTORY_ORIGIN + "/v1beta3/crypto/us"
+# EXPERIMENT_DASHBOARD_V3 (package public-page-v3): the section titles.
+HEADINGS = ("Trading P&amp;L", "Performance", "Open positions", "Closed today", "Past days")
 SCRIPT = SOURCE / "static" / "experiment.js"
 REMOVED = ("Not investment advice", "simulated money", "The questions", "How it works",
            "The rules", "Honest notes", "Too early", "PUBLIC_EXPERIMENT_REPORT_V1",
@@ -107,16 +108,18 @@ def test_an_empty_ledger_serves_the_dashboard_shell_and_its_first_data(er):  # n
     assert "FIXTURE DATA" not in html and "fixture-banner" not in html
     assert f'<script defer src="/experiment.js?v={asset_version()}"></script>' in html
     assert '<a href="/api/public/experiment">' in html  # the noscript fallback
-    # The run status holds only its dot and its words (no stray text for the script to keep).
-    assert re.search(r'<span class="state" id="pill"><span class="dot"\s+aria-hidden="true">'
-                     r'</span><span id="pill-text">', html)
-    assert '<span class="account" id="account"></span>' in html  # the masthead's account
+    # The status line's band (filled by the script) and the masthead's account line.
+    assert re.search(r'<div class="status-band" id="status" role="status" aria-live="polite">',
+                     html)
+    assert '<div class="updated" id="updated">Paper account</div>' in html
+    assert 'data-view="main"' in html
     for name in PRELOAD_FONTS:  # same-origin fonts, preloaded
         assert (f'<link rel="preload" href="/fonts/{name}" as="font" type="font/woff2" '
                 'crossorigin>') in html
     first = embedded(html)
-    assert first["dashboard_version"] == data["dashboard_version"] == "EXPERIMENT_DASHBOARD_V1"
-    assert data["status"]["pill"] == "STOPPED"
+    assert first["dashboard_version"] == data["dashboard_version"] == "EXPERIMENT_DASHBOARD_V3"
+    assert data["status"]["pill"] == "STOPPED" and data["system"]["state"] == "STOPPED"
+    assert data["results"]["since_start"]["trades"] == 0 and data["market"]["day"] is None
     assert (data["overall"]["closed"], data["overall"]["open"], data["overall"]["pnl_usd"],
             data["overall"]["win_rate"], data["overall"]["equity_usd"],
             data["overall"]["account_label"]) == (0, 0, "0.00", None, None, "Paper account")
@@ -251,9 +254,8 @@ def test_every_response_carries_the_strict_security_headers(er):  # noqa: F811
     directives = dict(part.strip().split(" ", 1) for part in CSP.split(";"))
     assert directives["script-src"] == directives["style-src"] == "'self'"
     assert directives["font-src"] == directives["img-src"] == "'self'"
-    # The one other origin: the reader's browser reads public price bars for a trade's chart.
-    assert directives["connect-src"] == "'self' https://data.alpaca.markets"
-    assert PRICE_HISTORY_ORIGIN == "https://data.alpaca.markets"
+    # V3: the service reads the public market data itself; the browser reads this origin only.
+    assert directives["connect-src"] == "'self'"
     assert "unsafe-inline" not in CSP and "unsafe-eval" not in CSP and "*" not in CSP
     with client(er) as c:
         responses = [c.get(path) for path in (
@@ -309,80 +311,63 @@ def script_code():
 
 
 def test_the_script_builds_the_page_with_dom_calls_and_reads_only_its_own_json():
-    """Its own JSON, and public market data: an opened trade's price bars and the current
-    cycle's latest one-minute bars. No key, cookie or referrer; nothing sent but the coins,
-    the time window and the bar size."""
+    """V3: its own JSON and its own chart route only (the service reads the public market data
+    server side); the charts are inline SVG built with DOM calls."""
     script = script_code()
     for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(",
                    "new Function", "localStorage", "sessionStorage", "document.cookie"):
         assert unsafe not in script, unsafe
     assert script.count("fetch(") == 2
     assert re.findall(r"fetch\((.+?), \{", script) == [
-        "MARKET_DATA + path + '?' + query.toString()", "'/api/public/experiment'"]
-    assert re.findall(r"https?://[^'\s]+", script) == [MARKET_DATA, "http://www.w3.org/2000/svg"]
-    assert f"const MARKET_DATA = '{MARKET_DATA}';" in script
-    assert MARKET_DATA.startswith(PRICE_HISTORY_ORIGIN + "/")  # the origin the policy allows
-    reads = re.findall(r"marketData\('([^']+)', \{(.*?)\}\)", script, re.S)
-    assert [(path, re.findall(r"(\w+):", params)) for path, params in reads] == [
-        ("/bars", ["symbols", "timeframe", "start", "end", "limit"]),
-        ("/latest/bars", ["symbols"])]
-    assert "credentials: 'omit'" in script and "referrerPolicy: 'no-referrer'" in script
-    for private in ("apca", "authorization", "api-key", "secret", "token"):
+        "'/api/public/experiment/trades/' + number + '/chart'", "'/api/public/experiment'"]
+    assert re.findall(r"https?://[^'\s]+", script) == ["http://www.w3.org/2000/svg"]
+    for private in ("apca", "authorization", "api-key", "secret", "token", "alpaca"):
         assert private not in script.lower(), private
-    assert "POLL_MS = 5000" in script
-    # The latest prices are read only while the cycle's table is on screen, once a minute.
-    assert "LATEST_REFRESH_MS = 60000" in script and "new IntersectionObserver" in script
+    assert "POLL_MS = 30000" in script and "DIM_AFTER_MS" in script
+    assert "if (document.hidden || polling) return;" in script
+    assert "POLL_TIMEOUT_MS = 20000" in script and "signal: abort.signal" in script
+    assert "const TZ = 'America/New_York'" in script  # every time on the page is ET
 
 
-def test_section_headings_stand_out_and_jevs_log_scrolls_in_two_scopes():
-    """The owner, 2026-09-28: the main headings were small and not highlighted; Jev's day of
-    decisions should scroll, per cycle or per day."""
+def test_the_design_tokens_are_the_owner_approved_ones():
+    """The 2026-10-03 design: white ground, one ink, thin rules, one accent, gains and losses
+    with their sign, IBM Plex, no shadows or gradients; phone width with a 16 px gutter."""
     css = (SOURCE / "static" / "experiment.css").read_text()
-    h2 = re.search(r"\nh2 \{([^}]*)\}", css).group(1)
-    assert "600 17px" in h2 and "var(--ink)" in h2 and "uppercase" not in h2
-    head = re.search(r"\n\.block-head \{([^}]*)\}", css).group(1)
-    assert "border-top: 2px solid" in head
-    marker = re.search(r"\n\.block-head::before \{([^}]*)\}", css).group(1)
-    assert "var(--accent)" in marker and "height: 4px" in marker
-    labels = re.search(r"\nh3, \.subhead \{([^}]*)\}", css).group(1)
-    assert "uppercase" in labels and "12px" in labels  # field labels stay small uppercase
-    scroll = re.search(r"\n\.log-scroll \{([^}]*)\}", css).group(1)
-    assert "max-height: 460px" in scroll and "overflow-y: auto" in scroll
-    script = script_code()
-    for hook in ("el('div', 'log-scroll')", "box.tabIndex = 0", "box.setAttribute('role', "
-                 "'region')", "box.dataset.identity = identity", "box.scrollTop = keep",
-                 "group.setAttribute('role', 'group')",
-                 "button.setAttribute('aria-pressed', String(active === key))",
-                 "[['cycle', 'This cycle'], ['today', 'Today']]", "table(CYCLE_COLUMNS, 'cycle'",
-                 "table(DAY_RUN_COLUMNS, 'day-runs'", "awaiting Jev"):
-        assert hook in script, hook
-    html = experiment_html.render_page({"title": "t", "fixture_data": False, "data_label": None})
-    for key, title in (("live", "Positions"), ("closed", "Closed trades"),
-                       ("research", "Research"), ("jev", "Jev"), ("picks", "Latest picks"),
-                       ("past", "Performance")):
-        assert f'<div class="block-head"><h2 id="{key}-title">{title}</h2>' in html, title
-
-
-def test_an_opened_trade_is_a_keyboard_operable_disclosure_with_its_chart_and_timeline():
-    """Each trade row's coin is a button that says whether its detail row is open and which
-    row it controls; the detail holds the price chart (with a fallback line when the public
-    bars cannot be read) beside the trade's timeline."""
-    script = script_code()
-    for hook in ("el('button', 'expander')", "button.type = 'button'",
-                 "button.setAttribute('aria-expanded', String(expanded.has(key)))",
-                 "button.setAttribute('aria-controls', 'detail-' + kind + '-' + t.trade_no)",
-                 "detail.id = 'detail-' + kind + '-' + t.trade_no", "detail.hidden = true",
-                 "el('tr', 'detail-row')", "chart.dataset.chart = key",
-                 "el('ol', 'timeline')", "'price history unavailable'",
-                 "'loading price history…'", "role: 'img'", "th.scope = 'col'"):
-        assert hook in script, hook
-    css = (SOURCE / "static" / "experiment.css").read_text()
-    for rule in (":focus-visible", ".expander[aria-expanded=\"true\"]",
-                 "tr.detail-row", "@media (max-width: 640px)", "prefers-color-scheme: dark",
-                 "prefers-reduced-motion: reduce"):
+    for token in ("--bg: #FFFFFF", "--ink: #111418", "--muted: #5B6470", "--rule: #E2E5E9",
+                  "--accent: #1D4ED8", "--gain: #0B7A47", "--loss: #B42318"):
+        assert token in css, token
+    for effect in ("gradient", "box-shadow", "blur(", "text-shadow", "drop-shadow",
+                   "border-radius"):
+        assert effect not in css, effect
+    for rule in (":focus-visible", "@media (max-width: 640px)", "padding-left: 16px",
+                 ".table-wrap { overflow-x: auto;", "prefers-reduced-motion: reduce",
+                 '.status-band[data-state="HALTED"]', '.status-band[data-state="PAUSED"]',
+                 '.status-band[data-state="SOFT_LIMIT"]', '.status-band[data-state="TRADING"]'):
         assert rule in css, rule
-    for effect in ("gradient", "box-shadow", "blur(", "text-shadow", "drop-shadow"):
-        assert effect not in css, effect  # hairlines, not glows or shadows
+    script = script_code()
+    assert "(x > 0 ? '+' : MINUS)" in script  # signed figures
+
+
+def test_a_trades_own_page_has_levels_plan_story_and_no_placeholder():
+    script = script_code()
+    for hook in ("label('Levels')", "label('The plan')", "'What happened'", "'After the sale'",
+                 "label('Price')", "if (!p) return null;",
+                 "if (!a || !Array.isArray(a.points) || !a.points.length) return null;",
+                 "a.href = '/trade/' + t.trade_no", "th.scope = 'col'",
+                 "wrap.setAttribute('role', 'region')", "'role', 'img'", "View as table"):
+        assert hook in script, hook
+    for placeholder in ("[price", "[R]", "[hh:mm]", "lorem"):
+        assert placeholder not in script, placeholder
+    html = experiment_html.render_page({"title": "t", "fixture_data": False, "data_label": None},
+                                       7)
+    assert 'data-view="trade" data-trade="7"' in html and '<div id="trade-body"></div>' in html
+    main = experiment_html.render_page({"title": "t", "fixture_data": False, "data_label": None})
+    for key, title in (("equity", "Trading P&amp;L"), ("performance", "Performance"),
+                       ("open", "Open positions"), ("closed", "Closed today"),
+                       ("past", "Past days")):
+        assert f'<div class="section-head"><h2 id="{key}-title">{title}</h2>' in main, title
+    for key in ("account", "tiles", "agents"):
+        assert f'<div class="body" id="{key}-body"></div>' in main, key
 
 
 def test_the_fonts_are_self_hosted_ibm_plex_under_the_ofl(er):  # noqa: F811
@@ -418,9 +403,9 @@ def test_responses_are_cached_for_five_seconds(er, monkeypatch):  # noqa: F811
     reads = []
     real = experiment_page.read_snapshot
 
-    def counting(conn):
+    def counting(conn, *args):  # read_snapshot(conn, schedule) since package research-loop-app.
         reads.append(1)
-        return real(conn)
+        return real(conn, *args)
 
     monkeypatch.setattr(experiment_page, "read_snapshot", counting)
     app = create_experiment_app(public_url(er.database_url), environ={},
@@ -436,6 +421,74 @@ def test_responses_are_cached_for_five_seconds(er, monkeypatch):  # noqa: F811
         assert len(reads) == 2
     assert first.headers["cache-control"] == "public, max-age=5"
     assert app.state.cache.builds == 2
+
+
+def test_one_slow_build_at_a_time_and_other_requests_get_the_last_build_at_once():
+    """2026-09-29: builds took 6.5 s against the page's 5 s poll. Every waiting request found
+    the cache expired and built again, and the queue grew until the page itself stopped
+    answering. The cache now counts from the end of a build, one build runs at a time, and a
+    request meanwhile gets the last build at once."""
+    clock = [0.0]
+    second_started, release = threading.Event(), threading.Event()
+    builds = []
+
+    def build():
+        builds.append(clock[0])
+        if len(builds) == 2:
+            second_started.set()
+            assert release.wait(10)
+        clock[0] += 6.5  # the build's own time
+        return {"n": len(builds)}
+
+    cache = ReportCache(build, CACHE_SECONDS, monotonic=lambda: clock[0])
+    assert cache.get() == {"n": 1}
+    clock[0] += 4.9
+    assert cache.get() == {"n": 1} and len(builds) == 1  # 4.9 s after the build ended
+    clock[0] += 0.2
+    answers = []
+    builder = threading.Thread(target=lambda: answers.append(("builder", cache.get())))
+    builder.start()
+    assert second_started.wait(10)
+    reader = threading.Thread(target=lambda: answers.append(("reader", cache.get())))
+    reader.start()
+    reader.join(2)
+    try:
+        assert answers == [("reader", {"n": 1})]  # at once, while the second build runs
+    finally:
+        release.set()
+        builder.join(10)
+    assert answers[-1] == ("builder", {"n": 2}) and cache.builds == 2 and len(builds) == 2
+
+
+def test_a_request_waits_for_the_running_build_when_the_last_one_is_too_old():
+    """No build yet, or the last one older than the stale limit: a request waits for the
+    build that is running, and does not build again after it."""
+    clock = [0.0]
+    started, release = threading.Event(), threading.Event()
+    builds = []
+
+    def build():
+        builds.append(clock[0])
+        if len(builds) == 2:
+            started.set()
+            assert release.wait(10)
+        return {"n": len(builds)}
+
+    cache = ReportCache(build, CACHE_SECONDS, monotonic=lambda: clock[0])
+    assert cache.get() == {"n": 1}
+    clock[0] += STALE_LIMIT_SECONDS + 1
+    answers = []
+    builder = threading.Thread(target=lambda: answers.append(cache.get()))
+    builder.start()
+    assert started.wait(10)
+    reader = threading.Thread(target=lambda: answers.append(cache.get()))
+    reader.start()
+    reader.join(0.5)
+    assert reader.is_alive() and answers == []  # waiting: the last build is too old to serve
+    release.set()
+    builder.join(10)
+    reader.join(10)
+    assert answers == [{"n": 2}, {"n": 2}] and len(builds) == 2
 
 
 # --- A populated fixture ledger --------------------------------------------------------------
@@ -635,6 +688,6 @@ def test_health_reports_a_read_only_paper_surface(er):  # noqa: F811
     assert health.json() == {"status": "ok", "surface": "PUBLIC_EXPERIMENT_READ_ONLY",
                              "role": "catalyst_public", "paper_only": True,
                              "trading_enabled": False,
-                             "dashboard_version": "EXPERIMENT_DASHBOARD_V1",
+                             "dashboard_version": "EXPERIMENT_DASHBOARD_V3",
                              "fixture_data": False}
     assert health.headers["cache-control"] == "no-store"

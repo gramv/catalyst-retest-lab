@@ -20,7 +20,7 @@ met does it propose a **rule change, as a named version, for the owner to approv
    setups it ranks first, preferred distance to entry, timeframes, sources. Trading rules do not
    change daily. These rules include Jev's questions and thresholds, the system check, sizing,
    stops, the maintenance cadence and the 24-hour review.
-2. **Rule changes only as named versions** in `docs/CONTRACT-RESOLUTIONS.md`, and only after
+2. **Rule changes only as named versions** in `docs/REFERENCE-RULES.md`, and only after
    the owner approves. Trades keep the version they were admitted under, so every comparison
    stays clean.
 3. **The baselines stay.** The randomized 30% control arm (fixed stop and target, no Jev) and
@@ -240,7 +240,7 @@ since they need no approval.
 | Phase | Work | Effort |
 | --- | --- | --- |
 | **1** | `scorecard.py` and `DAILY_SCORECARD_V1` with tests; the `jobs` cron service (shadow job, replay, scorecard); private morning summary | about half a day |
-| **2** | Research context V2 `lessons`; `MUSE_RESEARCH_GUIDELINES_V6` (lessons, post-mortems, regime tag, news-date checks); the kit's `lessons` and `postmortem` steps; `docs/MUSE-CONNECTION.md` update | most of a day |
+| **2** | Research context V2 `lessons`; `MUSE_RESEARCH_GUIDELINES_V6` (lessons, post-mortems, regime tag, news-date checks); the kit's `lessons` and `postmortem` steps | most of a day |
 | **3** | `WEEKLY_REVIEW_V1` with the fixed tests and the proposal template | a few hours |
 | **4** | Daily market review (5c): the `MARKET_OUTLOOK_V1` route and its immutable record; the nightly reality measurement over the whole universe (movers, misses, calibration, factor table); Muse's why-it-moved step and research checklist in the guidelines and the kit | about a day |
 
@@ -266,3 +266,27 @@ since they need no approval.
   per-review footprint, a lower cadence, or a larger plan.
 - **Watchdog:** a status read that lands inside the half-second reconciliation pass shows
   `RECONCILIATION_STALE`. This is a false alarm to fix with the next trader deploy.
+
+## 11. Two speeds (owner, 2026-10-03; package learning-loop2)
+
+The owner asked for overall learning — how the market did, what moved, why, what we missed —
+and to adjust the strategy, with one correction: **two speeds**.
+
+- **Daily: observe and explain.** `DAILY_BRIEF_V1` (nightly, `daily_brief`): the market in words
+  (regime, BTC/ETH, breadth, sell-off hours), the movers and their sector clusters, why they
+  moved (only from accepted post-mortems; otherwise queued for an agent), what we missed and
+  whether it was knowable, whether our mechanical plug-ins would have traded each top mover and
+  at what net R after fees (`MISSED_TRADEABLE_V1`, final once the holds have passed), how our
+  picks and trades did against the market, and tomorrow's research focus. It may change only
+  research attention; agents read its sanitized view and a 7-day post-mortem queue in their
+  lessons, and every 2-hourly `update` reads the lessons (`--lessons`).
+- **Weekly: decide, propose only.** `WEEKLY_REVIEW_V1` gains `learning`
+  (`LEARNING_LOOP_WEEKLY_V1`): patterns at 10+ occurrences, strategy fit by regime (minimum 30
+  per cell), shadow vs live, the Jev calibration summary, missed-tradeable totals by regime,
+  management value by stop distance, time in trade and regime, after-exit paths, and
+  `PROPOSED_NOT_APPLIED` items. A proposal still needs a history test, a named version in
+  `docs/REFERENCE-RULES.md` and the owner's yes.
+
+Also delivered: lesson hints by net R per resolved pick (L2), after-exit paths per trade (L4),
+the management split (L6), the cloud/agent division of the post-mortem work (L7) and analytics
+on the plan's traded levels.

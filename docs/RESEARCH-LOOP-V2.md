@@ -65,55 +65,95 @@ It applies to report-V3 selections and setups while the configured schedule is V
     `INVALIDATED` revision;
   - a `RESEARCH_ADMISSION_DECLINED` for an unadmitted selection.
 - It uses the same lock and ordering as V1 (before admission, in the protection tick).
+  Built: a V3 selection is offered for admission only in a tick whose supersession pass read
+  it, so one published while a tick runs waits for the next tick. An adjusted pick therefore
+  never meets the setup it replaces at admission, where `ACTIVE_SYMBOL_ALREADY_MANAGED` would
+  decline it.
 - An adjusted pick that Jev does not select supersedes nothing: the old setup stays.
 - Setups in any other state are never touched.
 
 ### 3.3 `AGENT_RESEARCH_WITHDRAWAL_V1` (package research-loop-app)
 
 `POST /api/v1/lab/research-withdrawals`, called with the agent's own bearer token (the report
-submission auth).
+submission auth: a research-agent token, or the legacy token acting for `muse`).
 
-Body: `{"schema_version": "AGENT_RESEARCH_WITHDRAWAL_V1", "withdrawal_id": "<uuid4>",
-"agent": {"agent_id", "agent_version"}, "items": [{"symbol": "XRP/USD", "reason":
-"<1–300 chars>"}]}`, with 1–30 items and unique symbols. The body limit and rate limits are the
-report route's.
+Body, exactly these keys:
 
-Effect, per item, under the shared lock:
+```json
+{"schema_version": "AGENT_RESEARCH_WITHDRAWAL_V1", "withdrawal_id": "<UUID>",
+ "agent": {"agent_id": "muse", "agent_version": "<the agent's version>"},
+ "items": [{"symbol": "XRP/USD", "reason": "<1-300 characters>"}]}
+```
+
+- `agent` has exactly `agent_id` (the credential's) and `agent_version`, with the report
+  block's patterns. It is not the report's five-key block.
+- 1–30 items, unique symbols in the universe form (`XRP/USD`); the reason is trimmed.
+- The body limit is the report route's, 1,048,576 bytes. The report route has no app-level
+  rate limit, so neither has this one.
+
+Effect, per item, in one ledger transaction under the shared lock:
 - each of **the calling agent's own** `WATCHING` V3 setups for that symbol is revoked
   `WITHDRAWN_BY_RESEARCH` through the revoke path (one `REVOKE` keyed
-  `research:withdrawn:<withdrawal_id>:<setup_id>` with the reason and agent identity, and its
-  `INVALIDATED` revision);
+  `research:withdrawn:<withdrawal_id>:<setup_id>` with `withdrawal_id`, `withdrawal_reason`
+  and the `agent` block, and its `INVALIDATED` revision);
 - each of the agent's own unexpired, unadmitted V3 selections for that symbol gets
-  `RESEARCH_ADMISSION_DECLINED` `WITHDRAWN_BY_RESEARCH`.
+  `RESEARCH_ADMISSION_DECLINED` `WITHDRAWN_BY_RESEARCH` (the runtime's decline key, so it is
+  never offered again; no `TOPK_REPLACEMENT_V1` decision follows).
+- "Own" is the `agent` block the pick's packet recorded (in the setup record and the
+  `RESEARCH_SELECTED` packet), read as the research context reads the caller's own trades.
 
 Rules:
 - A setup in any other state (entry working, open, closing, closed), and any other agent's
-  setup, is never touched.
-- The response is 200 with one result per item: `WITHDRAWN` (with setup IDs), `NOT_WATCHING`
-  (the symbol's setup is past watching) or `NONE`.
-- A repeated `withdrawal_id` with an identical body returns the stored result. A different body
-  gets 409 `WITHDRAWAL_ID_CONFLICT`.
-- One `RESEARCH_WITHDRAWAL` event records the request. Agent identity lives in event bodies
-  only and never reaches Jev.
+  setup or selection, is never touched.
+- Admission refuses a selection declined this way (`WITHDRAWN_BY_RESEARCH`) even when it was
+  admitting it at the same moment.
+- The response is 200:
+  `{"status": "RESEARCH_WITHDRAWAL_RECORDED", "schema_version", "withdrawal_id", "agent_id",
+  "agent_version", "results", "idempotent_replay", "trade_authorized": false}`, with one result
+  per item: `{"symbol", "result", "setup_ids", "selections_declined"}`.
+  - `WITHDRAWN`: the revoked setup IDs and the number of declined selections.
+  - `NOT_WATCHING`: nothing withdrawn; the agent's live setup on that coin has left
+    `WATCHING` (entry working, open or closing). Its IDs are listed.
+  - `NONE`: nothing of the agent's for that coin.
+- A repeated `withdrawal_id` with an identical body returns the stored result
+  (`idempotent_replay: true`). A different body gets 409 `WITHDRAWAL_ID_CONFLICT`.
+- Refusals store nothing: 401 and 403 as for reports (403 `AGENT_IDENTITY_MISMATCH` when the
+  agent block is not the credential's); 413 `RESEARCH_WITHDRAWAL_TOO_LARGE`; 422
+  `INVALID_RESEARCH_WITHDRAWAL` with field paths and codes, or `SENSITIVE_EVIDENCE_REJECTED`;
+  503 `RESEARCH_WITHDRAWAL_NOT_CONFIGURED`.
+- One `RESEARCH_WITHDRAWAL` event (key `research-withdrawal:<agent_id>:<withdrawal_id>`)
+  records the request and its results. Agent identity lives in event bodies only and never
+  reaches Jev.
 - **Permission change (owner direction "cancels irrelevant ones"):** Muse may withdraw its own
   unfilled candidates. A `WATCHING` setup has no broker order, so no size, order or execution
-  effect exists; Muse's other limits are unchanged.
+  effect exists, and the route makes no broker call; Muse's other limits are unchanged.
 
 ### 3.4 Research context (package research-loop-app)
 
-- `schedule` shows `version`, and under V2 `daily`, `current_run_kind` and the kind of each of
-  `next_runs`.
-- `open_trades` already lists the caller's non-closed setups with their levels and state. Each
-  row gains `run_slot` and `watching: true|false`.
-- The context version follows the file's own convention.
+`RESEARCH_CONTEXT_V3`: every V2 field unchanged, plus:
+- `watching_setups`: the caller's own report-V3 setups whose state is `WATCHING`, by symbol;
+  `[]` when there are none and for the status credential. Each row is exactly `{"setup_id",
+  "symbol", "levels": {"entry_trigger", "max_entry_price", "stop", "target"}, "run_slot",
+  "expires_at", "signal_id"}`: levels as decimal strings, `run_slot` in the schedule's zone
+  (New York), `expires_at` RFC 3339. The owner is decided as for withdrawals.
+- `open_trades` is unchanged. It lists filled trades only (it joins the fills), so a
+  `WATCHING` setup never appears there; the design's first draft said otherwise.
+- `schedule` under V2 only: keys in the order `version` (`RESEARCH_SCHEDULE_V2`), `timezone`,
+  `runs`, `grace_minutes`, `daily`, `current_run_slot`, `current_run_kind` (`FULL` or
+  `UPDATE`), `current_run_valid_until_limit`, `next_runs` (unchanged: RFC 3339 strings) and
+  `next_run_kinds` (one kind per entry of `next_runs`). Under V1 the block is exactly V2's.
+- `current_run_slot` is the latest run at or before `as_of`. A report may answer the next run
+  within the grace instead, so the kit computes the kind of the slot it actually answers.
+- The version follows the file's own convention (V2 was V1 plus `lessons`). The kit accepts
+  V3 from package research-loop-kit on; both ship together.
 
 ### 3.5 Research kit, update mode (package research-loop-kit)
 
 `python -m research_agent.run update --profile intraday …` runs these steps:
 1. **Context.** It refuses unless the schedule is V2 and the answered slot is an `UPDATE` run.
 2. **Market** (the profile's data).
-3. **Review of the agent's own `WATCHING` setups** (from `open_trades`). Each coin's setup is
-   found again:
+3. **Review of the agent's own `WATCHING` setups** (from `watching_setups`, 3.4). Each coin's
+   setup is found again:
    - **none** → withdraw, with the first failing rule as the reason;
    - **found, but materially different** (entry trigger moved at least 0.25%, or the stop or
      target moved at least 0.5%) → an adjusted pick;

@@ -2,7 +2,7 @@
 
 2026-09-20. Evaluation protocol, not an activated selection policy or completed performance experiment.
 The initial synthetic diagnostic has now been implemented and run; see
-[measured results and remaining stages](JEV-VALIDATION-2026-09-20.md). Paper orders, model changes
+measured results and remaining stages. Paper orders, model changes
 and historical decision changes are not authorized by this document.
 
 ## Questions this must answer
@@ -129,6 +129,6 @@ run the locked prospective portfolio comparison. Evaluate second-Jev management 
 
 Current status (updated after implementation): the synthetic 60-case benchmark, frozen independent AI review,
 non-authorizing reason-bearing diagnostic and 60 real-provider evaluations are complete. A crypto matched-opportunity
-shadow ledger/evaluator is implemented. See [the bounded-run report](JEV-VALIDATION-2026-09-20.md) for measured mistakes,
+shadow ledger/evaluator is implemented. See the bounded-run report for measured mistakes,
 reference ambiguity, accounting corrections and limitations. Human-adjudicated real-case validation, prospective
 portfolio comparison, second-Jev management value and new-workflow actual fill/management acceptance remain open.

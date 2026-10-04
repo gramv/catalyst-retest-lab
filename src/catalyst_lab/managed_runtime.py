@@ -27,13 +27,22 @@ from pathlib import Path
 from uuid import uuid4
 
 from catalyst_lab import (
+    ai_mode,
+    coinbase_feed,
+    coinbase_trigger,
     crypto_holding,
     crypto_maintenance,
     crypto_trigger,
     day_review,
+    execution_setting,
     gap_resume,
     jev_budget,
+    regime_gate,
     stale_print,
+    stop_breach,
+    strategies,
+    strategy_paper,
+    trade_plan,
 )
 from catalyst_lab.alpaca import (
     CRYPTO_STREAM_ENDPOINT,
@@ -76,20 +85,28 @@ from catalyst_lab.position_monitor import (
     MANAGEMENT_REVIEWS_ENABLED,
     MANAGEMENT_REVIEWS_SETTINGS,
 )
+from catalyst_lab.public_crypto_bars import PublicCryptoBarReader
 from catalyst_lab.repository import json_safe
 from catalyst_lab.research_selection_topk import TOPK_POLICIES
 from catalyst_lab.runtime import WIRE_LOG
-from catalyst_lab.system_check import PERMANENT_REFUSALS as V3_PERMANENT_REFUSALS
+from catalyst_lab.selection_facts_v3 import ComparisonFacts
 from catalyst_lab.system_check import (
+    ADMISSION_DECLINED_KEY,
+    NOT_REPLACED,
     SUPERSEDED_BY_NEW_RESEARCH,
     SUPERSESSION_VERSION,
+    SUPERSESSION_VERSION_V2,
     AdmissionRefused,
     LivePriceReader,
     LivePriceUnavailable,
     is_v3_packet,
+    newer_v3_selections,
     newest_v3_run_slot,
     run_slot_of,
+    superseding_run_slot,
+    supersession_version,
 )
+from catalyst_lab.system_check import PERMANENT_REFUSALS as V3_PERMANENT_REFUSALS
 
 # A lost executor lease ends the process with this status (sysexits EX_TEMPFAIL), so the
 # supervisor (launchd KeepAlive SuccessfulExit=false, through the private launcher) starts a
@@ -143,7 +160,8 @@ def engineering_runtime_policy():
 
 
 _FAILURE_CODE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
-ADMISSION_DECLINED_KEY = "research:admission-declined:"
+# ADMISSION_DECLINED_KEY ("research:admission-declined:") is system_check's, shared with the
+# research withdrawals (package research-loop-app).
 # Refusals the same stored selection can never overcome: its packet, receipts and
 # research rows are immutable and time only moves forward. Every other refusal (halts,
 # pending exits, the crypto entry window, an actively managed symbol, database or
@@ -195,12 +213,17 @@ PERMANENT_ADMISSION_REFUSALS = frozenset(
         "TOPK_RANKING_BINDING_FAILURE",
         "TOPK_SCORE_MISMATCH",
         "TOPK_VETOED",
+        # lab.managed_review_failure_topk_v3, migration 030 (JEV_TOP_K_SELECTION_V3)
+        "TOPK_BELOW_THRESHOLD",
+        "TOPK_COMPARISON_BINDING_FAILURE",
     }
 )
 
 # Package system-check (plan phase 3a, 2026-09-27; system_check.py): the report-V3 system
 # check's refusals (STOP_DISTANCE_BELOW_MINIMUM, PRICE_MISMATCH, STOP_ALREADY_HIT,
 # BREAKOUT_NOT_ENABLED) and SUPERSEDED_BY_NEW_RESEARCH. LIVE_PRICE_UNAVAILABLE stays transient.
+# Package research-loop-app: WITHDRAWN_BY_RESEARCH, a selection its agent withdrew while it
+# was being admitted (already declined by the withdrawal, so declining again writes nothing).
 PERMANENT_ADMISSION_REFUSALS = PERMANENT_ADMISSION_REFUSALS | V3_PERMANENT_REFUSALS
 
 # Package replacement (plan phase 3b, 2026-09-27). The broker price-grid refusals are final for
@@ -219,21 +242,28 @@ TOPK_PERMANENT_ADMISSION_REFUSALS = TOPK_PERMANENT_ADMISSION_REFUSALS | {
     "ACTIVE_SYMBOL_ALREADY_MANAGED",
 }
 REPLACEMENT_FAULT_EVENT = "RUNTIME_REPLACEMENT_FAULT"
+# STRATEGY_PAPER_PATH_V1 (package plugin-c3): how often the signal pass looks for a new hour.
+STRATEGY_SIGNAL_SECONDS = 60
 
 
 def permanent_refusal(packet, reason):
     """Whether a selection refused with ``reason`` is declined (never offered again)."""
+    if strategies.is_signal_packet(packet):
+        # STRATEGY_PAPER_PATH_V1 (package plugin-c3): a marketable signal has no later entry, so
+        # every final code of a top-K pick, and the strategy path's own, declines it.
+        return reason in TOPK_PERMANENT_ADMISSION_REFUSALS | strategy_paper.PERMANENT_REFUSALS
     if packet.get("selection_policy") in TOPK_POLICIES:
         return reason in TOPK_PERMANENT_ADMISSION_REFUSALS
     return reason in PERMANENT_ADMISSION_REFUSALS
 
 
 def replaces_on_decline(packet, reason, research):
-    """TOPK_REPLACEMENT_V1 applies: a top-K selection declined for anything but supersession
-    (the run is over), with a research cycle that can decide its replacement."""
+    """TOPK_REPLACEMENT_V1 (V2 for a cycle accepted under RESEARCH_SCHEDULE_V2) applies: a
+    top-K selection declined for anything but supersession (the run is over) or its agent's
+    withdrawal, with a research cycle that can decide its replacement."""
     return (
         packet.get("selection_policy") in TOPK_POLICIES
-        and reason != SUPERSEDED_BY_NEW_RESEARCH
+        and reason not in NOT_REPLACED
         and callable(getattr(research, "replace_declined", None))
     )
 
@@ -257,16 +287,80 @@ def decline_selection(store, research, body, key):
         return decline, research.replace_declined(conn, decline)
 
 
+def research_v3(packet):
+    """A report-V3 research pick: the packets run supersession reads. A promoted strategy's
+    signal (STRATEGY_PAPER_PATH_V1) carries the report-V3 packet shape but answers no research
+    run, so it neither supersedes nor is superseded."""
+    return is_v3_packet(packet) and not strategies.is_signal_packet(packet)
+
+
+# The streams' session clock (a module name, so a test can stand in for it).
+_monotonic = time.monotonic
+
+
+def reconnect_wait(previous, session_seconds, policy):
+    """The wait before the next stream connection: the policy's first wait
+    (``reconnect_seconds``) after a session that stayed up at least ``max_reconnect_seconds``,
+    so only drops in a row keep doubling it; else ``previous``. (Until 2026-09-29 it never
+    reset, so a process that had seen five drops waited the 30-second cap after every drop.)"""
+    if session_seconds >= policy.max_reconnect_seconds:
+        return policy.reconnect_seconds
+    return previous
+
+
 def failure_code(exc):
     """The exception's own UPPER_SNAKE code, else its class name; free text is never kept."""
     text = str(exc)
     return text if len(text) <= 80 and _FAILURE_CODE.fullmatch(text) else type(exc).__name__
 
 
+def close_codes(exc):
+    """``WS_CLOSED_<received>_<sent>`` for a closed WebSocket (websockets' ``ConnectionClosed``
+    keeps both close frames, each with its code; NONE when absent), else None: a keepalive
+    timeout of ours reads ``WS_CLOSED_NONE_1011``, a close by the provider carries its code."""
+    if not hasattr(exc, "rcvd") or not hasattr(exc, "sent"):
+        return None
+    codes = []
+    for frame in (exc.rcvd, exc.sent):
+        code = getattr(frame, "code", None)
+        codes.append(str(code) if type(code) is int and 0 <= code < 10000 else "NONE")
+    return "WS_CLOSED_" + "_".join(codes)
+
+
+def _run_slot_or_none(record):
+    """A V3 record's aware ``run_slot``, or None when it has none (admission refuses such a
+    packet for good, APP_REVIEWED_PACKET_REQUIRED)."""
+    try:
+        slot = run_slot_of(record)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return slot if slot.tzinfo is not None else None
+
+
 # The gap every startup records for both markets; for CRYPTO_GAP_RESUME_V1 its window starts at
 # the previous runtime's last recorded observation of the market (package gap-resume).
 RESTART_GAP_REASON = "RUNTIME_RESTART_REQUIRES_FRESH_OBSERVATION"
+# Alpaca stamps each stream message on its own servers, and this container's clock can run a
+# little behind them: a message stamped up to this long after our clock is still current. Beyond
+# it the message is refused as before (INVALID_MARKET_TIMESTAMP ends the session). 2026-09-29:
+# with no tolerance the crypto stream was dropped 18 times in 22 minutes from 17:06 UTC and no
+# entry could confirm. The Coinbase reference feed allows the same (CLOCK_TOLERANCE_SECONDS).
+MARKET_CLOCK_TOLERANCE_SECONDS = 3
 GAP_STATUS_LIMIT = 50  # Held setups listed in the status (the count is always complete).
+# CRYPTO_STREAM_CAPACITY_V1 (2026-09-29). Alpaca serves at most 30 trade and quote channels on
+# one market-stream connection, and every coin takes both, so the crypto stream carries at most
+# 15 coins. A subscribe beyond that is answered with an error message (405, symbol limit
+# exceeded), and any error message ends the session: at 23:13 UTC one request widening the
+# subscription from 13 to 19 coins stopped the data of all 13, every 30 s. The stream plan
+# (``ManagedRuntime._stream_plan``) keeps every active setup's coin, and holds back the offered
+# picks that do not fit until a slot frees up.
+CRYPTO_STREAM_CAPACITY_VERSION = "CRYPTO_STREAM_CAPACITY_V1"
+# Frames the market stream's connection buffers (2026-09-30). With 64, a reader that fell behind
+# stopped reading the socket, the keepalive's pong went unread and the connection closed about
+# 40 s later: the crypto stream dropped every 45-100 s from 12:30 UTC, when quote traffic rose,
+# while the Coinbase feed (MAX_QUEUE 1024, for the same reason) stayed up.
+MARKET_STREAM_MAX_QUEUE = 1024
+CRYPTO_STREAM_SYMBOL_CAPACITY = 15
 
 
 @dataclass
@@ -304,6 +398,20 @@ class GapCheck:
             "stream_back_at": self.stream_back_at.isoformat() if self.stream_back_at else None,
             "due_at": due.isoformat() if due else None,
         }
+
+
+class MarketStreamProviderError(ValueError):
+    """An ``error`` message from the market stream's provider. ``str()`` stays
+    MARKET_STREAM_PROVIDER_ERROR (the gap's reason). ``code`` keeps only the provider's numeric
+    code, as ``ALPACA_STREAM_<n>`` like ``runtime.MarketRuntime``, never its message text: the
+    number is what tells a symbol limit (405) from a connection limit (406) or a refused
+    subscription (410)."""
+
+    def __init__(self, frame):
+        super().__init__("MARKET_STREAM_PROVIDER_ERROR")
+        number = frame.get("code")
+        self.code = (f"ALPACA_STREAM_{number}" if type(number) is int and 0 <= number < 10000
+                     else "ALPACA_STREAM_ERROR")
 
 
 class ManagedRuntime:
@@ -363,6 +471,10 @@ class ManagedRuntime:
         # JEV_SPEND_GUARD_V1 (package jev-budget): the monthly Jev budget's meter and tier, for
         # the status (``jev_budget``); the maintenance component asks the same guard.
         self.spend_guard = spend_guard
+        # STRATEGY_PAPER_PATH_V1 (package plugin-c3): the promoted strategies' hourly signal pass
+        # (``strategy_paper.StrategySignalSource``); None unless MANAGED_STRATEGIES_JSON lists
+        # one. Set by the factory after construction, before ``start``.
+        self.strategy_source = None
         # Bitcoin's last 15 minutes from the authenticated crypto stream (the 3% shock trigger),
         # subscribed while a maintained setup is active.
         self.benchmark = crypto_maintenance.BenchmarkWindow()
@@ -419,6 +531,10 @@ class ManagedRuntime:
         # Report-V3 system check (package system-check): the stream observation, else one
         # bounded REST latest-quote read through this runtime's market source.
         self.live_prices = LivePriceReader(market_source, clock=clock)
+        # CRYPTO_TRADE_PLAN_V1 (package trade-plan): the coin's hourly range for admission, one
+        # bounded GET of 1-hour bars spending this tick's market-data read budget.
+        self.hourly_ranges = trade_plan.HourlyRangeReader(
+            market_source, clock=clock, spend=self.live_prices.spend_read)
         # CRYPTO_ALPACA_TRIGGER_V1 (package crypto-trigger): when each stream quote was received
         # (freshness by read time; kept apart from the observation rows, which MARKET_PRINT
         # records, so every other setup's records are unchanged) and the waits this runtime
@@ -433,6 +549,25 @@ class ManagedRuntime:
         self._gap_bounds = {}
         self._unobserved = {}
         self._gap_generation = {"US": 0, "CRYPTO": 0}
+        # RESEARCH_RUN_SUPERSESSION_V2 (package research-loop-app): the V3 selections this
+        # tick's supersession pass read, the only V3 selections admission may take this tick;
+        # None under V1, which never defers one.
+        self._supersession_checked = None
+        # CRYPTO_COINBASE_TRIGGER_V1 / CRYPTO_STOP_BREACH_V3: the Coinbase products the reference
+        # feed serves, as (monotonic time, products) of their last read (at most one a second),
+        # and since when one of them has not been healthy (the watchdog's
+        # REFERENCE_FEED_UNHEALTHY).
+        self._reference_wanted = None
+        self._reference_unhealthy_since = None
+        # CRYPTO_STREAM_CAPACITY_V1: the offered selections whose capacity wait this runtime
+        # recorded, so a lasting wait costs no ledger write each tick.
+        self._capacity_waits = set()
+
+    @property
+    def reference_feed(self):
+        """Coinbase's public feed (``coinbase_feed.CoinbaseFeed``), the one the execution reads
+        for its admissions and stop breaches; None without it."""
+        return getattr(self.execution, "reference_feed", None)
 
     @property
     def error(self):
@@ -575,6 +710,8 @@ class ManagedRuntime:
         trade_maintenance = self._maintenance_status(active)
         day_reviews = self._day_review_status(active)
         jev_budget_status = self._jev_budget_status()
+        reference_feed = self._reference_status()
+        crypto_stream = self._crypto_stream_status()
         with self.lock:
             return {
                 "runtime_id": self.runtime_id,
@@ -602,6 +739,17 @@ class ManagedRuntime:
                 # CRYPTO_GAP_RESUME_V1: setups held for their gap check, and each market's
                 # observation as of one instant (the next runtime's restart window).
                 "gap_resume": self._gap_resume_status(),
+                # CRYPTO_COINBASE_TRIGGER_V1 / CRYPTO_STOP_BREACH_V3: Coinbase's public feed.
+                "reference_feed": reference_feed,
+                # CRYPTO_STREAM_CAPACITY_V1: the coins the crypto stream wants, its capacity and
+                # the offered picks held back until a slot frees up.
+                "crypto_stream": crypto_stream,
+                # STRATEGY_PAPER_PATH_V1 (package plugin-c3), only when a strategy is configured.
+                **({"strategy_paper": {
+                    "version": strategy_paper.PATH_VERSION,
+                    "strategies": list(self.strategy_source.strategy_ids),
+                    "last_pass": dict(self.strategy_source.last)}}
+                   if self.strategy_source is not None else {}),
                 "trade_updates_connected": self.connected,
                 "research_healthy": self.research_healthy,
                 "jev_breaker": jev_breaker,
@@ -655,6 +803,43 @@ class ManagedRuntime:
             "overdue_after_seconds": gap_resume.CHECK_OVERDUE_SECONDS,
             "pending": [check.public() for check in held[:GAP_STATUS_LIMIT]],
         }
+
+    def _reference_status(self):
+        """The Coinbase reference feed's status (``None`` without the feed; ``available: false``
+        when it cannot be read), with the products the setups and offered picks need
+        (``wanted``, as the feed loop last read them) and since when one of them has not been
+        healthy (``unhealthy_since``; the watchdog raises REFERENCE_FEED_UNHEALTHY after 300 s)."""
+        feed = self.reference_feed
+        if feed is None:
+            return None
+        now = self.now()
+        try:
+            status = feed.status(now)
+        except Exception:
+            return {"provider": coinbase_feed.PROVIDER, "available": False}
+        wanted = sorted(self._reference_wanted[1]) if self._reference_wanted else []
+        failing = set(wanted) - set(status.get("healthy") or ())
+        with self.lock:
+            if not failing:
+                self._reference_unhealthy_since = None
+            elif self._reference_unhealthy_since is None:
+                self._reference_unhealthy_since = now
+            since = self._reference_unhealthy_since
+        return {**status, "available": True, "wanted": wanted,
+                "unhealthy_since": since.isoformat() if since is not None else None}
+
+    def _crypto_stream_status(self):
+        """CRYPTO_STREAM_CAPACITY_V1's status: ``wanted``, the number of coins the crypto
+        stream's plan subscribes, against ``capacity``, and ``held_back``, the offered picks'
+        coins that wait for a slot (selection order). ``available: false`` when the plan cannot
+        be read."""
+        section = {"version": CRYPTO_STREAM_CAPACITY_VERSION,
+                   "capacity": CRYPTO_STREAM_SYMBOL_CAPACITY}
+        try:
+            wanted, held_back = self._stream_plan("CRYPTO")
+        except Exception:
+            return {**section, "available": False}
+        return {**section, "wanted": len(wanted), "held_back": held_back}
 
     def _maintenance_status(self, active):
         """The maintenance component's status (``None`` without one; ``available: false`` when
@@ -713,6 +898,9 @@ class ManagedRuntime:
                 AND NOT EXISTS(SELECT 1 FROM lab.managed_setups s WHERE s.receipt_id IS NULL
                     AND s.record_json->>'enrollment_event_seq'
                         =e.body->'packet'->>'enrollment_event_seq')
+                AND NOT EXISTS(SELECT 1 FROM lab.managed_setups s WHERE s.receipt_id IS NULL
+                    AND s.record_json->>'signal_event_seq'
+                        =e.body->'packet'->>'signal_event_seq')
                 AND NOT EXISTS(SELECT 1 FROM lab.managed_events d
                     WHERE d.idempotency_key=%s||e.event_seq::text)
                 ORDER BY e.event_seq LIMIT 30""",
@@ -732,6 +920,21 @@ class ManagedRuntime:
         else:
             self.latches.note_audit_success()
         return True
+
+    def _stream_capacity_wait(self, packet):
+        """CRYPTO_STREAM_CAPACITY_V1: a pick the crypto stream holds back is not admitted; one
+        CRYPTO_STREAM_CAPACITY_WAIT per selection records it. It is admitted as usual once a
+        slot frees up, and expires as before otherwise."""
+        seq = packet.get("selection_event_seq")
+        if seq in self._capacity_waits:
+            return
+        if self._audit_once(
+            "CRYPTO_STREAM_CAPACITY_WAIT",
+            {"version": CRYPTO_STREAM_CAPACITY_VERSION, "symbol": packet["symbol"],
+             "capacity": CRYPTO_STREAM_SYMBOL_CAPACITY, "selection_event_seq": seq},
+            f"stream-capacity:{seq}",
+        ):
+            self._capacity_waits.add(seq)
 
     def _admission_refused(self, packet, exc):
         """Audit a refusal once per runtime, selection and reason; decline permanent ones.
@@ -860,7 +1063,9 @@ class ManagedRuntime:
         candidates = [
             setup for setup in active
             if (setup.get("state") or {}).get("state") == "WATCHING"
-            and crypto_trigger.active(setup.get("state"))
+            # CRYPTO_COINBASE_TRIGGER_V1 too (``_evaluate_reference_trigger``).
+            and (crypto_trigger.active(setup.get("state"))
+                 or coinbase_trigger.active(setup.get("state")))
             # CRYPTO_GAP_RESUME_V1: a setup held for its gap check is not evaluated at all.
             and not self._gap_pending(setup["setup_id"])
         ]
@@ -873,7 +1078,10 @@ class ManagedRuntime:
             if not self._market_ready(setup["market"], setup["symbol"]):
                 continue
             try:
-                self._evaluate_quote_trigger(setup)
+                if coinbase_trigger.active(setup["state"]):
+                    self._evaluate_reference_trigger(setup)
+                else:
+                    self._evaluate_quote_trigger(setup)
             except Exception as exc:
                 self._record_failure(
                     tick, "TRIGGER", TRIGGER_SCOPE, exc, setup_id=setup["setup_id"]
@@ -910,6 +1118,130 @@ class ManagedRuntime:
         if noted is not None:
             self._trigger_waits[noted] = minute
 
+    # --- CRYPTO_COINBASE_TRIGGER_V1 and CRYPTO_STOP_BREACH_V3 (Coinbase as the reference) ------
+
+    def _evaluate_reference_trigger(self, setup):
+        """CRYPTO_COINBASE_TRIGGER_V1 (coinbase_trigger.py), every protection tick.
+
+        The coin's Coinbase view alone decides whether anything happened: a stop (invalidated
+        whatever the runtime's readiness, a ledger write only), an unhealthy feed (a wait) or a
+        touch. Only a touch reads Alpaca's freshest quote (the tick's shared reader, by read
+        time) for the confirmation; nothing is read or written without one. A wait or a
+        confirmed touch goes to ``observe_trigger`` only while entries are ready and outside a
+        capacity cooldown, a wait at most once per setup, reason and minute (as V1)."""
+        state, now = setup["state"], self.now()
+        admitted = datetime.fromisoformat(state["admitted_at"])
+        levels = {k: Decimal(str(v)) for k, v in setup["record_json"]["levels"].items()}
+        view = coinbase_feed.read_view(
+            self.reference_feed,
+            state.get("reference_product") or coinbase_feed.product_id(setup["symbol"]), now)
+        reference = coinbase_trigger.reference_record(view, levels, admitted_at=admitted, now=now)
+        first = coinbase_trigger.reference_verdict(levels, reference, now=now,
+                                                   admitted_at=admitted)
+        if first.outcome == crypto_trigger.NO_TOUCH:
+            return
+        if first.outcome == coinbase_trigger.TOUCH:
+            quote, attempts, row, received = self._crypto_trigger_quote(setup["symbol"])
+            observed = coinbase_trigger.observation(
+                reference=reference, quote=quote, row=row, received_at=received, attempts=attempts)
+        else:
+            observed = coinbase_trigger.observation(reference=reference)
+        verdict = coinbase_trigger.evaluate(levels, observed, now=now, admitted_at=admitted)
+        if verdict.outcome == crypto_trigger.INVALIDATE:
+            self.execution.observe_trigger(setup["setup_id"], observed)
+            return
+        if verdict.outcome not in {crypto_trigger.CONFIRM, crypto_trigger.WAIT}:
+            return
+        if not self.ready():
+            return
+        until = state.get("capacity_deferred_until")
+        if until and now < datetime.fromisoformat(until):
+            return
+        noted = minute = None
+        if verdict.outcome == crypto_trigger.WAIT:
+            noted = (str(setup["setup_id"]), verdict.reason)
+            minute = now.astimezone(UTC).replace(second=0, microsecond=0)
+            if self._trigger_waits.get(noted) == minute:
+                return
+        self.execution.observe_trigger(setup["setup_id"], observed)
+        if noted is not None:
+            self._trigger_waits[noted] = minute
+
+    def _reference_admission_ready(self, packet):
+        """A pick admitted under CRYPTO_COINBASE_TRIGGER_V1 waits until Coinbase's feed is healthy
+        for its coin (subscription acknowledged on every channel, a current heartbeat), besides
+        the Alpaca stream. Every other pick, and every pick without the feed, is unaffected."""
+        feed = self.reference_feed
+        if feed is None or not coinbase_trigger.applies(packet):
+            return True
+        try:
+            return feed.health(coinbase_feed.product_id(packet["symbol"]), self.now())[0] is True
+        except Exception:
+            return False
+
+    def _reference_products(self):
+        """The Coinbase products the feed serves: each active crypto setup of the Coinbase
+        versions and each offered pick CRYPTO_COINBASE_TRIGGER_V1 will admit. Read at most once
+        a second; a failed read keeps the last products (the subscriptions stay)."""
+        clock, cached = _monotonic(), self._reference_wanted
+        if cached is not None and 0 <= clock - cached[0] < self.policy.market_poll_seconds:
+            return cached[1]
+        try:
+            products = {
+                s["state"].get("reference_product") or coinbase_feed.product_id(s["symbol"])
+                for s in self.execution.store.active()
+                if s["market"] == "CRYPTO" and (
+                    coinbase_trigger.active(s["state"]) or stop_breach.active_v3(s["state"]))
+            } | {
+                coinbase_feed.product_id(p["symbol"]) for p in self._selected_packets()
+                if coinbase_trigger.applies(p)
+            }
+            products = frozenset(p for p in products if p is not None)
+        except Exception:
+            products = cached[1] if cached is not None else frozenset()
+        self._reference_wanted = (clock, products)
+        return products
+
+    def _reference_connected(self, products, refused):
+        self._event("RUNTIME_REFERENCE_CONNECTED", {
+            "provider": coinbase_feed.PROVIDER, "channels": list(coinbase_feed.CHANNELS),
+            "products": list(products), "refused": refused})
+
+    def _reference_stream_loop(self):
+        """Coinbase's public feed while any setup or offered pick reads it, reconnected with the
+        Alpaca streams' bounded backoff (``reconnect_wait``). A session that fails records
+        RUNTIME_REFERENCE_GAP with its code; meanwhile the coins' products are unhealthy, so
+        their entries wait and their stop breaches fall back to CRYPTO_STOP_BREACH_V2's
+        evidence."""
+        backoff = self.policy.reconnect_seconds
+        while not self.stop_event.is_set():
+            if not self._reference_products():
+                self.stop_event.wait(self.policy.market_poll_seconds)
+                continue
+            started, code = _monotonic(), None
+            try:
+                ended = self.reference_feed.session(
+                    wanted=self._reference_products, stop_event=self.stop_event,
+                    open_timeout=self.policy.stream_open_timeout_seconds,
+                    read_timeout=self.policy.stream_read_timeout_seconds,
+                    on_acknowledged=self._reference_connected,
+                )
+            except Exception as exc:
+                ended, code = "REFERENCE_FEED_DISCONNECTED", failure_code(exc)
+            if self.stop_event.is_set():
+                break
+            if ended == coinbase_feed.NOTHING_WANTED:
+                backoff = self.policy.reconnect_seconds
+                continue
+            body = {"provider": coinbase_feed.PROVIDER, "reason": ended}
+            if code is not None:
+                body["code"] = code
+            self._event("RUNTIME_REFERENCE_GAP", body)
+            backoff = reconnect_wait(backoff, _monotonic() - started, self.policy)
+            if self.stop_event.wait(backoff):
+                break
+            backoff = min(backoff * 2, self.policy.max_reconnect_seconds)
+
     def _retire_superseded_research(self, tick=None):
         """RESEARCH_RUN_SUPERSESSION_V1 (plan 4.4, package system-check), every tick.
 
@@ -922,14 +1254,19 @@ class ManagedRuntime:
         read from the ledger only while a V3 setup watches or a V3 selection waits, so a tick
         without V3 work adds no ledger read. A failure latches entries like a failed market-gap
         revocation; protection still runs.
+
+        While the configured schedule is RESEARCH_SCHEDULE_V2, RESEARCH_RUN_SUPERSESSION_V2
+        decides instead (``_retire_superseded_v2``, package research-loop-app).
         """
+        if supersession_version(self._research_schedule()) == SUPERSESSION_VERSION_V2:
+            return self._retire_superseded_v2(tick)
         try:
             watching = [
                 setup for setup in self.execution.store.active()
                 if (setup.get("state") or {}).get("state") == "WATCHING"
-                and is_v3_packet(setup.get("record_json"))
+                and research_v3(setup.get("record_json"))
             ]
-            pending = [packet for packet in self._selected_packets() if is_v3_packet(packet)]
+            pending = [packet for packet in self._selected_packets() if research_v3(packet)]
             if not watching and not pending:
                 return
             with self.execution.repo.connect() as conn:
@@ -962,6 +1299,88 @@ class ManagedRuntime:
             if superseded:
                 self._decline(packet, packet["selection_event_seq"], SUPERSEDED_BY_NEW_RESEARCH,
                               {"run_slot": packet["run_slot"], **evidence})
+
+    def _research_schedule(self):
+        """``MANAGED_RESEARCH_SCHEDULE_JSON`` as the app configured it on the execution (None
+        when absent, and in fixtures without one)."""
+        return getattr(self.execution, "research_schedule", None)
+
+    def _retire_superseded_v2(self, tick=None):
+        """RESEARCH_RUN_SUPERSESSION_V2 (docs/RESEARCH-LOOP-V2.md 3.2, package
+        research-loop-app), every tick while the configured schedule is RESEARCH_SCHEDULE_V2.
+
+        V1's pass with V2's rule: a V3 setup still WATCHING, or a V3 selection still offered
+        for admission, that answers run ``r`` is retired only when a published V3 selection of a
+        later run is from a full run (any symbol) or is for the same symbol (any run kind;
+        ``system_check.superseding_run_slot``). Everything else stays until its own expiry, so
+        an adjusted pick Jev does not select supersedes nothing. The same revoke path, keys,
+        decline and ordering as V1, recording ``supersession_rule`` V2. The selections read
+        are only those whose run is later than the oldest watched or offered one.
+
+        Only the V3 selections this pass read may be admitted in this tick
+        (``_supersession_checked``): one published while the tick runs waits for the next
+        pass, so an adjusted pick never meets the setup it replaces at admission (where
+        ACTIVE_SYMBOL_ALREADY_MANAGED would decline it). A failure admits no V3 selection.
+        """
+        schedule = self._research_schedule()
+        self._supersession_checked = frozenset()
+        try:
+            watching = [
+                setup for setup in self.execution.store.active()
+                if (setup.get("state") or {}).get("state") == "WATCHING"
+                and research_v3(setup.get("record_json"))
+            ]
+            pending = [packet for packet in self._selected_packets() if research_v3(packet)]
+            if not watching and not pending:
+                return
+            slots = [slot for slot in (_run_slot_or_none(record) for record in (
+                *(setup["record_json"] for setup in watching), *pending)) if slot is not None]
+            newer = []
+            if slots:
+                with self.execution.repo.connect() as conn:
+                    newer = newer_v3_selections(conn, min(slots))
+        except Exception as exc:
+            self._record_failure(tick, "TRIGGER", TRIGGER_SCOPE, exc)
+            return
+        for setup in watching:
+            try:
+                record = setup["record_json"]
+                newest = superseding_run_slot(schedule, run_slot_of(record), setup["symbol"],
+                                              newer)
+                if newest is not None:
+                    self.execution.revoke(
+                        setup["setup_id"], SUPERSEDED_BY_NEW_RESEARCH, watching_only=True,
+                        details={"run_slot": record["run_slot"],
+                                 "superseded_by_run_slot": newest.isoformat(),
+                                 "supersession_rule": SUPERSESSION_VERSION_V2},
+                        key=f"research:superseded:setup:{setup['setup_id']}",
+                    )
+            except Exception as exc:
+                self._record_failure(
+                    tick, "TRIGGER", TRIGGER_SCOPE, exc, setup_id=setup["setup_id"]
+                )
+        checked = []
+        for packet in pending:
+            try:
+                newest = superseding_run_slot(schedule, run_slot_of(packet), packet["symbol"],
+                                              newer)
+            except (KeyError, TypeError, ValueError):
+                newest = None  # Admission refuses it for good (APP_REVIEWED_PACKET_REQUIRED).
+            if newest is None:
+                checked.append(packet["selection_event_seq"])
+                continue
+            self._decline(packet, packet["selection_event_seq"], SUPERSEDED_BY_NEW_RESEARCH,
+                          {"run_slot": packet["run_slot"],
+                           "superseded_by_run_slot": newest.isoformat(),
+                           "supersession_rule": SUPERSESSION_VERSION_V2})
+        self._supersession_checked = frozenset(checked)
+
+    def _admission_due(self, packet):
+        """Whether admission may take ``packet`` in this tick: always, except a V3 selection
+        that this tick's RESEARCH_RUN_SUPERSESSION_V2 pass did not read (next tick)."""
+        checked = self._supersession_checked
+        return checked is None or not research_v3(packet) or (
+            packet["selection_event_seq"] in checked)
 
     def reconcile_once(self):
         with self.reconcile_lock:
@@ -1042,19 +1461,47 @@ class ManagedRuntime:
             )
 
     def _desired_symbols(self, market):
+        return self._stream_plan(market)[0]
+
+    def _stream_plan(self, market, packets=None):
+        """``(wanted, held_back)``: the symbols ``market``'s stream subscribes, and the offered
+        picks' symbols it holds back (selection order, each once). ``packets`` is the caller's
+        ``_selected_packets()`` read, so a tick reads it once; None reads it here.
+
+        US: every active setup's and offered pick's symbol; nothing is held back.
+        CRYPTO (CRYPTO_STREAM_CAPACITY_V1): every active setup's coin always, and Bitcoin while
+        a maintained setup is active, even beyond the capacity (after this version they cannot
+        exceed it: admission needs an acknowledged subscription). Then the offered picks in
+        selection order while the plan stays within CRYPTO_STREAM_SYMBOL_CAPACITY; one slot is
+        kept for Bitcoin while it is not wanted (admitting a maintained pick adds it), and a pick
+        for a coin already wanted takes no slot. The others are held back.
+        """
         label = "US_STOCKS" if market == "US" else market
         active = self.execution.store.active()
-        wanted = {s["symbol"] for s in active if s["market"] == label} | {
-            p["symbol"] for p in self._selected_packets() if p["market"] == label
-        }
-        if market == "CRYPTO" and any(crypto_maintenance.active(s["state"]) for s in active):
+        offered = [p["symbol"] for p in (
+            self._selected_packets() if packets is None else packets) if p["market"] == label]
+        wanted = {s["symbol"] for s in active if s["market"] == label}
+        if market != "CRYPTO":
+            return wanted | set(offered), []
+        if any(crypto_maintenance.active(s["state"]) for s in active):
             # CRYPTO_MAINTENANCE_V1: Bitcoin's price feeds the 3%-in-15-minutes shock trigger,
             # with or without a Bitcoin trade.
             wanted.add(crypto_maintenance.BENCHMARK_SYMBOL)
-        return wanted
+        held_back = []
+        for symbol in offered:
+            if symbol in wanted or symbol in held_back:
+                continue
+            bitcoin_wanted = crypto_maintenance.BENCHMARK_SYMBOL in (wanted | {symbol})
+            if len(wanted) + (1 if bitcoin_wanted else 2) <= CRYPTO_STREAM_SYMBOL_CAPACITY:
+                wanted.add(symbol)
+            else:
+                held_back.append(symbol)
+        return wanted, held_back
 
-    def market_gap(self, market, reason):
-        # Invalidate queued work immediately; the execution lane records setup revocations.
+    def market_gap(self, market, reason, *, code=None):
+        """Invalidate queued work immediately; the execution lane records setup revocations.
+        ``code`` is the sanitized failure code of the stream session that ended on an error
+        (``failure_code``); the gap event carries it beside ``reason`` (package ops-alarms)."""
         now = self.now()
         # CRYPTO_GAP_RESUME_V1: where a held setup's unobserved window starts. At startup that
         # is the previous runtime's last recorded observation of the market (from the ledger).
@@ -1077,7 +1524,13 @@ class ManagedRuntime:
             self._unobserved.setdefault(market, bound)
         if market == "CRYPTO":
             self.benchmark.reset()  # The missing interval cannot be reconstructed.
-        self._event("RUNTIME_MARKET_GAP", {"market": market, "reason": reason})
+            pacing = getattr(self.execution, "entry_pacing", None)
+            if pacing is not None:
+                pacing.refresh_due()  # CRYPTO_ENTRY_PACING_V1: re-seed from bars at once.
+        body = {"market": market, "reason": reason}
+        if code is not None:
+            body["code"] = code
+        self._event("RUNTIME_MARKET_GAP", body)
 
     def _restart_bound(self, market, now):
         """``(bound, basis)``: the previous runtime's last recorded observation of ``market``
@@ -1271,6 +1724,24 @@ class ManagedRuntime:
         except Exception as exc:
             return (), (failure_code(exc),)
 
+    def _refresh_entry_pacing(self):
+        """CRYPTO_ENTRY_PACING_V1: seed the market window from completed one-minute bars (the
+        same read-only ``window_bars`` route as the gap check), at most once a minute, for the
+        streamed coins and, while fewer than three are streamed, the reference basket. Never
+        raises: a failed read leaves the window as it was, so paced entries keep waiting."""
+        pacing = getattr(self.execution, "entry_pacing", None)
+        if pacing is None:
+            return None
+        with self.lock:
+            streamed = set(self.market_subscriptions.get("CRYPTO", ()))
+        try:
+            return regime_gate.refresh(
+                pacing, lambda symbol, start, end: self._gap_bars("CRYPTO", symbol, start, end),
+                streamed, self.now())
+        except Exception as exc:
+            pacing.last_refresh = {"at": self.now().isoformat(), "error": failure_code(exc)}
+            return None
+
     def _gap_check(self, setup, check, now):
         """One held setup's bar check (``gap_resume.decide``) and its record."""
         generation, window_start = check.generation, check.window_start
@@ -1328,12 +1799,13 @@ class ManagedRuntime:
                 return False
             if not 0 <= (now - trade_at).total_seconds() <= self.QUIET_PRINT_MAX_AGE_SECONDS:
                 return False
-            if not crypto_trigger.active(state) and not all(
+            if not (crypto_trigger.active(state) or coinbase_trigger.active(state)) and not all(
                 observation.get(k) for k in ("bid", "ask", "quote_at")
             ):
                 # The per-print path revokes a quote-less print. CRYPTO_ALPACA_TRIGGER_V1 never
                 # does (a thin coin's print may come before any quote), so for it a print above
-                # the trigger is quiet with or without a quote.
+                # the trigger is quiet with or without a quote. CRYPTO_COINBASE_TRIGGER_V1 never
+                # evaluates an Alpaca print at all.
                 return False
             deadline = setup["expires_at"]
             if state.get("crypto_entry_deadline"):
@@ -1491,7 +1963,8 @@ class ManagedRuntime:
         if kind not in {"q", "t"} or not subscribed:
             raise ValueError("UNSUBSCRIBED_MARKET_MESSAGE")
         stamp = datetime.fromisoformat(message["t"].replace("Z", "+00:00"))
-        if stamp.tzinfo is None or stamp > self.now():
+        if stamp.tzinfo is None or stamp > self.now() + timedelta(
+                seconds=MARKET_CLOCK_TOLERANCE_SECONDS):
             raise ValueError("INVALID_MARKET_TIMESTAMP")
         feed = self.stock_feed if market == "US" else "CRYPTO_US"
         with self.lock:
@@ -1531,6 +2004,14 @@ class ManagedRuntime:
             # The Bitcoin window of CRYPTO_MAINTENANCE_V1: quote mids and trade prints.
             self.benchmark.observe(
                 (Decimal(row["bid"]) + Decimal(row["ask"])) / 2 if kind == "q"
+                else Decimal(row["trade_price"]), stamp,
+            )
+        pacing = getattr(self.execution, "entry_pacing", None)
+        if market == "CRYPTO" and pacing is not None:
+            # CRYPTO_ENTRY_PACING_V1 (package risk-pacing): every streamed coin's quote mids and
+            # trade prints feed the market window of the -2% median 1-hour gate.
+            pacing.window.observe(
+                symbol, (Decimal(row["bid"]) + Decimal(row["ask"])) / 2 if kind == "q"
                 else Decimal(row["trade_price"]), stamp,
             )
         if kind == "t":
@@ -1736,13 +2217,26 @@ class ManagedRuntime:
         self._invalidate_market_gaps(tick)
         self._retire_superseded_research(tick)
         self._run_gap_checks(tick)  # CRYPTO_GAP_RESUME_V1: held setups' bar checks.
+        self._refresh_entry_pacing()  # CRYPTO_ENTRY_PACING_V1: the market window's bar seed.
         if self.ready():
-            for packet in self._selected_packets():
+            packets = self._selected_packets()
+            # CRYPTO_STREAM_CAPACITY_V1: the picks the crypto stream holds back, from this read.
+            held_back = set(self._stream_plan("CRYPTO", packets)[1])
+            self._capacity_waits &= {p.get("selection_event_seq") for p in packets}
+            for packet in packets:
+                if packet["market"] == "CRYPTO" and packet["symbol"] in held_back:
+                    self._stream_capacity_wait(packet)
+                    continue
                 if packet["market"] in {"US_STOCKS", "CRYPTO"} and self._market_ready(
                     packet["market"], packet["symbol"]
-                ):
+                ) and self._reference_admission_ready(packet) and self._admission_due(packet):
                     try:
-                        if is_v3_packet(packet):  # The system check needs the live price.
+                        if is_v3_packet(packet) and getattr(
+                                self.execution, "trade_plan_active", False):
+                            # CRYPTO_TRADE_PLAN_V1 also needs the coin's hourly range.
+                            self.execution.admit(packet, live_quote=self._live_quote,
+                                                 hourly_range=self.hourly_ranges)
+                        elif is_v3_packet(packet):  # The system check needs the live price.
                             self.execution.admit(packet, live_quote=self._live_quote)
                         else:
                             self.execution.admit(packet)
@@ -1822,6 +2316,12 @@ class ManagedRuntime:
             # CRYPTO_GAP_RESUME_V1: held for its gap check, which reads this print from the
             # ledger; it is neither evaluated nor aged into a revocation meanwhile.
             self._consume_trade(queued, gap_resume.PRINT_CONSUMED_REASON)
+            return
+        if coinbase_trigger.active(setup["state"]):
+            # CRYPTO_COINBASE_TRIGGER_V1: an Alpaca print is neither a touch nor an invalidation
+            # (the trigger reads Coinbase every tick), so it is consumed unevaluated, whatever
+            # its age; the gap check still reads it from the ledger.
+            self._consume_trade(queued, coinbase_trigger.ALPACA_PRINT_CONSUMED_REASON)
             return
         age = (self.now() - datetime.fromisoformat(printed["trade_at"])).total_seconds()
         if age < 0 or age > 5:
@@ -2043,6 +2543,11 @@ class ManagedRuntime:
         budget = status.get("jev_budget")
         if isinstance(budget, dict):  # Spend moves every call; only the tier is a change.
             stable["jev_budget_tier"] = budget.get("tier")
+        feed = status.get("reference_feed")
+        if isinstance(feed, dict):  # Ages and the instant move every call; health is a change.
+            stable["reference_feed"] = {k: feed.get(k) for k in (
+                "available", "connected", "wanted", "requested", "acknowledged", "refused",
+                "healthy", "unhealthy", "unhealthy_since")}
         return json.dumps(stable, sort_keys=True, default=str)
 
     def heartbeat_once(self):
@@ -2138,6 +2643,7 @@ class ManagedRuntime:
     def _stream_loop(self):
         backoff = self.policy.reconnect_seconds
         while not self.stop_event.is_set():
+            started = _monotonic()
             try:
                 self.stream_session()
             except Exception:
@@ -2149,6 +2655,7 @@ class ManagedRuntime:
                     self.reconciled_at = None
                     self.execution.reconciled_at = None
             self._event("RUNTIME_STREAM_DISCONNECTED", {"reason": "PAPER_STREAM_UNAVAILABLE"})
+            backoff = reconnect_wait(backoff, _monotonic() - started, self.policy)
             if self.stop_event.wait(backoff):
                 break
             backoff = min(backoff * 2, self.policy.max_reconnect_seconds)
@@ -2158,8 +2665,9 @@ class ManagedRuntime:
         value = json.loads(socket.recv(timeout=timeout), parse_float=Decimal)
         if not isinstance(value, list) or not value or any(not isinstance(v, dict) for v in value):
             raise ValueError("INVALID_MARKET_STREAM_FRAME")
-        if any(v.get("T") == "error" for v in value):
-            raise ValueError("MARKET_STREAM_PROVIDER_ERROR")
+        error = next((v for v in value if v.get("T") == "error"), None)
+        if error is not None:
+            raise MarketStreamProviderError(error)
         return value
 
     def market_stream_session(self, market):
@@ -2172,7 +2680,7 @@ class ManagedRuntime:
             ping_interval=20,
             ping_timeout=20,
             max_size=2**20,
-            max_queue=64,
+            max_queue=MARKET_STREAM_MAX_QUEUE,
             logger=WIRE_LOG,
         ) as socket:
             with self.lock:
@@ -2195,20 +2703,25 @@ class ManagedRuntime:
             ]:
                 raise ValueError("MARKET_STREAM_AUTH_FAILED")
             requested, acknowledged, deadline = set(), set(), None
+            planned_at = None
             while not self.stop_event.is_set():
-                wanted = self._desired_symbols(market)
-                if wanted != requested:
+                # The plan (two ledger reads) is read at most once per market_poll_seconds while
+                # frames arrive, and again after every idle read (2026-09-30). Read after every
+                # frame, it capped how fast the stream was read; around US market events the
+                # provider cut the lagging connection every 2-5 minutes (WS_CLOSED_NONE_NONE).
+                clock = time.monotonic()
+                if planned_at is None or not 0 <= clock - planned_at < (
+                        self.policy.market_poll_seconds):
+                    wanted, planned_at = self._desired_symbols(market), clock
+                # One subscription change in flight (2026-09-30): the next change waits for the
+                # provider to acknowledge the previous one. Sent while it was unacknowledged,
+                # its late answer listed a coin no longer requested, and the session ended
+                # (MARKET_STREAM_SUBSCRIPTION_MISMATCH twice at 01:11 UTC, when a research
+                # update retired, re-offered and admitted several coins within seconds).
+                if wanted != requested and deadline is None:
                     adding, removing = wanted - requested, requested - wanted
-                    if adding:
-                        socket.send(
-                            json.dumps(
-                                {
-                                    "action": "subscribe",
-                                    "trades": sorted(adding),
-                                    "quotes": sorted(adding),
-                                }
-                            )
-                        )
+                    # CRYPTO_STREAM_CAPACITY_V1: the unsubscribe goes first, so a coin replacing
+                    # another at the capacity never asks the provider for one coin more.
                     if removing:
                         socket.send(
                             json.dumps(
@@ -2219,6 +2732,16 @@ class ManagedRuntime:
                                 }
                             )
                         )
+                    if adding:
+                        socket.send(
+                            json.dumps(
+                                {
+                                    "action": "subscribe",
+                                    "trades": sorted(adding),
+                                    "quotes": sorted(adding),
+                                }
+                            )
+                        )
                     requested = wanted
                     deadline = time.monotonic() + self.policy.stream_open_timeout_seconds
                 if deadline is not None and time.monotonic() >= deadline:
@@ -2226,6 +2749,7 @@ class ManagedRuntime:
                 try:
                     frame = self._market_frame(socket, self.policy.stream_read_timeout_seconds)
                 except TimeoutError:
+                    planned_at = None  # Idle: the next pass reads the plan again.
                     continue
                 for message in frame:
                     if message.get("T") == "subscription":
@@ -2259,10 +2783,17 @@ class ManagedRuntime:
             if not self._desired_symbols(market):
                 self.stop_event.wait(self.policy.market_poll_seconds)
                 continue
-            reason = "MARKET_STREAM_DISCONNECTED_OR_GAP"
+            reason, code = "MARKET_STREAM_DISCONNECTED_OR_GAP", None
+            started = _monotonic()
             try:
                 self.market_stream_session(market)
             except Exception as exc:
+                # The session still ends (fail-closed); its cause is recorded with the gap, so a
+                # malformed message outside the known reasons is no longer only a disconnect.
+                # A provider error records the provider's numeric code (ALPACA_STREAM_<n>).
+                # A closed connection records its close codes (who closed it, and why).
+                code = (exc.code if isinstance(exc, MarketStreamProviderError)
+                        else close_codes(exc) or failure_code(exc))
                 if str(exc) in {
                     "MARKET_QUEUE_OVERLOAD",
                     "OUT_OF_ORDER_MARKET_TRADE",
@@ -2275,10 +2806,20 @@ class ManagedRuntime:
             finally:
                 with self.lock:
                     self.market_sockets.pop(market, None)
-                self.market_gap(market, reason)
+                self.market_gap(market, reason, code=code)
+            backoff = reconnect_wait(backoff, _monotonic() - started, self.policy)
             if self.stop_event.wait(backoff):
                 break
             backoff = min(backoff * 2, self.policy.max_reconnect_seconds)
+
+    def strategy_signals_once(self):
+        """STRATEGY_PAPER_PATH_V1's signal pass (package plugin-c3); its reads are research
+        class (public bars and the broker's asset grid). Signals become selections that the
+        protection pass admits through the same admission and risk gate as research picks."""
+        if self.strategy_source is None:
+            return None
+        with request_priority(RESEARCH):
+            return self.strategy_source.run_once()
 
     def _loop(self, callback, interval, name):
         while not self.stop_event.is_set():
@@ -2394,6 +2935,14 @@ class ManagedRuntime:
             # reconciliation cadence rather than adding a new policy field for them.
             (self._loop, (self.fee_import_once, self.policy.reconcile_seconds, "fee_import")),
         ]
+        if callable(getattr(self.reference_feed, "session", None)):
+            # Coinbase's public feed (CRYPTO_COINBASE_TRIGGER_V1 / CRYPTO_STOP_BREACH_V3).
+            targets.append((self._reference_stream_loop, ()))
+        if self.strategy_source is not None:
+            # STRATEGY_PAPER_PATH_V1: the promoted strategies' signals, checked every minute
+            # (each completed hour is scanned once).
+            targets.append((self._loop, (self.strategy_signals_once, STRATEGY_SIGNAL_SECONDS,
+                                         "strategy_signals")))
         self.expected_workers = len(targets)
         for target, args in targets:
             thread = threading.Thread(target=target, args=args, daemon=True)
@@ -2413,6 +2962,8 @@ class ManagedRuntime:
             market_sockets = list(self.market_sockets.values())
         for market_socket in market_sockets:
             market_socket.close()
+        if callable(getattr(self.reference_feed, "close", None)):
+            self.reference_feed.close()  # Coinbase's public connection, when open.
         for thread in self.threads:
             thread.join(timeout=self.policy.shutdown_timeout_seconds)
         self._flush_print_summaries(force=True)  # The last partial minute of quiet prints.
@@ -2518,6 +3069,9 @@ def build_runtime_from_env(*, monitor_tick=None):
     from catalyst_lab.trade_maintenance import TradeMaintenance
     from catalyst_lab.trade_review import DayReviews
 
+    # AI_MODE_SETTING_V1 (package oss-packaging): absent is JEV_AI_MODE_V1, the reference
+    # deployment, unchanged; NO_AI_MODE_V1 must be fully configured (its own refusal code).
+    mode = ai_mode.require(os.environ)
     try:
         if os.environ["MANAGED_ENVIRONMENT"] not in {"local_test", "supervised_paper"}:
             raise ValueError
@@ -2551,6 +3105,12 @@ def build_runtime_from_env(*, monitor_tick=None):
         # versions exactly as before; present, it is parsed strictly and new report-V3 crypto
         # admissions record CRYPTO_WINDOW_REVIEW_V1 / CRYPTO_WINDOW_HOLD_V1 with its window.
         crypto_window = crypto_holding.window_setting_from_env(os.environ)
+        # MANAGED_CRYPTO_EXECUTION_JSON (package exec-d): absent, neither phase-D execution
+        # version is admitted (CRYPTO_STOP_EXECUTION_V1, CRYPTO_MAKER_ENTRY_V1).
+        crypto_execution = execution_setting.from_env(os.environ)
+        # MANAGED_STRATEGIES_JSON (package plugin-c3, STRATEGY_PAPER_PATH_V1): absent or empty,
+        # no strategy signal is sought or admitted (the default).
+        paper_strategies = strategy_paper.configured_strategies(os.environ)
         if monitor_policy != engineering_monitor_policy() or monitor_seconds != 10:
             raise ValueError
         # Staging switch (plan 0.10 / R4): required, exactly ENABLED or DISABLED, no default.
@@ -2605,6 +3165,9 @@ def build_runtime_from_env(*, monitor_tick=None):
     liquidity_source = (
         AlpacaMarketSource(credentials, source_policy, now) if liquidity_policy else None
     )
+    # Coinbase's public market data (no key, no credential; read-only): the reference market of
+    # CRYPTO_COINBASE_TRIGGER_V1 and CRYPTO_STOP_BREACH_V3 (owner approval 2026-09-29).
+    reference_feed = coinbase_feed.CoinbaseFeed(clock=now)
     execution = ManagedExecution(
         repository,
         broker_budget.wrap(broker),
@@ -2616,9 +3179,20 @@ def build_runtime_from_env(*, monitor_tick=None):
         if liquidity_policy else None,
         risk_policy_id=risk_policy_id,
         crypto_window=crypto_window,
+        reference_feed=reference_feed,
+        # CRYPTO_ENTRY_PACING_V1 (owner approval 2026-10-02, package risk-pacing): new crypto
+        # admissions are paced; the stream feeds its market window, the calendar is the file's.
+        entry_pacing=regime_gate.EntryPacing(),
+        crypto_execution=crypto_execution,
+        paper_strategies=paper_strategies,
+        ai_mode=mode,
     )
+    # JEV_TOP_K_SELECTION_V3 (package jev-b2): its comparative review's code facts, read through
+    # Alpaca's keyless public bars (read-only) and the engine's entry-pacing state.
     research = ResearchCycle(
-        repository, worker.reviewer, cycle_policy, clock=now, selection=selection_rule
+        repository, worker.reviewer, cycle_policy, clock=now, selection=selection_rule,
+        comparison_facts=ComparisonFacts(repository, PublicCryptoBarReader(),
+                                         pacing=getattr(execution, "entry_pacing", None)),
     )
     monitor_source = AlpacaMarketSource(credentials, source_policy, now)
     position_monitor = PositionMonitor(
@@ -2685,8 +3259,29 @@ def build_runtime_from_env(*, monitor_tick=None):
         "day_review": crypto_holding.admission_policy(
             True, crypto_holding.JEV_MANAGED_ARM, crypto_window).record(),
         "early_exit": day_review.EARLY_EXIT_AGREEMENT.record(),
+        # The Coinbase reference versions admission records, and the feed they read.
+        "reference": {
+            "trigger": coinbase_trigger.COINBASE_TRIGGER_VERSION,
+            "stop_breach": stop_breach.STOP_BREACH_VERSION_V3,
+            "provider": coinbase_feed.PROVIDER, "endpoint": coinbase_feed.ENDPOINT,
+            "channels": list(coinbase_feed.CHANNELS),
+            "products": sorted(coinbase_feed.COINBASE_USD_PRODUCTS),
+            "products_verified_on": coinbase_feed.PRODUCTS_VERIFIED_ON,
+            "heartbeat_max_age_seconds": coinbase_feed.HEARTBEAT_MAX_AGE_SECONDS,
+            "clock_tolerance_seconds": coinbase_feed.CLOCK_TOLERANCE_SECONDS,
+            "tape_gap_hold_seconds": coinbase_feed.TAPE_GAP_HOLD_SECONDS,
+        },
         "crypto_day": asdict(crypto_day_policy) if crypto_day_policy else None,
+        # Package exec-d: the execution versions admission records (both null: off).
+        "crypto_execution": crypto_execution.record(),
         "crypto_liquidity": asdict(liquidity_policy) if liquidity_policy else None,
+        # Package plugin-c3: only when a strategy is configured (otherwise the hash is as before).
+        **({"paper_strategies": {"version": strategy_paper.PATH_VERSION,
+                                 "strategies": list(paper_strategies)}}
+           if paper_strategies else {}),
+        # Package oss-packaging: only in NO_AI_MODE_V1 (the reference deployment's hash is as
+        # before).
+        **({"ai_mode": ai_mode.record(mode)} if mode == ai_mode.NO_AI_MODE else {}),
         "review_reliability": gate1.values,
         "broker_budget": asdict(broker_budget.policy),
         "latches": asdict(runtime.latch_policy),
@@ -2697,9 +3292,21 @@ def build_runtime_from_env(*, monitor_tick=None):
     runtime.release_commit = identity["release_commit"]
     runtime.position_monitor = position_monitor
     runtime.trade_maintenance = maintenance
+    runtime.ai_mode = mode
+    if paper_strategies:
+        # STRATEGY_PAPER_PATH_V1: drop-in plug-ins join the registry, then the promoted ones'
+        # signals are read from Alpaca's keyless public bars (the shadow's source).
+        strategies.ensure_plugins_loaded()
+        strategy_reader = PublicCryptoBarReader()
+        runtime.strategy_source = strategy_paper.StrategySignalSource(
+            execution.store, strategy_reader, paper_strategies, now,
+            execution._crypto_price_increment,
+            # NO_AI_MODE_V1 records no research universe (no report is taken): its strategies
+            # scan the fixed Alpaca USD pairs of ALPACA_CRYPTO_SECTORS_V1 instead.
+            universe=ai_mode.strategy_universe if mode == ai_mode.NO_AI_MODE else None)
     runtime.owned_resources = (source, monitor_source, broker, legacy_client) + (
         (liquidity_source,) if liquidity_source is not None else ()
-    )
+    ) + ((runtime.strategy_source.reader,) if runtime.strategy_source is not None else ())
     return runtime
 
 

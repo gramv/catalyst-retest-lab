@@ -1,16 +1,26 @@
-"""Screenshots of the public live dashboard, from disposable fixture databases only.
+"""Screenshots of the public live page (EXPERIMENT_DASHBOARD_V3), from disposable fixture
+databases only.
 
-    python -m scripts.experiment_page_screenshots [--out artifacts/experiment-page-2026-09-27]
-    python -m scripts.experiment_page_screenshots --serve     # keep both pages up to inspect
+    python -m scripts.experiment_page_screenshots [--out artifacts/public-page-v3]
+    python -m scripts.experiment_page_screenshots --serve     # keep the pages up to inspect
+    python -m scripts.experiment_page_screenshots --like live.json --public-market
+
+``--like FILE`` adds a third, realistic fixture ledger shaped like a saved public page document
+(scripts/experiment_realistic.py); ``--public-market`` lets the realistic page's service read
+Alpaca's keyless public crypto bars and quotes (read-only, no credential), so its candles, the
+BTC benchmark and today's snapshots are real market prices. The demo ledger is
+tests/experiment_fixtures.py's build_demo_v3 (V2's demo plus day starts, equity snapshots, a
+soft limit and a stats exclusion).
 
 Builds a private /tmp PostgreSQL cluster (never an owner ledger), migrates it, enables LOGIN for
-catalyst_public exactly as the tests do, and serves two copies of the dashboard as
-catalyst_public: an empty ledger and tests/experiment_fixtures.py's demo experiment. Both pass
+catalyst_public exactly as the tests do, and serves two copies of the page as catalyst_public:
+an empty ledger and tests/experiment_fixtures.py's V2 demo (build_demo_v2: the demo experiment
+plus phase-A trades, entry waits, the day's baseline and market regimes). Both pass
 ``fixture_data=True``, so every screenshot carries the "FIXTURE DATA - not real results" banner.
 Headless Chrome (DevTools protocol) waits for the page's own script to render, then captures
-desktop 1440 px and mobile 390 px in light and dark, plus one desktop capture with the
-collapsible lists opened. checks.json records sideways scrolling, clipped tables, console
-errors, the number of scripts and the JSON polls the page made.
+the live page and a trade's own page at desktop 1440 px and phone 390 px (PNG). checks.json
+records sideways page scrolling, tables that scroll inside their own box, console errors, the
+number of scripts and the JSON polls the page made.
 """
 
 import argparse
@@ -37,17 +47,16 @@ from catalyst_lab.experiment_page import create_experiment_app
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.experiment_realistic import build_realistic  # noqa: E402
 from tests.experiment_fixtures import (  # noqa: E402
     ExperimentLedger,
-    build_demo_experiment,
+    build_demo_v3,
     enable_public_login,
     public_url,
 )
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-VIEWPORTS = {"desktop-1440": (1440, 1000, False), "mobile-390": (390, 844, True)}
-SCHEMES = ("light", "dark")
-MAX_BYTES = 1_000_000  # The repository caps tracked files at 1 MiB.
+VIEWPORTS = {"desktop-1440": (1440, 1000, False), "phone-390": (390, 844, True)}
 
 
 def free_port():
@@ -68,16 +77,16 @@ def serve(app, port):
     raise RuntimeError("SERVER_DID_NOT_START")
 
 
-def databases(root):
-    """The empty ledger (catalyst_lab) and a demo copy made from it before any row is added."""
+def databases(root, names=("experiment_demo", "experiment_like")):
+    """The empty ledger (catalyst_lab) and copies made from it before any row is added."""
     admin = localdb.connection_url(root, "lab_owner").replace("dbname=catalyst_lab",
                                                               "dbname=postgres")
     with psycopg.connect(admin, autocommit=True) as conn:
-        conn.execute(sql.SQL("CREATE DATABASE {} TEMPLATE catalyst_lab").format(
-            sql.Identifier("experiment_demo")))
+        for name in names:
+            conn.execute(sql.SQL("CREATE DATABASE {} TEMPLATE catalyst_lab").format(
+                sql.Identifier(name)))
     empty = localdb.connection_url(root)
-    demo = empty.replace("dbname=catalyst_lab", "dbname=experiment_demo")
-    return empty, demo
+    return empty, *(empty.replace("dbname=catalyst_lab", "dbname=" + n) for n in names)
 
 
 class Chrome:
@@ -119,11 +128,27 @@ class Chrome:
                     raise RuntimeError(f"{method}: {message['error']}")
                 return message.get("result", {})
 
-    def capture(self, url, width, height, mobile, scheme, path, expand=False):
+    def hover(self, selector, fraction):
+        """Move the pointer over a chart (at ``fraction`` of its width) to show its tooltip."""
+        self.call("Runtime.evaluate", expression=f"""(() => {{
+            const hit = document.querySelector({json.dumps(selector)});
+            if (!hit) return false;
+            const box = hit.getBoundingClientRect();
+            hit.scrollIntoView({{block: 'center'}});
+            const b = hit.getBoundingClientRect();
+            hit.dispatchEvent(new PointerEvent('pointermove', {{bubbles: true,
+                clientX: b.left + b.width * {fraction}, clientY: b.top + b.height / 2}}));
+            hit.dispatchEvent(new PointerEvent('pointerenter', {{bubbles: false,
+                clientX: b.left + b.width * {fraction}, clientY: b.top + b.height / 2}}));
+            return box.width > 0;
+        }})()""")
+        time.sleep(0.3)
+        shot = self.call("Page.captureScreenshot", format="png")["data"]
+        return base64.b64decode(shot)
+
+    def capture(self, url, width, height, mobile, path):
         self.call("Emulation.setDeviceMetricsOverride", width=width, height=height,
-                  deviceScaleFactor=1, mobile=mobile)
-        self.call("Emulation.setEmulatedMedia",
-                  features=[{"name": "prefers-color-scheme", "value": scheme}])
+                  deviceScaleFactor=1 if not mobile else 2, mobile=mobile)
         self.call("Page.enable")
         self.errors.clear()
         self.call("Page.navigate", url=url)
@@ -134,15 +159,17 @@ class Chrome:
             if state["result"].get("value") is True:
                 break
             time.sleep(0.05)
-        time.sleep(0.6)
-        if expand:  # Open the collapsible lists (latest picks, recent closed trades).
-            self.call("Runtime.evaluate", expression="document.querySelectorAll('details')"
-                      ".forEach((d) => { d.open = true; })")
-            time.sleep(0.4)
+        for _ in range(200):  # A trade page reads its price bars after the first render.
+            state = self.call("Runtime.evaluate", expression="!document.body.textContent"
+                              ".includes('Loading the price bars')")
+            if state["result"].get("value") is True:
+                break
+            time.sleep(0.05)
+        time.sleep(1.2)
         checks = self.call("Runtime.evaluate", returnByValue=True, expression="""({
             scrollWidth: document.documentElement.scrollWidth,
             innerWidth: window.innerWidth,
-            clippedTables: [...document.querySelectorAll('.table-wrap')]
+            scrollingTables: [...document.querySelectorAll('.table-wrap')]
                 .filter((w) => w.scrollWidth > w.clientWidth + 1).length,
             executableScripts: [...document.scripts]
                 .filter((s) => s.type !== 'application/json').length,
@@ -151,26 +178,20 @@ class Chrome:
             height: document.documentElement.scrollHeight,
             fixtureBanner: !!document.querySelector('.fixture-banner'),
             rendered: document.body.dataset.ready === '1',
-            pill: (document.getElementById('pill') || {}).textContent,
-            liveRows: document.querySelectorAll('#live-body tbody tr').length,
-            feedItems: document.querySelectorAll('#feed-body li').length,
-            agentCards: document.querySelectorAll('#agents-body .card').length,
-            scripts: document.scripts.length,
-            dark: matchMedia('(prefers-color-scheme: dark)').matches
+            status: (document.querySelector('.status-label') || {}).textContent,
+            openRows: document.querySelectorAll('#open-body tbody tr').length,
+            closedRows: document.querySelectorAll('#closed-body tbody tr').length,
+            timeline: document.querySelectorAll('.timeline li').length,
+            charts: document.querySelectorAll('svg.chart-svg').length,
         })""")["result"]["value"]
         full = self.call("Page.getLayoutMetrics")["cssContentSize"]
         clip = {"x": 0, "y": 0, "width": width, "height": full["height"], "scale": 1}
-        for quality in (70, 60, 50):  # JPEG keeps the committed files small.
-            data = self.call("Page.captureScreenshot", format="jpeg", quality=quality,
-                             clip=clip, captureBeyondViewport=True)["data"]
-            raw = base64.b64decode(data)
-            if len(raw) <= MAX_BYTES:
-                break
-        path = path.with_suffix(".jpg")
+        data = self.call("Page.captureScreenshot", format="png", clip=clip,
+                         captureBeyondViewport=True)["data"]
+        raw = base64.b64decode(data)
         path.write_bytes(raw)
         return {**checks, "consoleErrors": len(self.errors), "file": path.name, "bytes": len(raw),
-                "horizontal_overflow": checks["scrollWidth"] > checks["innerWidth"]
-                or checks["clippedTables"] > 0}
+                "horizontal_overflow": checks["scrollWidth"] > checks["innerWidth"]}
 
     def close(self):
         try:
@@ -187,8 +208,11 @@ def _stop(signum, frame):
 def main(argv=None):
     signal.signal(signal.SIGTERM, _stop)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default=str(ROOT / "artifacts" / "experiment-page-2026-09-27"))
-    parser.add_argument("--serve", action="store_true", help="serve both pages until Ctrl-C")
+    parser.add_argument("--out", default=str(ROOT / "artifacts" / "public-page-v3"))
+    parser.add_argument("--serve", action="store_true", help="serve the pages until Ctrl-C")
+    parser.add_argument("--like", help="a saved public page JSON to shape a realistic ledger on")
+    parser.add_argument("--public-market", action="store_true",
+                        help="read Alpaca's keyless public crypto data for the realistic page")
     args = parser.parse_args(argv)
     out = Path(args.out)
     with tempfile.TemporaryDirectory(prefix="catalyst-shots-", dir="/tmp") as directory:
@@ -196,18 +220,41 @@ def main(argv=None):
         localdb.start(root)  # A fresh private cluster; never an owner ledger.
         try:
             enable_public_login(root)
-            empty_url, demo_url = databases(root)
+            empty_url, demo_url, like_url = databases(root)
             now = datetime.now(UTC)
             ledger = ExperimentLedger(demo_url)
-            build_demo_experiment(ledger, now)
+            build_demo_v3(ledger, now)
+            market = None
+            if args.public_market:
+                from catalyst_lab.public_market import PublicMarketData
+
+                market = PublicMarketData()
             apps = {
                 "empty": create_experiment_app(public_url(empty_url), fixture_data=True,
                                                environ={}),
                 "demo": create_experiment_app(public_url(demo_url), fixture_data=True,
                                               environ={}),
             }
+            if args.like:
+                build_realistic(ExperimentLedger(like_url),
+                                json.loads(Path(args.like).read_text()), market, now)
+                apps["like"] = create_experiment_app(public_url(like_url), fixture_data=True,
+                                                     environ={}, market=market)
             ports = {name: free_port() for name in apps}
             servers = [serve(app, ports[name]) for name, app in apps.items()]
+            pages = {}
+            for name in ("demo", "like") if args.like else ("demo",):
+                document = httpx.get(f"http://127.0.0.1:{ports[name]}/api/public/experiment",
+                                     timeout=60).json()
+                closed = document["past"]["closed_trades"]
+                planned = next((t for t in closed if t["plan"]), closed[0])
+                if name == "like":  # A stop-out with a day of price after it.
+                    planned = next((t for t in closed if t["exit_reason"] and
+                                    "Stop" in t["exit_reason"]), planned)
+                held = next((t for t in document["live_trades"] if t["plan"]),
+                            document["live_trades"][0])
+                pages[name] = {"main": "/", "trade": f"/trade/{planned['trade_no']}",
+                               "open-trade": f"/trade/{held['trade_no']}"}
             if args.serve:
                 for name, port in ports.items():
                     print(f"{name}: http://127.0.0.1:{port}/", flush=True)
@@ -218,27 +265,32 @@ def main(argv=None):
                     pass
                 return
             out.mkdir(parents=True, exist_ok=True)
-            for old in out.glob("experiment-*-fixture-*"):
+            for old in out.glob("*.png"):
                 old.unlink()
             profile = Path(directory) / "chrome"
             chrome = Chrome(profile)
             results = []
             try:
-                for name, port in ports.items():
-                    for viewport, (width, height, mobile) in VIEWPORTS.items():
-                        for scheme in SCHEMES:
-                            path = out / f"experiment-{name}-fixture-{viewport}-{scheme}.jpg"
-                            result = chrome.capture(f"http://127.0.0.1:{port}/", width, height,
-                                                    mobile, scheme, path)
-                            results.append({"page": name, "viewport": viewport,
-                                            "scheme": scheme, **result})
-                            print(json.dumps(results[-1]), flush=True)
-                path = out / "experiment-demo-fixture-desktop-1440-light-expanded.jpg"
-                result = chrome.capture(f"http://127.0.0.1:{ports['demo']}/", 1440, 1000, False,
-                                        "light", path, expand=True)
-                results.append({"page": "demo", "viewport": "desktop-1440", "scheme": "light",
-                                "expanded": True, **result})
-                print(json.dumps(results[-1]), flush=True)
+                shots = [(name, page, viewport) for name in pages for page in pages[name]
+                         for viewport in VIEWPORTS]
+                shots.append(("empty", "main", "desktop-1440"))
+                for name, page, viewport in shots:
+                    width, height, mobile = VIEWPORTS[viewport]
+                    path = out / f"{name}-{page}-{viewport}.png"
+                    route = pages.get(name, {"main": "/"})[page]
+                    result = chrome.capture(f"http://127.0.0.1:{ports[name]}{route}",
+                                            width, height, mobile, path)
+                    results.append({"ledger": name, "page": page, "viewport": viewport,
+                                    **result})
+                    hovers = {"main": [(".chart-equity .hit", 0.62, "equity"),
+                                       (".chart-daily .hit:nth-last-of-type(2)", 0.5, "daily")],
+                              "trade": [(".chart-candles .hit", 0.4, "candles")],
+                              "open-trade": [(".chart-candles .hit", 0.7, "candles")]}
+                    if viewport == "desktop-1440" and name != "empty":
+                        for selector, fraction, label in hovers.get(page, []):
+                            (out / f"{name}-{page}-hover-{label}.png").write_bytes(
+                                chrome.hover(selector, fraction))
+                    print(json.dumps(results[-1]), flush=True)
             finally:
                 chrome.close()
                 for server in servers:

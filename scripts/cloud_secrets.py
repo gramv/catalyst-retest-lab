@@ -7,12 +7,13 @@ Run it from the repository root after ``railway login`` and ``railway link`` (an
 first ``railway config apply`` created the services). Each value is generated here with
 ``secrets.token_urlsafe`` and handed to ``railway variable set NAME --service S --skip-deploys
 --stdin`` on its standard input: it is never printed, logged, written to a file, put in an
-argv or read from anywhere else. The only exception is Muse's agent token: Muse is the one
-research agent and the only outside caller, and ``MANAGED_AGENT_TOKENS_JSON`` holds exactly
-``{"muse": <token>}`` (the identity screens match a report's agent to its credential's own ID,
-so the ID is exactly ``muse``). That token is also written to the owner-chosen
-``--agent-token-file`` (absolute, outside the repository, outside ~/Documents and iCloud Drive,
-mode 0600), which the owner hands to Muse without opening it or pasting it into chat.
+argv or read from anywhere else. The only exception is a research agent's token: the first
+deployment's ``MANAGED_AGENT_TOKENS_JSON`` is ``{"muse": <token>}`` (the identity screens match
+a report's agent to its credential's own ID, so Muse's ID is exactly ``muse``), and another
+agent is added below. Each agent's token is also written to its owner-chosen file
+(``--agent-token-file``, ``--token-file``: absolute, outside the repository, outside ~/Documents
+and iCloud Drive, mode 0600), which the owner hands to that agent without opening it or pasting
+it into chat; this script reads such files only to rebuild the variable.
 ``MANAGED_API_TOKEN`` is generated like every other token and never issued to anyone: it is the
 legacy identity, kept out of every hand-off.
 
@@ -26,6 +27,25 @@ sealed variables.
 After rotating a ``*_DATABASE_PASSWORD``, the role's verifier in PostgreSQL must change too:
 run the provisioner's ``rotate-passwords`` mode, then redeploy the services that use it
 (docs/RAILWAY-DEPLOYMENT.md, "Rotating secrets").
+
+Another research agent (package agent-api; owner direction of 2026-09-29 evening: one research
+agent at a time, another agent allowed besides Muse), without replacing anyone's token:
+
+    python scripts/cloud_secrets.py --add-agent dots-agent \\
+        --token-file /abs/private/dots-agent-token \\
+        --agent-token-file /abs/private/muse-agent-token [--keep-agent ID=/abs/file ...] \\
+        [--dry-run]
+
+writes ``MANAGED_AGENT_TOKENS_JSON`` as the union of every configured agent's LOCAL token file
+(``--agent-token-file`` for ``--agent-id``, default ``muse``, and one ``--keep-agent`` per agent
+added earlier) and the new agent's. The script cannot read the deployed value, so the owner
+lists every agent that must keep working; the summary it prints first names the agent IDs, and
+never a token. The new agent's token is generated only when ``--token-file`` does not exist
+(then it is written mode 0600, before Railway is changed, so a rerun reuses it); an existing
+file must be a private 0600 file and its token is reused. IDs follow ``agent_identity``
+(``^[a-z][a-z0-9_-]{1,31}$``, at most 32 agents, each ID once); every token must be distinct.
+Rotating ``MANAGED_AGENT_TOKENS_JSON`` keeps the agents named with ``--keep-agent`` the same way.
+Then redeploy the trader, which reads the variable at startup.
 """
 
 import argparse
@@ -42,7 +62,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+# catalyst_lab.agent_identity's rules (AGENT_ID_PATTERN, MAX_AGENT_TOKENS, valid_token), kept
+# here because the owner runs this script with a plain python3, outside the package's venv.
 AGENT_ID = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+MAX_AGENTS = 32
+MIN_TOKEN_CHARACTERS = 32
+MAX_TOKEN_FILE_BYTES = 4096
+AGENT_TOKENS = "MANAGED_AGENT_TOKENS_JSON"
+AGENT_SERVICE = "trader"
 NAME = re.compile(r"[A-Z][A-Z0-9_]{2,63}")
 TOKEN_BYTES = 48  # token_urlsafe(48): 64 URL-safe characters.
 
@@ -135,6 +162,68 @@ def write_agent_file(path, token, *, replace):
             os.unlink(temporary)
 
 
+def valid_token(value):
+    """``agent_identity.valid_token``: at least 32 characters, no whitespace."""
+    return (isinstance(value, str) and len(value) >= MIN_TOKEN_CHARACTERS
+            and not any(c.isspace() for c in value))
+
+
+def read_agent_token(path, agent_id):
+    """The token of an agent's private local file (the file this script writes: the token and
+    a newline). Refusals name the agent and a code, never the file's content."""
+    if agent_file_state(path) != "PRIVATE":
+        raise Refused(f"AGENT_TOKEN_FILE_MISSING {agent_id}")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise Refused(f"AGENT_TOKEN_FILE_UNREADABLE {agent_id}") from None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise Refused(f"AGENT_TOKEN_FILE_NOT_PRIVATE {agent_id}")
+        data = stream.read(MAX_TOKEN_FILE_BYTES + 1)
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused(f"AGENT_TOKEN_FILE_INVALID {agent_id}") from None
+    token = text[:-1] if text.endswith("\n") else text
+    if len(data) > MAX_TOKEN_FILE_BYTES or not valid_token(token):
+        raise Refused(f"AGENT_TOKEN_FILE_INVALID {agent_id}")
+    return token
+
+
+def kept_agents(values, *, home=None):
+    """``--keep-agent ID=/abs/file`` values: ``[(agent ID, validated path)]`` in order."""
+    kept = []
+    for value in values or ():
+        agent_id, separator, path = value.partition("=")
+        if not separator or not AGENT_ID.fullmatch(agent_id):
+            raise Refused("KEEP_AGENT_INVALID (expected ID=/absolute/token-file)")
+        kept.append((agent_id, agent_file_path(path, home=home)))
+    return kept
+
+
+def agent_union(agents, *, extra=None):
+    """``{agent ID: token}`` of ``agents`` (``[(ID, path)]``) read from their local files, plus
+    ``extra`` (``(ID, token)``): each ID once, at most MAX_AGENTS, every token distinct."""
+    ids = [agent_id for agent_id, _ in agents] + ([extra[0]] if extra else [])
+    duplicated = sorted({agent_id for agent_id in ids if ids.count(agent_id) > 1})
+    if duplicated:
+        raise Refused("AGENT_ID_DUPLICATE " + ",".join(duplicated))
+    if len(ids) > MAX_AGENTS:
+        raise Refused(f"AGENT_TOKENS_OVER_LIMIT {MAX_AGENTS}")
+    paths = [path for _, path in agents]
+    if len(set(paths)) != len(paths):
+        raise Refused("AGENT_TOKEN_FILE_SHARED")
+    tokens = {agent_id: read_agent_token(path, agent_id) for agent_id, path in agents}
+    if extra:
+        tokens[extra[0]] = extra[1]
+    if len(set(tokens.values())) != len(tokens):
+        raise Refused("AGENT_TOKENS_NOT_DISTINCT")
+    return tokens
+
+
 class RailwayCli:
     """The two documented commands this script needs; values travel only on stdin."""
 
@@ -216,16 +305,38 @@ def plan(existing, agent_state, rotate):
     return actions
 
 
+def railway_cli(args):
+    executable = args.railway or shutil.which("railway")
+    if not executable:
+        raise Refused("RAILWAY_CLI_REQUIRED")
+    return RailwayCli(executable, args.environment)
+
+
 def run(args, *, cli=None, home=None, out=sys.stdout):
+    if getattr(args, "add_agent", None) is not None:
+        return add_agent(args, cli=cli, home=home, out=out)
+    if getattr(args, "token_file", None) is not None:
+        raise Refused("TOKEN_FILE_ONLY_WITH_ADD_AGENT")
     if not AGENT_ID.fullmatch(args.agent_id):
         raise Refused("AGENT_ID_INVALID")
     agent_path = agent_file_path(args.agent_token_file, home=home)
     agent_state = agent_file_state(agent_path)
+    # Agents added earlier keep their tokens when the agent token is rotated (package agent-api):
+    # read from their local files, checked before anything changes.
+    kept = kept_agents(getattr(args, "keep_agent", None), home=home)
+    kept_tokens = {}
+    if kept:
+        if AGENT_TOKENS not in set(args.rotate or ()):
+            raise Refused("KEEP_AGENT_ONLY_WITH_ADD_AGENT_OR_ROTATE " + AGENT_TOKENS)
+        if args.agent_id in {agent_id for agent_id, _ in kept}:
+            raise Refused("AGENT_ID_DUPLICATE " + args.agent_id)
+        if agent_path in {path for _, path in kept}:
+            raise Refused("AGENT_TOKEN_FILE_SHARED")
+        if len(kept) + 1 > MAX_AGENTS:
+            raise Refused(f"AGENT_TOKENS_OVER_LIMIT {MAX_AGENTS}")
+        kept_tokens = agent_union(kept)
     if cli is None:
-        executable = args.railway or shutil.which("railway")
-        if not executable:
-            raise Refused("RAILWAY_CLI_REQUIRED")
-        cli = RailwayCli(executable, args.environment)
+        cli = railway_cli(args)
     existing = {(service, name) for service in SERVICES for name in cli.names(service)}
     actions = plan(existing, agent_state, set(args.rotate or ()))
     report = {"agent_token_file": str(agent_path), "dry_run": args.dry_run, "secrets": {}}
@@ -233,15 +344,71 @@ def run(args, *, cli=None, home=None, out=sys.stdout):
         action = actions[secret.name]
         report["secrets"][secret.name] = {
             "action": action, "services": [service for service, _ in secret.targets]}
+        if secret.agent:
+            report["secrets"][secret.name]["agents"] = sorted({args.agent_id, *kept_tokens})
         if action == "SKIP" or args.dry_run:
             continue
         token = secrets.token_urlsafe(TOKEN_BYTES)
-        value = json.dumps({args.agent_id: token}, sort_keys=True) if secret.agent else token
+        if secret.agent and token in kept_tokens.values():
+            raise Refused("AGENT_TOKENS_NOT_DISTINCT")
+        value = (json.dumps({**kept_tokens, args.agent_id: token}, sort_keys=True)
+                 if secret.agent else token)
         for service, name in secret.targets:
             cli.set(service, name, value)
         if secret.agent:
             write_agent_file(agent_path, token, replace=agent_state == "PRIVATE")
         del token, value
+    print(json.dumps(report, indent=2, sort_keys=True), file=out)
+    return report
+
+
+def add_agent(args, *, cli=None, home=None, out=sys.stdout):
+    """``--add-agent``: ``MANAGED_AGENT_TOKENS_JSON`` becomes the listed agents' local tokens
+    plus the new agent's, and nothing else changes. Everything is checked first; the summary
+    (agent IDs, never a token) is printed before anything is applied."""
+    new_id = args.add_agent
+    if not AGENT_ID.fullmatch(new_id) or not AGENT_ID.fullmatch(args.agent_id):
+        raise Refused("AGENT_ID_INVALID")
+    if args.rotate:
+        raise Refused("ADD_AGENT_WITH_ROTATE_REFUSED")
+    if getattr(args, "token_file", None) is None:
+        raise Refused("TOKEN_FILE_REQUIRED")
+    kept = [(args.agent_id, agent_file_path(args.agent_token_file, home=home)),
+            *kept_agents(getattr(args, "keep_agent", None), home=home)]
+    ids = [agent_id for agent_id, _ in kept]
+    if new_id in ids:
+        raise Refused("AGENT_ALREADY_LISTED " + new_id)
+    if len(ids) + 1 > MAX_AGENTS:
+        raise Refused(f"AGENT_TOKENS_OVER_LIMIT {MAX_AGENTS}")
+    new_path = agent_file_path(args.token_file, home=home)
+    if new_path in {path for _, path in kept}:
+        raise Refused("AGENT_TOKEN_FILE_SHARED")
+    reuse = agent_file_state(new_path) == "PRIVATE"
+    new_token = read_agent_token(new_path, new_id) if reuse else None
+    tokens = agent_union(kept, extra=(new_id, new_token) if reuse else None)
+    if cli is None:
+        cli = railway_cli(args)
+    if AGENT_TOKENS not in cli.names(AGENT_SERVICE):
+        raise Refused(f"AGENT_TOKENS_VARIABLE_MISSING {AGENT_SERVICE} {AGENT_TOKENS} "
+                      "(run the first deployment's secrets step first)")
+    report = {"mode": "ADD_AGENT", "dry_run": args.dry_run, "applied": False,
+              "service": AGENT_SERVICE, "variable": AGENT_TOKENS,
+              "agents": sorted({*tokens, new_id}), "new_agent": new_id,
+              "new_agent_token": "REUSE_LOCAL_FILE" if reuse else "GENERATE",
+              "new_agent_token_file": str(new_path)}
+    print(json.dumps(report, indent=2, sort_keys=True), file=out)
+    if args.dry_run:
+        return report
+    if not reuse:
+        new_token = secrets.token_urlsafe(TOKEN_BYTES)
+        if new_token in tokens.values():
+            raise Refused("AGENT_TOKENS_NOT_DISTINCT")
+        # Written before Railway changes: a failed set leaves a file the rerun reuses.
+        write_agent_file(new_path, new_token, replace=False)
+    value = json.dumps({**tokens, new_id: new_token}, sort_keys=True)
+    cli.set(AGENT_SERVICE, AGENT_TOKENS, value)
+    del value, new_token, tokens
+    report = {**report, "applied": True}
     print(json.dumps(report, indent=2, sort_keys=True), file=out)
     return report
 
@@ -255,6 +422,15 @@ def main(argv=None):
                         help="the agent ID of that token (default and cloud value: muse)")
     parser.add_argument("--rotate", action="append", metavar="NAME",
                         help="generate a new value for this secret everywhere it lives")
+    parser.add_argument("--add-agent", metavar="ID",
+                        help="add this research agent to MANAGED_AGENT_TOKENS_JSON, keeping "
+                             "--agent-id and every --keep-agent (package agent-api)")
+    parser.add_argument("--token-file", metavar="PATH",
+                        help="with --add-agent: the new agent's absolute token file "
+                             "(generated only when it does not exist)")
+    parser.add_argument("--keep-agent", action="append", metavar="ID=PATH",
+                        help="another agent already in MANAGED_AGENT_TOKENS_JSON and its local "
+                             "token file (with --add-agent or --rotate MANAGED_AGENT_TOKENS_JSON)")
     parser.add_argument("--environment", help="Railway environment (default: the linked one)")
     parser.add_argument("--railway", help="path to the railway CLI (default: on PATH)")
     parser.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
@@ -263,7 +439,6 @@ def main(argv=None):
         return run(args)
     except Refused as exc:
         raise SystemExit(f"CLOUD_SECRETS_REFUSED: {exc}") from None
-
 
 if __name__ == "__main__":
     main()

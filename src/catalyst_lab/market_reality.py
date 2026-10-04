@@ -34,6 +34,10 @@ and |return| < 1.5% or the opposite move. A mover ``was_miss`` for an agent when
 24-hour window covers it said FLAT, the opposite direction or SKIPPED, or no such outlook
 exists (``missed_by``); an outlook written after the move began never counts for or against it.
 
+**Regime** (package learning-measure, 2026-10-02): ``regime`` carries the day's recorded
+``MARKET_REGIME_V1`` (``market_regime``; the nightly regime step runs before this one), or
+``NOT_RECORDED``. Days recorded before then have none; their regime is its own record.
+
 Fail-closed: a day is recorded only once it has ended (plus the bar buffer), only when every
 coin's bars could be fetched (a coin with no trades has no bars and is recorded as unmeasured,
 not guessed), and never twice.
@@ -46,6 +50,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from catalyst_lab.learning_intake import OUTLOOK_EVENT, day_bounds
 from catalyst_lab.managed_classification import ALPACA_CRYPTO_SECTOR_OF, DEFAULT_CRYPTO_BUCKET
 from catalyst_lab.market import NY
+from catalyst_lab.market_regime import REGIME_VERSION, recorded_regimes
 from catalyst_lab.pick_outcomes import BAR_FETCH_BUFFER, ShadowDataError, parse_bars
 from catalyst_lab.repository import json_safe
 from catalyst_lab.research_report_v3 import REPORT_SCHEMA_V3
@@ -443,6 +448,7 @@ def measure_day(repository, bar_reader, day, *, now):
         covering = covering_outlooks(conn, day_start - HORIZON, day_end)
         agents = outlook_agents(conn, day_end)
         classified = sector_map(conn)
+        regime = recorded_regimes(conn, [day]).get(day.isoformat())
     universe = (universe_row["universe"] or {}) if universe_row else {}
     symbols = set(universe.get("symbols") or [])
     for outlook in graded:
@@ -534,8 +540,18 @@ def measure_day(repository, bar_reader, day, *, now):
         "coins": coins, "movers": movers,
         "mover_share": _q(D(len(movers)) / len(measured), RATIO) if measured else None,
         "factors": factors, "outlook_agents": agents, "grades": grades,
-        "limitations": list(LIMITATIONS),
+        "regime": regime_record(regime), "limitations": list(LIMITATIONS),
     })
+
+
+def regime_record(regime):
+    """The day's recorded ``MARKET_REGIME_V1`` (package learning-measure, 2026-10-02; the nightly
+    regime step runs first), without its universe list, or a ``NOT_RECORDED`` marker."""
+    if regime is None:
+        return {"regime_version": REGIME_VERSION, "status": "NOT_RECORDED"}
+    keep = ("regime_version", "tag", "btc_trend", "btc_volatility", "alt_breadth", "selloff",
+            "computed_at")
+    return {"status": "RECORDED", **{key: regime.get(key) for key in keep}}
 
 
 def record_day(store, bar_reader, day, *, now):

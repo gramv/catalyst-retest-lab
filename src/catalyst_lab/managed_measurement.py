@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from decimal import Decimal as D
 from decimal import InvalidOperation
 
+from catalyst_lab import trade_plan
 from catalyst_lab.managed_analytics import resolved_fill_costs
 from catalyst_lab.managed_store import TERMINAL
 from catalyst_lab.repository import json_safe
@@ -234,8 +235,11 @@ def managed_measurement(repository, setup_id, *, as_of=None):
     # filled buy quantity times (admitted max entry minus admitted initial stop), read
     # from the immutable admission record, never the reservation's authorized quantity
     # and never any later trailing-stop amendment recorded only in the setup's state.
+    # CRYPTO_TRADE_PLAN_V1 (trade_plan.py): the admitted initial stop is the plan's stop,
+    # recorded once at admission in the setup's state; every other setup keeps the packet's.
     try:
-        levels = setup["record_json"]["levels"] if setup else {}
+        levels = trade_plan.initial_levels(
+            setup["record_json"]["levels"] if setup else {}, state)
         m, s = D(str(levels["max_entry_price"])), D(str(levels["stop"]))
     except (KeyError, TypeError, ValueError, ArithmeticError):
         m = s = None

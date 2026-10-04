@@ -33,12 +33,31 @@ from catalyst_lab.managed_engineering import ENGINEERING_PURPOSE, is_engineering
 from catalyst_lab.managed_funnel import execution_quality, research_funnel
 from catalyst_lab.managed_measurement import managed_measurement
 from catalyst_lab.managed_store import COHORT
+from catalyst_lab.muse_guidelines import (
+    RESEARCH_GUIDELINES,
+    RESEARCH_GUIDELINES_SHA256,
+    RESEARCH_GUIDELINES_VERSION,
+)
 from catalyst_lab.muse_reports import ResearchReportRejected
 from catalyst_lab.pick_outcomes import cycle_picks, pick_outcome_aggregates, pick_outcome_page
 from catalyst_lab.repository import json_safe
 from catalyst_lab.research_cycle import ResearchThesis
 from catalyst_lab.research_evidence import canonical_sources
 from catalyst_lab.research_report_v3 import ResearchCapabilityUnavailable, declared_agent
+from catalyst_lab.research_validate import (
+    NOT_CONFIGURED,
+    RATE_LIMITED,
+    ValidateLimiter,
+    ValidateRateLimited,
+    principal_key,
+)
+from catalyst_lab.research_withdrawal import (
+    INVALID_WITHDRAWAL,
+    WITHDRAWAL_BODY_LIMIT,
+    WITHDRAWAL_TOO_LARGE,
+    WithdrawalConflict,
+)
+from catalyst_lab.research_withdrawal import declared_agent as withdrawal_agent
 from catalyst_lab.unchanged_plan import maintenance_replay_aggregates, maintenance_replay_page
 
 STATE_FIELDS = {
@@ -71,6 +90,25 @@ STATE_FIELDS = {
     # Set at open under CRYPTO_24H_REVIEW_V1 (package day-review) and the other review versions:
     # T of the next review and the number of continues so far.
     "day_review_at", "continuations",
+    # The stop-limit fallback: ``stop_breached_at`` under V1 and CRYPTO_STOP_BREACH_V2; the V2
+    # version (every crypto setup admitted from 2026-09-29), its marks and breach evidence.
+    "stop_breached_at", "stop_breach_version", "stop_breach_marks", "stop_breach_evidence",
+    # OPERATOR_PAUSE_ENTRY_WAIT_V1 (every setup admitted from 2026-09-29).
+    "pause_wait_version",
+    # CRYPTO_COINBASE_TRIGGER_V1 and CRYPTO_STOP_BREACH_V3 (owner approval 2026-09-29): the
+    # coin's Coinbase product, the reference market of its trigger and stop breach.
+    "reference_product",
+    # CRYPTO_ENTRY_WORKING_LIMIT_V1 (every crypto setup admitted from 2026-09-29): the entry's
+    # acknowledgement (its fill window's start), its stop marks before a fill, and the decision
+    # that ended the entry.
+    "entry_working_version", "entry_acknowledged_at", "entry_stop_marks", "entry_working_cancel",
+    # CRYPTO_ENTRY_PACING_V1 (package risk-pacing; crypto setups of a paced engine).
+    "entry_pacing_version",
+    # STRATEGY_REGISTRY_V1 (package strategy-c1; report-V3 crypto setups): the strategy.
+    "strategy_id", "strategy_version",
+    # Package exec-d (switched-on engines only): CRYPTO_STOP_EXECUTION_V1 and its collar, and
+    # CRYPTO_MAKER_ENTRY_V1.
+    "stop_execution_policy", "stop_execution_collar", "entry_execution_policy",
 }
 STATUS_FIELDS = {
     "worker_state", "last_cycle_at", "last_reconciliation_at", "trade_stream_connected",
@@ -80,7 +118,7 @@ STATUS_FIELDS = {
     "required_market_streams", "schema_version", "code_version", "configuration_hash",
     "release_commit", "operator_flatten", "jev_breaker", "jev_calls_today",
     "execution_halts", "exit_refusal_alarms", "trade_maintenance", "day_reviews",
-    "gap_resume", "jev_budget",
+    "gap_resume", "jev_budget", "reference_feed", "crypto_stream",
 }
 
 
@@ -101,7 +139,8 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
                        position_news=None, status_token=None, operator_token=None,
                        agent_tokens=None, research_context=None, trade_reviews=None,
                        bar_reader=None, clock=None, health_check_database=True,
-                       learning_intake=None):
+                       learning_intake=None, research_withdrawals=None, report_validate=None,
+                       validate_limiter=None):
     """Inject an actual runtime status callback; serving this page starts no worker.
 
     ``health_check_database`` (default True, the Mac app on loopback): ``GET /health`` reads the
@@ -137,6 +176,21 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
     agent's ``MARKET_OUTLOOK_V1`` (``POST /api/v1/lab/market-outlooks``) and ``POST_MORTEM_V1``
     (``POST /api/v1/lab/post-mortems``); without it both answer 503. Neither reaches Jev, and the
     results routes stay closed to agent tokens.
+
+    ``research_withdrawals`` (research_withdrawal.ResearchWithdrawals, package
+    research-loop-app) serves ``POST /api/v1/lab/research-withdrawals``
+    (``AGENT_RESEARCH_WITHDRAWAL_V1``): a research agent withdraws its own report-V3 picks that
+    are still WATCHING or not yet admitted; without it the route answers 503. It makes no broker
+    call and never touches another agent's record or a setup past WATCHING.
+
+    ``report_validate`` (an async callable over research_validate.ReportValidator, package
+    agent-api) serves ``POST /api/v1/lab/research-reports/validate``
+    (``RESEARCH_REPORT_VALIDATE_V1``): the report route's body limit, JSON and agent binding,
+    then report-V3 intake's verdict with admission warnings, and nothing written; without it the
+    route answers 503. ``validate_limiter`` (default ``research_validate.ValidateLimiter()``)
+    bounds it per credential (429 with ``Retry-After``). ``GET
+    /api/v1/lab/research-guidelines`` (``RESEARCH_GUIDELINES_ROUTE_V1``) serves the research
+    guidelines text the research context names, with its version and SHA-256.
 
     With ``status_token`` and ``operator_token`` (private config v2) every token has one role:
     ``api_token`` is Muse's, the status token is GET-only and the operator token is reserved.
@@ -209,7 +263,20 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
         # The learning loop (package learning-app): the agent's own outlook and post-mortems.
         ("POST", "/api/v1/lab/market-outlooks"),
         ("POST", "/api/v1/lab/post-mortems"),
+        # The research loop (package research-loop-app): withdrawing its own unfilled picks.
+        ("POST", "/api/v1/lab/research-withdrawals"),
+        # Package agent-api: the report's dry run (writes nothing) and the guidelines text.
+        ("POST", "/api/v1/lab/research-reports/validate"),
+        ("GET", "/api/v1/lab/research-guidelines"),
     })
+    validate_limiter = validate_limiter if validate_limiter is not None else ValidateLimiter()
+    guidelines_body = {
+        "route_version": "RESEARCH_GUIDELINES_ROUTE_V1",
+        "guidelines_version": RESEARCH_GUIDELINES_VERSION,
+        "guidelines_sha256": RESEARCH_GUIDELINES_SHA256,
+        "text": RESEARCH_GUIDELINES,
+        "trade_authorized": False,
+    }
 
     def authenticate(request: Request):
         supplied = request.headers.get("authorization", "").encode()
@@ -323,10 +390,9 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
             "scan": scan_readback(r["body"]) if "scan" in r["body"] else None,
         } for r in rows]})
 
-    @app.post("/api/v1/lab/research-reports", dependencies=[Depends(authenticate)], status_code=202)
-    async def research_report(request: Request):
-        if report_submit is None:
-            raise HTTPException(503, "MUSE_REPORT_INTAKE_NOT_CONFIGURED")
+    async def report_verdict(request, service):
+        """A research report through ``service`` (the intake, or its dry run): both routes read,
+        bind and answer a report with this one path."""
         chunks, size = [], 0
         async for chunk in request.stream():
             size += len(chunk)
@@ -347,12 +413,37 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
                 raise HTTPException(403, "AGENT_IDENTITY_MISMATCH")
             # 202 carries per-item `item_results`; a refused report stores nothing and its
             # 422 names codes and field paths only, never submitted values.
-            return json_safe(await report_submit(payload))
+            return json_safe(await service(payload))
         except ResearchReportRejected as exc:
             return JSONResponse(json_safe(exc.detail()), status_code=422)
         except ResearchCapabilityUnavailable as exc:
             # Report V3 without its schedule or tradable universe: nothing stored, retryable.
             raise HTTPException(503, exc.code) from None
+
+    @app.post("/api/v1/lab/research-reports", dependencies=[Depends(authenticate)], status_code=202)
+    async def research_report(request: Request):
+        if report_submit is None:
+            raise HTTPException(503, "MUSE_REPORT_INTAKE_NOT_CONFIGURED")
+        return await report_verdict(request, report_submit)
+
+    @app.post("/api/v1/lab/research-reports/validate", dependencies=[Depends(authenticate)])
+    async def research_report_validate(request: Request):
+        """RESEARCH_REPORT_VALIDATE_V1: the report route's verdict (its refusals unchanged), 200
+        with intake's ``item_results`` and admission warnings otherwise; nothing written."""
+        if report_validate is None:
+            raise HTTPException(503, NOT_CONFIGURED)
+        try:
+            with validate_limiter.hold(principal_key(request.state.principal)):
+                return await report_verdict(request, report_validate)
+        except ValidateRateLimited as exc:
+            raise HTTPException(429, RATE_LIMITED,
+                                headers={"Retry-After": str(exc.retry_after)}) from None
+
+    @app.get("/api/v1/lab/research-guidelines", dependencies=[Depends(authenticate)])
+    async def research_guidelines():
+        """RESEARCH_GUIDELINES_ROUTE_V1: the guidelines text the research context names in its
+        report_format, with that version and the SHA-256 of the text's UTF-8 bytes."""
+        return guidelines_body
 
     async def learning_record(request, *, limit, too_large, invalid, submit):
         """A learning body (package learning-app): bounded, strict JSON, its agent block
@@ -399,6 +490,37 @@ def create_managed_app(cycle, execution_store, *, api_token, runtime_status, rep
             request, limit=POST_MORTEM_BODY_LIMIT, too_large="POST_MORTEM_TOO_LARGE",
             invalid="INVALID_POST_MORTEM",
             submit=lambda body: learning_intake.submit_post_mortem(body, principal=principal))
+
+    @app.post("/api/v1/lab/research-withdrawals", dependencies=[Depends(authenticate)])
+    async def research_withdrawal(request: Request):
+        """AGENT_RESEARCH_WITHDRAWAL_V1: the agent's own unfilled report-V3 picks, withdrawn.
+        The report route's body limit; the agent block is bound to the credential first."""
+        if research_withdrawals is None:
+            raise HTTPException(503, "RESEARCH_WITHDRAWAL_NOT_CONFIGURED")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > WITHDRAWAL_BODY_LIMIT:
+                raise HTTPException(413, WITHDRAWAL_TOO_LARGE)
+            chunks.append(chunk)
+        try:
+            payload = strict_json(b"".join(chunks))
+            if not isinstance(payload, dict):
+                raise ValueError
+        except (ValueError, TypeError, UnicodeError):
+            raise HTTPException(422, INVALID_WITHDRAWAL) from None
+        principal = request.state.principal
+        try:
+            agent = withdrawal_agent(payload)
+            if not principal.acts_for(agent["agent_id"]):
+                raise HTTPException(403, "AGENT_IDENTITY_MISMATCH")
+            # 200 with one result per coin; a refusal stores nothing and names codes and paths.
+            return json_safe(await asyncio.to_thread(
+                research_withdrawals.withdraw, payload, principal=principal))
+        except ResearchReportRejected as exc:
+            return JSONResponse(json_safe(exc.detail()), status_code=422)
+        except WithdrawalConflict:
+            raise HTTPException(409, "WITHDRAWAL_ID_CONFLICT") from None
 
     @app.get("/api/v1/lab/research-context", dependencies=[Depends(authenticate)])
     def research_context_route(request: Request):

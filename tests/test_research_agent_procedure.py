@@ -83,6 +83,51 @@ def test_every_concrete_agent_identity_is_one_the_app_accepts():
     assert "claude-as-muse-intraday-v1-09.28" in checked and "fable" in checked
 
 
+def test_the_update_run_is_update_then_submit_in_its_own_folder():
+    text = section(PROCEDURE, "## Update run (every 2 hours, RESEARCH_SCHEDULE_V2)")
+    parser = run.build_parser()
+    parsed = [parser.parse_args(argv) for argv in commands(text)]
+    assert [args.command for args in parsed] == ["update", "submit"]
+    update_args, submit_args = parsed
+    assert update_args.profile == "intraday" and update_args.max_picks == 8
+    assert update_args.base_url == "x" and update_args.token_file == "x"
+    assert update_args.run_dir == submit_args.run_dir == "x"
+    assert "runs/<YYYY-MM-DD>/update-<HHMM>" in text
+    for code in ("UPDATE_NEEDS_SCHEDULE_V2", "UPDATE_SLOT_IS_FULL_RUN",
+                 "RESEARCH_WITHDRAWAL_RECORDED", "WITHDRAWAL_ID_CONFLICT"):
+        assert code in text
+    assert "Any withdrawal answer but 200 stops before the report is sent" in text
+    # The intraday run says when it does not apply.
+    intraday = section(PROCEDURE, "## Intraday run (every 2 hours)")
+    assert "Under `RESEARCH_SCHEDULE_V2`" in intraday
+
+
+def test_the_morning_reads_the_derivatives_context_right_before_build():
+    text = section(PROCEDURE, "## Morning")
+    parser = run.build_parser()
+    parsed = [parser.parse_args(argv) for argv in commands(text)]
+    steps = [args.command for args in parsed]
+    assert steps.index("derivatives") == steps.index("build") - 1
+    [build_args] = [args for args in parsed if args.command == "build"]
+    assert build_args.derivatives == "x/derivatives.json"
+    assert build_args.lessons == "x/emphasis.json"
+    prompt = section(PROMPTS, "## Morning (08:00 New York)")
+    assert "--derivatives derivatives.json" in prompt
+
+
+def test_the_update_prompt_gives_its_placeholders_identity_and_section():
+    prompt = section(PROMPTS, "## Update (every 2 hours, RESEARCH_SCHEDULE_V2)")
+    for placeholder in ("<RUN_DIR", "<BASE_URL", "<TOKEN_FILE_PATH>"):
+        assert placeholder in prompt
+    assert "never read this file's contents" in prompt
+    assert "--agent-id muse --agent-version claude-as-muse-update-v1-09.29" in prompt
+    assert AGENT_VERSION.fullmatch("claude-as-muse-update-v1-09.29")  # 30 of 32 characters.
+    assert "update --profile intraday" in prompt and "runs/2026-09-29/update-1000" in prompt
+    assert '"Update run (every 2 hours,\nRESEARCH_SCHEDULE_V2)"' in prompt
+    intraday = section(PROMPTS, "## Intraday (every 2 hours)")
+    assert "RESEARCH_SCHEDULE_V2" in intraday
+
+
 def test_the_intraday_prompt_gives_its_placeholders_identity_and_profile():
     prompt = section(PROMPTS, "## Intraday (every 2 hours)")
     for placeholder in ("<RUN_DIR", "<BASE_URL", "<TOKEN_FILE_PATH>"):

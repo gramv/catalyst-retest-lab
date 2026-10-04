@@ -292,7 +292,7 @@ def test_the_owner_switch_reads_v2_with_k_and_refuses_a_floor():
     with pytest.raises(ValueError, match="^SELECTION_QUALITY_FLOOR_NOT_APPLICABLE$"):
         topk.selection_rule_from_env({RULE_ENV: V2, FLOOR_ENV: "WEAK"})
     with pytest.raises(ValueError, match="^UNKNOWN_SELECTION_RULE$"):
-        topk.TopKRule("JEV_TOP_K_SELECTION_V3")
+        topk.TopKRule("JEV_TOP_K_SELECTION_V4")  # V3 exists since 2026-10-03.
     assert topk.is_topk_policy(V2) and topk.is_topk_policy(topk.TOPK_POLICY)
     assert not topk.is_topk_policy("MUSE_JEV_RESEARCH_SELECTION_V2")
 
@@ -569,9 +569,12 @@ def test_migration_023_is_021s_branch_with_only_the_documented_changes(er):
             for name in ("managed_review_failure", "managed_review_failure_topk_v2",
                          "managed_review_failure_topk")}
         version = conn.execute("SELECT max(version) AS v FROM lab.schema_migrations").fetchone()
-    # 024 (public experiment views) and 025 (Jev review policy V2) follow; neither changes
-    # these functions.
-    assert version["v"] == 25
+    # 024 (public experiment views), 025 (Jev review policy V2), 026 (JEV_MANAGED_RISK_V4),
+    # 027 (the trade plan's planned-stop guard), 028 and 029 (public page views) follow; none
+    # changes these functions. 030 (JEV_TOP_K_SELECTION_V3) puts its branch in front of the
+    # dispatcher (tests/test_selection_topk_v3.py); without it the stored dispatcher is 023's.
+    # 031 (package plugin-c3) puts the strategy-signal branch in front of that.
+    assert version["v"] == 31
     expected, comment_v1 = expected_v2_branch()
     stored = rows["managed_review_failure_topk_v2"]["prosrc"]
     comment_v2 = stored[stored.index(" -- No veto label"):stored.index(" names:=")]
@@ -581,7 +584,11 @@ def test_migration_023_is_021s_branch_with_only_the_documented_changes(er):
     assert rows["managed_review_failure_topk"]["prosrc"] == function_source(
         V1_MIGRATION, "CREATE FUNCTION lab.managed_review_failure_topk(packet jsonb)")
     # The dispatcher is 021's, byte for byte, with the V2 branch in front of it.
-    dispatcher = rows["managed_review_failure"]["prosrc"]
+    from tests.test_selection_topk_v3 import TOPK_V3_DISPATCH, stored_dispatcher_before_031
+
+    stored = stored_dispatcher_before_031(rows["managed_review_failure"]["prosrc"])
+    assert stored.count(TOPK_V3_DISPATCH) == 1
+    dispatcher = stored.replace(TOPK_V3_DISPATCH, "")
     header = "CREATE OR REPLACE FUNCTION lab.managed_review_failure(packet jsonb)"
     assert dispatcher == function_source(V2_MIGRATION, header)
     assert dispatcher.count(TOPK_V2_DISPATCH) == 1

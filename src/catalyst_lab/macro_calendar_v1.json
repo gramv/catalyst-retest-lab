@@ -1,0 +1,22 @@
+{
+  "version": "US_MACRO_CALENDAR_V1",
+  "timezone": "America/New_York",
+  "note": "CRYPTO_ENTRY_PACING_V1 (regime_gate.py): no new crypto entry from 15 minutes before to 45 minutes after each release below. MUST BE EXTENDED: after the earliest coverage 'through' date every paced crypto entry waits (MACRO_CALENDAR_EXPIRED). BLS had not published its 2027 CPI schedule on 2026-10-02; add the January-March 2027 CPI dates (and later ones) from the BLS schedule when published, move CPI 'through' forward, and add the FOMC meetings after March 2027. 2027 FOMC dates are tentative until confirmed at the preceding meeting; re-check them.",
+  "sources": {
+    "CPI": "https://www.bls.gov/schedule/news_release/cpi.htm (read 2026-10-02; releases at 08:30 ET)",
+    "FOMC": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm (read 2026-10-02; statement at 14:00 ET on the meeting's last day)"
+  },
+  "coverage": {
+    "CPI": {"from": "2026-10-01", "through": "2026-12-31"},
+    "FOMC": {"from": "2026-10-01", "through": "2027-03-31"}
+  },
+  "events": [
+    {"kind": "CPI", "date": "2026-10-14", "time": "08:30", "label": "CPI for September 2026"},
+    {"kind": "CPI", "date": "2026-11-10", "time": "08:30", "label": "CPI for October 2026"},
+    {"kind": "CPI", "date": "2026-12-10", "time": "08:30", "label": "CPI for November 2026"},
+    {"kind": "FOMC", "date": "2026-10-28", "time": "14:00", "label": "FOMC statement, October 27-28 meeting"},
+    {"kind": "FOMC", "date": "2026-12-09", "time": "14:00", "label": "FOMC statement, December 8-9 meeting (SEP)"},
+    {"kind": "FOMC", "date": "2027-01-27", "time": "14:00", "label": "FOMC statement, January 26-27 meeting (tentative)"},
+    {"kind": "FOMC", "date": "2027-03-17", "time": "14:00", "label": "FOMC statement, March 16-17 meeting (SEP, tentative)"}
+  ]
+}

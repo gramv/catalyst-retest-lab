@@ -1,5 +1,9 @@
 """The public live dashboard's data: one JSON-safe document built from the four
-``lab.public_dashboard_*`` views of migration 024 (role ``catalyst_public``).
+``lab.public_dashboard_*`` views of migration 024 and the four ``lab.public_page_*`` views of
+migration 028 (role ``catalyst_public``). EXPERIMENT_DASHBOARD_V2 (package public-page) adds the
+status line, today's P&L against the daily limits, open risk against the cap, the market's
+regime, results by market and by rules, and each trade's traded levels, plan and entry waits
+(their definitions are with the page V2 functions below).
 
 Paper only: nothing here can place, change or cancel an order, and nothing reads a broker or
 Jev/TypeSafe credential or calls an exchange. Display definitions (docs/packages/
@@ -10,7 +14,9 @@ experiment-page.md):
   Nothing is estimated.
 * **P&L of an open trade** is the held quantity times (the freshest price the ledger holds, the
   bid, minus the average entry). No price in the ledger: unknown.
-* **R** divides P&L by the planned risk, filled quantity x (max entry - initial stop).
+* **R** divides P&L by the planned risk, filled quantity x (max entry - initial stop). V2: the
+  initial stop is the stop actually traded (CRYPTO_TRADE_PLAN_V1's plan stop when the trade
+  recorded one, as lab.managed_planned_stop plans the reservation; else the research stop).
 * **Size**: an open trade's quantity is the quantity it holds, a closed trade's the quantity it
   bought; its value at entry is that quantity x the average entry, and an open trade's value
   now is its quantity x the freshest price the ledger holds (none without a price).
@@ -37,7 +43,11 @@ experiment-page.md):
   schedule's limit for its slot (the next run plus the grace; the research kit sets reports to
   that limit). A pick's status: in trade or closed (with the trade number), no entry yet
   (selected, before the limit), expired (selected, after it) or not selected. A newer run that
-  Jev has not ranked yet is shown as awaiting Jev.
+  Jev has not ranked yet is shown as awaiting Jev. Under RESEARCH_SCHEDULE_V2 (a daily full run
+  plus update runs, RESEARCH_RUN_SUPERSESSION_V2) the current cycle is the newest ranked full
+  run and every ranked update run after it, valid until the next full run plus the grace; a
+  selected pick without a trade whose coin a later run of the cycle selected again is
+  replaced. The schedule in words then names the daily run and the updates.
 * **Jev's scoped logs**: "This cycle" is Jev's decisions since the current cycle's selection
   (its per-pick verdicts, then reviews, level changes, 24-hour reviews, and the trades' entries
   and exits); "Today" is the New York day's (each run's selection as one line). Newest first,
@@ -46,13 +56,14 @@ experiment-page.md):
 """
 
 from collections import Counter, defaultdict
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal as D
 from zoneinfo import ZoneInfo
 
+from catalyst_lab import experiment_v3 as v3
 from catalyst_lab.repository import json_safe
 
-DASHBOARD_VERSION = "EXPERIMENT_DASHBOARD_V1"
+DASHBOARD_VERSION = "EXPERIMENT_DASHBOARD_V3"
 DEFAULT_TITLE = "AI crypto trading — live"
 FIXTURE_BANNER = "FIXTURE DATA — not real results"
 ACCOUNT_LABEL = "Paper account"
@@ -77,6 +88,7 @@ EXIT_REASONS = {
     "TARGET_EXIT": "Target reached",
     "BROKER_EXIT": "Stop hit",
     "STOP_LIMIT_NOT_FILLED": "Stop hit, sold at market",
+    "STOP_EMULATED_EXIT": "Stop hit on Coinbase, sold",
     "STOP_CROSSED_DURING_REPLACE": "Raised stop hit",
     # Window-neutral (package review-window): the 24-hour and the window versions share these
     # exit codes, and the public views carry no trade's window.
@@ -90,7 +102,8 @@ EXIT_REASONS = {
     "TIME_EXIT": "Time limit",
 }
 BASES = {
-    "BREAKEVEN": "breakeven", "SWING_LOW_15M": "15-minute swing low",
+    "BREAKEVEN": "breakeven", "BREAKEVEN_AFTER_FEES": "breakeven after fees",
+    "SWING_LOW_15M": "15-minute swing low",
     "SWING_LOW_1H": "1-hour swing low", "HIGH_24H": "24-hour high", "HIGH_7D": "7-day high",
     "SWING_HIGH_1H": "1-hour swing high", "SWING_HIGH_4H": "4-hour swing high",
 }
@@ -116,10 +129,6 @@ SNAPSHOT_QUERIES = {
     "recent": f"""SELECT * FROM lab.public_dashboard_decisions
         WHERE at IS NOT NULL AND kind NOT IN ('PICK','SELECTION')
         ORDER BY at DESC, trade_no, kind LIMIT {RECENT_LIMIT}""",
-    "latest_picks": """SELECT d.* FROM lab.public_dashboard_decisions d
-        JOIN (SELECT agent, max(run_no) AS run_no FROM lab.public_dashboard_runs GROUP BY agent)
-        l ON l.run_no=d.run_no WHERE d.kind IN ('PICK','SELECTION')
-        ORDER BY d.run_no, d.kind, d.jev_rank NULLS LAST, d.symbol""",
 }
 
 
@@ -127,7 +136,10 @@ SNAPSHOT_QUERIES = {
 # events and levels. At most 60 reviews per trade (the view), plus picks, answers and flags.
 TRADE_DECISIONS = """SELECT * FROM lab.public_dashboard_decisions
     WHERE trade_no = ANY(%s) AND at IS NOT NULL ORDER BY trade_no, at, kind"""
-# The current cycle's picks and Jev's verdicts (its runs may not be each agent's latest).
+# The picks and Jev's verdicts of the given runs: each agent's latest run (``latest_runs``, read
+# from the runs already fetched) and the current cycle's runs (they may not be each agent's
+# latest). Not a join with the runs view: that plan took 5.8 s on the live ledger (2026-09-29,
+# 12 runs) against 0.15 s for these run numbers, and the page stopped answering.
 CYCLE_PICKS = """SELECT * FROM lab.public_dashboard_decisions
     WHERE kind IN ('PICK','SELECTION') AND run_no = ANY(%s)
     ORDER BY run_no, kind, jev_rank NULLS LAST, symbol"""
@@ -136,6 +148,15 @@ CYCLE_PICKS = """SELECT * FROM lab.public_dashboard_decisions
 DAY_DECISIONS = f"""SELECT * FROM lab.public_dashboard_decisions
     WHERE at >= %s AND kind NOT IN ('PICK','SELECTION')
     ORDER BY at DESC, trade_no, kind LIMIT {DAY_LIMIT}"""
+
+
+PAGE_STATUS = "SELECT * FROM lab.public_page_status"
+PAGE_TRADES = "SELECT * FROM lab.public_page_trades ORDER BY trade_no"
+PAGE_WAITS = """SELECT * FROM lab.public_page_trade_waits WHERE trade_no = ANY(%s)
+    ORDER BY trade_no, first_at, wait_kind, reason"""
+PAGE_REGIMES = "SELECT * FROM lab.public_page_regimes ORDER BY day"
+PAGE_REVIEWS = """SELECT * FROM lab.public_page_reviews WHERE trade_no = ANY(%s)
+    ORDER BY trade_no, at"""
 
 
 def shown_trades(rows, limit=CLOSED_LIMIT):
@@ -147,11 +168,31 @@ def shown_trades(rows, limit=CLOSED_LIMIT):
         r["trade_no"] for r in closed[:limit]]
 
 
-def cycle_runs(runs):
-    """The current cycle: the runs of the newest run slot Jev has ranked (oldest run first)."""
+def latest_runs(runs):
+    """Each agent's newest run number, ascending."""
+    newest = {}
+    for r in runs:
+        newest[r["agent"]] = max(newest.get(r["agent"], r["run_no"]), r["run_no"])
+    return sorted(newest.values())
+
+
+def cycle_runs(runs, schedule=None):
+    """The current cycle: the runs of the newest run slot Jev has ranked (oldest run first).
+
+    Under RESEARCH_SCHEDULE_V2 (``schedule`` names its daily run): the newest ranked full run
+    and every ranked run after it, by slot, since their picks all stay valid until the next
+    full run; the newest slot's runs, as under V1, while no full run has been ranked."""
     ranked = [r for r in runs if r["ranked_at"] is not None]
     if not ranked:
         return []
+    plan = _v2_plan(schedule)
+    if plan is not None:
+        full = [_aware(r["run_at"]) for r in ranked
+                if plan.run_kind(_aware(r["run_at"])) == FULL_RUN_KIND]
+        if full:
+            start = max(full)
+            return sorted((r for r in ranked if _aware(r["run_at"]) >= start),
+                          key=lambda r: (_aware(r["run_at"]), r["run_no"]))
     slot = max(_aware(r["run_at"]) for r in ranked)
     return sorted((r for r in ranked if _aware(r["run_at"]) == slot), key=lambda r: r["run_no"])
 
@@ -169,20 +210,38 @@ def scope_start(status, cycle):
     return min([start, *selected])
 
 
-def read_snapshot(conn):
+def read_snapshot(conn, schedule=None):
     """Every public view, read in the caller's transaction (the service opens it REPEATABLE
-    READ, READ ONLY, so all the figures describe one instant)."""
+    READ, READ ONLY, so all the figures describe one instant). ``schedule`` decides the current
+    cycle's runs under RESEARCH_SCHEDULE_V2 (``cycle_runs``)."""
     snapshot = {"status": conn.execute("SELECT * FROM lab.public_dashboard_status").fetchone()}
     for name, sql in SNAPSHOT_QUERIES.items():
         snapshot[name] = conn.execute(sql).fetchall()
+    latest = latest_runs(snapshot["runs"])
+    snapshot["latest_picks"] = (
+        conn.execute(CYCLE_PICKS, (latest,)).fetchall() if latest else [])
     numbers = shown_trades(snapshot["trades"])
     snapshot["trade_decisions"] = (
         conn.execute(TRADE_DECISIONS, (numbers,)).fetchall() if numbers else [])
-    cycle = cycle_runs(snapshot["runs"])
+    cycle = cycle_runs(snapshot["runs"], schedule)
     snapshot["cycle_picks"] = (conn.execute(
         CYCLE_PICKS, ([r["run_no"] for r in cycle],)).fetchall() if cycle else [])
     snapshot["day_decisions"] = conn.execute(
         DAY_DECISIONS, (scope_start(snapshot["status"], cycle),)).fetchall()
+    # Page V2 (migration 028): the account's state, the traded levels and versions, the entry
+    # waits of the shown trades and the days' market regimes.
+    snapshot["page_status"] = conn.execute(PAGE_STATUS).fetchone()
+    snapshot["page_trades"] = conn.execute(PAGE_TRADES).fetchall()
+    snapshot["page_waits"] = (
+        conn.execute(PAGE_WAITS, (numbers,)).fetchall() if numbers else [])
+    snapshot["page_reviews"] = (
+        conn.execute(PAGE_REVIEWS, (numbers,)).fetchall() if numbers else [])
+    snapshot["regimes"] = conn.execute(PAGE_REGIMES).fetchall()
+    # Page V3 (migration 029): equity snapshots, day starts, halts and soft limits, and the
+    # STATS_EXCLUSION_V1 records.
+    from catalyst_lab.experiment_v3 import read_v3
+
+    snapshot.update(read_v3(conn))
     return snapshot
 
 
@@ -270,7 +329,7 @@ def level_change(action, stop, target, basis):
     """``Raised stop to breakeven (331.17)``, ``Raised target to 7.61 (24-hour high)``..."""
     stop_text, target_text = number_text(stop), number_text(target)
     moves_stop = action in {"RAISE_STOP", "RAISE_STOP_AND_TARGET"}
-    if moves_stop and basis == "BREAKEVEN":
+    if moves_stop and basis in {"BREAKEVEN", "BREAKEVEN_AFTER_FEES"}:
         text = f"Raised stop to breakeven ({stop_text})"
     elif moves_stop:
         text = f"Raised stop to {stop_text}"
@@ -280,7 +339,7 @@ def level_change(action, stop, target, basis):
         return "Changed the levels"
     if action == "RAISE_STOP_AND_TARGET":
         text += f" and target to {target_text}"
-    if basis in BASES and basis != "BREAKEVEN":
+    if basis in BASES and basis not in {"BREAKEVEN", "BREAKEVEN_AFTER_FEES"}:
         text += f" ({BASES[basis]})"
     return text
 
@@ -318,6 +377,7 @@ def closed_trade(row):
         "exit_reason": EXIT_REASONS.get(row["exit_reason"], row["exit_reason"]),
         "pnl_usd": pnl, "pnl_r": _ratio(pnl, risk),
         "fees_usd": _dec(row["fees_usd"]) if verified else None, "fees_pending": not verified,
+        "gross_pnl_usd": gross,  # EXPERIMENT_DASHBOARD_V3: the daily columns' tooltip.
     }
 
 
@@ -372,7 +432,9 @@ def totals(trades):
     }
 
 
-def past_days(closed):
+def past_days(closed, regimes=()):
+    """Each New York day's closed trades (by exit), with the day's recorded market in words."""
+    markets = {r["day"]: regime_words(r["tag"]) for r in regimes}
     by_day = defaultdict(list)
     for trade in closed:
         if trade["exit_at"] is not None:
@@ -383,7 +445,8 @@ def past_days(closed):
         cumulative += figures["pnl_usd"]
         days.append({"day": day.isoformat(), **{k: figures[k] for k in (
             "closed", "wins", "losses", "pnl_usd", "pnl_r", "fees_pending")},
-            "cumulative_pnl_usd": cumulative})
+            "cumulative_pnl_usd": cumulative,
+            "market": (markets.get(day.isoformat()) or {}).get("short")})
     return days
 
 
@@ -498,7 +561,10 @@ def _decision_event(d, before):
     event = {"at": d["at"], "since": d["at"], "kind": kind, "actor": d["actor"],
              "outcome": outcome, "confidence": d["confidence"], "repeats": 1,
              "repeats_more": False}
-    if kind == "MAINTENANCE":
+    if kind == "MAINTENANCE" and d.get("v5"):
+        event["kind"], event["v5"] = "REVIEW", d["v5"]
+        event["text"] = v5_words(d["v5"], outcome)
+    elif kind == "MAINTENANCE":
         event["kind"] = "REVIEW"
         if outcome == "APPLIED":
             after = (_plain(d["stop"]), _plain(d["target"]))
@@ -529,6 +595,84 @@ def _decision_event(d, before):
     return event
 
 
+V5_LABELS = (("invalidation", "invalidation met"), ("news", "news contradicts"))
+V5_VERDICTS = {"YES": "yes", "NO": "no", "UNCERTAIN": "unsure"}
+V5_CONFIRM = 3  # MAINTENANCE_ANSWER_RULE_V3: the third counted yes confirms.
+
+
+def v5_review(row):
+    """A ``public_page_reviews`` row as the decision's ``v5`` record (asked questions only)."""
+    out = {"action": row["action"]}
+    for key, _ in V5_LABELS:
+        if row[f"{key}_verdict"] is not None:
+            out[key] = {"p": _dec(row[f"{key}_p"]), "verdict": row[f"{key}_verdict"],
+                        "effect": row[f"{key}_effect"],
+                        "streak": _int(row[f"{key}_streak"])}
+    return out
+
+
+def with_v5(rows, reviews):
+    """Decision rows with CRYPTO_MAINTENANCE_V5's answers attached (``v5``); a review whose
+    streak is running reads as ``CONFIRMING`` (never folded with plain holds)."""
+    by_key = {(r["trade_no"], _aware(r["at"])): v5_review(r) for r in reviews}
+    if not by_key:
+        return rows
+    out = []
+    for row in rows:
+        v5 = by_key.get((row["trade_no"], _aware(row["at"]))) if row["kind"] == "MAINTENANCE" \
+            else None
+        if v5 is None:
+            out.append(row)
+            continue
+        outcome = "CONFIRMING" if v5["action"] == "CONFIRMING" else row["outcome"]
+        out.append({**row, "v5": v5, "outcome": outcome})
+    return out
+
+
+def v5_words(v5, outcome=None):
+    """``Invalidation met? no (0.08) · news contradicts? no (0.12)``; a counted yes adds its
+    streak (``yes (0.86), 2 of 3``); a confirmed question flags an early exit."""
+    parts = []
+    for key, label in V5_LABELS:
+        answer = v5.get(key)
+        if not answer:
+            continue
+        words = f"{label}? {V5_VERDICTS[answer['verdict']]}"
+        if answer["p"] is not None:
+            words += f" ({answer['p'].quantize(D('0.01'))})"
+        if answer["effect"] == "COUNTED" and answer["streak"]:
+            words += f", {answer['streak']} of {V5_CONFIRM}"
+        elif answer["effect"] == "CONFIRMED":
+            words += f", {V5_CONFIRM} of {V5_CONFIRM}"
+        parts.append(words)
+    text = " · ".join(parts) or "Reviewed"
+    text = text[0].upper() + text[1:]
+    if outcome == "FLAGGED":
+        text += ": flagged for an early exit"
+    elif outcome in {"FAILED", "REFUSED", "DISCARDED"}:
+        text = MAINTENANCE_WORDS.get(outcome, "Reviewed")
+    return text
+
+
+def _track_v5(target, item):
+    """Keep a folded line's range of invalidation probabilities and verdicts."""
+    answer = (item.get("v5") or {}).get("invalidation")
+    if not answer:
+        return
+    target.setdefault("v5_ps", []).append(answer["p"])
+    target.setdefault("v5_verdicts", set()).add(answer["verdict"])
+
+
+def v5_repeated(item, count):
+    """``Held: invalidation met? no, 18 reviews in a row (p 0.02–0.12)``."""
+    ps = [p for p in item.get("v5_ps", []) if p is not None]
+    verdicts = item.get("v5_verdicts") or set()
+    answer = "no" if verdicts == {"NO"} else "no or unsure"
+    span = (f" (p {min(ps).quantize(D('0.01'))}–{max(ps).quantize(D('0.01'))})"
+            if ps else "")
+    return f"Held: invalidation met? {answer}, {count} reviews in a row{span}"
+
+
 def _fold(events, window_start=None):
     """A trade's consecutive reviews with one unchanged outcome become one line. With its
     reviews cut at 60 (``window_start``: the oldest listed one), the streak that starts there
@@ -537,18 +681,26 @@ def _fold(events, window_start=None):
     for event in events:
         last = out[-1] if out else None
         if (event["kind"] == "REVIEW" and event["outcome"] in REPEATING and last is not None
-                and last["kind"] == "REVIEW" and last["outcome"] == event["outcome"]):
+                and last["kind"] == "REVIEW" and last["outcome"] == event["outcome"]
+                and bool(last.get("v5")) == bool(event.get("v5"))):
             last["repeats"] += 1
             last["at"], last["confidence"] = event["at"], event["confidence"]
+            _track_v5(last, event)
             continue
+        _track_v5(event, event)
         out.append(event)
     for event in out:
+        ps, verdicts = event.pop("v5_ps", None), event.pop("v5_verdicts", None)
         if event["kind"] != "REVIEW" or event["repeats"] < 2:
             continue
         event["repeats_more"] = (window_start is not None and event["outcome"] in REPEATING
                                  and _aware(event["since"]) == _aware(window_start))
-        event["text"] = repeated_words(event["outcome"], event["repeats"],
-                                       event["repeats_more"])
+        if event.get("v5") and event["outcome"] == "HELD":
+            event["text"] = v5_repeated({"v5_ps": ps, "v5_verdicts": verdicts},
+                                        f"{event['repeats']}{'+' if event['repeats_more'] else ''}")
+        else:
+            event["text"] = repeated_words(event["outcome"], event["repeats"],
+                                           event["repeats_more"])
     return out
 
 
@@ -588,13 +740,18 @@ def _exit_events(row, trade):
     ]
 
 
-def trade_story(row, trade, decisions):
-    """A trade's ``events`` (oldest first) and ``levels`` (display definitions)."""
+def trade_story(row, trade, decisions, *, plan=None, waits=()):
+    """A trade's ``events`` (oldest first) and ``levels`` (display definitions). ``plan``
+    (CRYPTO_TRADE_PLAN_V1) adds the plan line and ``waits`` the entry waits before the buy."""
     reviews = [d for d in decisions if d["kind"] == "MAINTENANCE"]
     cut = len(reviews) >= PER_TRADE_LIMIT
     window_start = reviews[0]["at"] if reviews else None
     steps, entry_known = level_steps(row, decisions, cut, window_start)
     events = [_decision_event(d, None) for d in decisions if d["kind"] in {"PICK", "SELECTION"}]
+    if plan is not None and plan["set_at"] is not None:
+        events.append(plan_event(plan))
+    events += [wait_event(w) for w in waits if w["first_at"] is not None]
+    events.sort(key=lambda e: _aware(e["at"]))
     if row["entry_at"] is not None:
         events += _entry_events(row, trade)
     if cut:
@@ -629,6 +786,8 @@ def decision_text(row):
     """One plain line for one decision (the actor is shown beside it); an agent's own words
     stay in ``note``."""
     kind, outcome, symbol = row["kind"], row["outcome"], row["symbol"] or "a coin"
+    if kind == "MAINTENANCE" and row.get("v5"):
+        return f"{symbol}: " + v5_words(row["v5"], outcome)
     if kind in {"MAINTENANCE", "DAY_REVIEW"}:
         return f"{symbol}: " + jev_action(kind, outcome, row["action"], row["stop"],
                                           row["target"], row["basis"])
@@ -657,7 +816,8 @@ def decision(row):
         note = None  # Internal codes stay out of the public lines.
     return {"at": row["at"], "actor": row["actor"], "agent": row["agent"], "kind": row["kind"],
             "outcome": row["outcome"], "symbol": row["symbol"], "trade_no": row["trade_no"],
-            "text": decision_text(row), "note": note, "confidence": row["confidence"]}
+            "text": decision_text(row), "note": note, "confidence": row["confidence"],
+            **({"v5": row["v5"]} if row.get("v5") else {})}
 
 
 def _coins(symbols, limit=5):
@@ -721,13 +881,16 @@ def fold_lines(items, length, *, window_full=False):
         repeating = (item["kind"] == "MAINTENANCE" and item["outcome"] in REPEATING
                      and trade is not None)
         current = streaks.get(trade)
-        if repeating and current is not None and current["outcome"] == item["outcome"]:
+        if repeating and current is not None and current["outcome"] == item["outcome"] \
+                and bool(current.get("v5")) == bool(item.get("v5")):
             current["repeats"] += 1
             current["since"] = item["at"]
+            _track_v5(current, item)
             continue
         line = None
         if len(out) < length:  # A full list skips older lines but still grows open streaks.
             line = {**item, "repeats": 1, "since": item["at"]}
+            _track_v5(line, item)
             out.append(line)
         if trade is not None:  # Any other decision on the trade ends its open streak.
             streaks[trade] = line if repeating else None
@@ -738,7 +901,12 @@ def fold_lines(items, length, *, window_full=False):
             item["repeats"] > 1 and item["kind"] == "MAINTENANCE"
             and _aware(item["since"]) == oldest.get(trade)
             and (window_full or reviews[trade] >= PER_TRADE_LIMIT))
-        if item["repeats"] > 1:
+        ps, verdicts = item.pop("v5_ps", None), item.pop("v5_verdicts", None)
+        if item["repeats"] > 1 and item.get("v5") and item["outcome"] == "HELD":
+            count = f"{item['repeats']}{'+' if item['repeats_more'] else ''}"
+            item["text"] = (f"{item['symbol'] or 'a coin'}: "
+                            + v5_repeated({"v5_ps": ps, "v5_verdicts": verdicts}, count))
+        elif item["repeats"] > 1:
             item["text"] = repeated_text(item)
     return out
 
@@ -752,6 +920,15 @@ def _plan(schedule):
     return ResearchSchedule(**schedule) if isinstance(schedule, dict) else schedule
 
 
+def _v2_plan(schedule):
+    """The schedule when it is RESEARCH_SCHEDULE_V2 (it names its daily full run), else None."""
+    try:
+        plan = _plan(schedule)
+    except Exception:  # noqa: BLE001 -- an unreadable schedule keeps the V1 display.
+        return None
+    return plan if getattr(plan, "daily", None) is not None else None
+
+
 def next_run(schedule, now):
     """The next scheduled research run (``RESEARCH_SCHEDULE_V1``), or None when unreadable."""
     try:
@@ -762,7 +939,9 @@ def next_run(schedule, now):
 
 def schedule_summary(schedule, now):
     """``Every 2 hours``, ``Daily at 08:00`` or ``3 runs a day``, with the run times, their time
-    zone and the next run; None when the schedule is unreadable."""
+    zone and the next run; None when the schedule is unreadable. Under RESEARCH_SCHEDULE_V2
+    the words name the daily full run and the updates (``Daily at 08:00 + updates every 2
+    hours``), with ``daily``, the next run's kind and the next full run."""
     try:
         plan = _plan(schedule)
         minutes = [int(run[:2]) * 60 + int(run[3:]) for run in plan.runs]
@@ -779,8 +958,26 @@ def schedule_summary(schedule, now):
         text = f"Every {gap} minutes"
     else:
         text = "Every hour" if gap == 60 else f"Every {gap // 60} hours"
-    return {"text": text, "timezone": plan.timezone, "times": list(plan.runs),
-            "next_run_at": next_run(plan, now)}
+    summary = {"text": text, "timezone": plan.timezone, "times": list(plan.runs),
+               "next_run_at": next_run(plan, now)}
+    daily = getattr(plan, "daily", None)
+    if daily is None:
+        return summary
+    updates = len(minutes) - 1
+    if not updates:
+        words = f"Daily at {daily}"
+    elif len(gaps) > 1:
+        words = f"Daily at {daily} + {updates} update{'s' if updates > 1 else ''} a day"
+    else:
+        words = f"Daily at {daily} + updates {text[0].lower()}{text[1:]}"
+    upcoming = summary["next_run_at"]
+    try:
+        full = plan.next_full_after(now)
+    except Exception:  # noqa: BLE001 -- as ``next_run``: no time, no next full run shown.
+        full = None
+    return {**summary, "text": words, "daily": daily,
+            "next_run_kind": plan.run_kind(upcoming) if upcoming else None,
+            "next_full_run_at": full}
 
 
 def run_summary(run):
@@ -803,7 +1000,7 @@ def todays_runs(runs, today):
 
 def pending_run(runs, cycle):
     """The newest run Jev has not ranked yet, when it is newer than the current cycle."""
-    slot = _aware(cycle[0]["run_at"]) if cycle else None
+    slot = max(_aware(r["run_at"]) for r in cycle) if cycle else None
     waiting = [r for r in runs if r["ranked_at"] is None
                and (slot is None or _aware(r["run_at"]) > slot)]
     return run_summary(max(waiting, key=lambda r: r["run_no"])) if waiting else None
@@ -818,7 +1015,10 @@ def validity_limit(schedule, slot):
 
 
 PICK_STATUS = {"IN_TRADE": "In trade", "CLOSED": "Closed", "NO_ENTRY": "No entry yet",
-               "EXPIRED": "Expired", "NOT_SELECTED": "Not selected", "NO_VERDICT": "No verdict"}
+               "EXPIRED": "Expired", "NOT_SELECTED": "Not selected", "NO_VERDICT": "No verdict",
+               # RESEARCH_SCHEDULE_V2 only: a later run of the cycle selected the coin again.
+               "REPLACED": "Replaced by a later pick"}
+FULL_RUN_KIND = "FULL"  # research_schedule.FULL_RUN, the daily run of RESEARCH_SCHEDULE_V2.
 
 
 def pick_status(verdict, trade, closed, valid_until, as_of):
@@ -894,11 +1094,21 @@ def research_cycle(cycle, rows, schedule, as_of, trades):
     picks = sorted((p for p in rows if p["kind"] == "PICK" and p["run_no"] in numbers),
                    key=lambda p: (_pick_order(verdicts.get((p["run_no"], p["symbol"])),
                                               p["symbol"]), p["run_no"]))
+    # RESEARCH_SCHEDULE_V2: the latest slot of the cycle that selected each coin, so an earlier
+    # untraded selection of it reads as replaced (RESEARCH_RUN_SUPERSESSION_V2's same-coin rule).
+    latest, slots = {}, {r["run_no"]: _aware(r["run_at"]) for r in cycle}
+    if _v2_plan(schedule) is not None:
+        for (run_no, symbol), verdict in verdicts.items():
+            if verdict.get("outcome") == "SELECTED":
+                latest[symbol] = max(latest.get(symbol, slots[run_no]), slots[run_no])
     listed = []
     for p in picks:
         verdict = verdicts.get((p["run_no"], p["symbol"])) or {}
         trade, closed = trades.get(p["trade_no"], (None, False))
         code, words = pick_status(verdict.get("outcome"), trade, closed, valid_until, as_of)
+        if code in {"NO_ENTRY", "EXPIRED"} and p["symbol"] in latest and (
+                latest[p["symbol"]] > slots[p["run_no"]]):
+            code, words = "REPLACED", PICK_STATUS["REPLACED"]
         listed.append({
             "symbol": p["symbol"], "agent": p["agent"], "run_no": p["run_no"],
             "kind": p["action"], "entry": _plain(p["entry"]), "stop": _plain(p["stop"]),
@@ -1004,6 +1214,8 @@ def jev_card(status, runs, recent, *, window_full=False, day_rows=None, day_full
             "picks": _int(latest["picks"]), "selected": _int(latest["selected"]),
             "passed": max(0, _int(latest["ranked"]) - _int(latest["selected"])),
             "vetoed": _int(latest["vetoed"]), "not_ranked": _int(latest["not_ranked"]),
+            "symbols": [s.split("/")[0] for s in (latest["selected_symbols"] or "").split(",")
+                        if s],
         }
     day_rows = recent if day_rows is None else day_rows
     failed, failed_more = failed_reviews_today(by_trade(day_rows), status["ny_today"])
@@ -1018,6 +1230,385 @@ def jev_card(status, runs, recent, *, window_full=False, day_rows=None, day_full
         "latest_selection": selection,
         "decisions": feed(recent, runs, JEV_LOG_LENGTH, window_full=window_full, actor="JEV"),
         "cycle": this_cycle, "today": today,
+    }
+
+
+# --- Page V2: traded levels, entry waits, the status line, limits, market and results --------
+#
+# Display definitions of EXPERIMENT_DASHBOARD_V2 (package public-page; docs/packages/
+# public-page.md). Nothing is estimated: a figure the ledger does not hold is omitted (None).
+
+PLAN_VERSION = "CRYPTO_TRADE_PLAN_V1"
+RULE_FIELDS = ("risk_policy", "trade_plan_policy", "entry_pacing_policy", "stop_limit_policy")
+MIN_SAMPLE = 30  # result_dimensions.CELL_MINIMUM: a net-R average under it shows its count only.
+PACING_RECENT_SECONDS = 300  # A pacing wait this recent means new entries are being held back.
+LIMIT_SCALE = D(7) / D(6)  # The limits bar spans 7/6 of the hard limit (3% -> 3.5%).
+FRACTION = D("0.0001")
+PCT_PLACES = D("0.01")
+STATES = {"TRADING": "Trading", "PAUSED": "Paused", "SOFT_LIMIT": "Soft limit",
+          "HALTED": "Halted", "STOPPED": "Stopped"}
+WAIT_WORDS = {
+    "MARKET_DROP": "market dropping", "ENTRY_RATE_LIMIT": "entry pace",
+    "MACRO_EVENT_WINDOW": "release window", "MARKET_BREADTH_UNAVAILABLE":
+    "market breadth unavailable", "MACRO_CALENDAR_EXPIRED": "release calendar expired",
+    "DAILY_SOFT_LOSS_LIMIT": "daily soft loss limit",
+}
+HALT_WORDS = {"OPERATOR_PAUSE": "paused by the operator"}
+TREND_WORDS = {"UP": "Bitcoin uptrend", "DOWN": "Bitcoin downtrend", "MIXED": "Bitcoin mixed"}
+TREND_SHORT = {"UP": "Uptrend", "DOWN": "Downtrend", "MIXED": "Mixed trend"}
+VOLATILITY_WORDS = {"LOW": "low volatility", "NORMAL": "normal volatility",
+                    "HIGH": "high volatility"}
+BREADTH_WORDS = {"BROAD": "most coins above their 20-day average",
+                 "NARROW": "most coins below their 20-day average"}
+BUCKET_WORDS = {"DOWN_2+": "down 2% or more", "DOWN": "falling", "FLAT": "flat",
+                "UP": "rising", "UP_2+": "up 2% or more"}
+
+
+def et_time(value):
+    """``15:24 ET`` (New York time)."""
+    return _aware(value).astimezone(NY).strftime("%H:%M") + " ET"
+
+
+def _frac(value):
+    return None if value is None else value.quantize(FRACTION)
+
+
+def _pct(fraction):
+    """A fraction as a percent figure (0.0213 -> 2.13)."""
+    return None if fraction is None else (fraction * 100).quantize(PCT_PLACES)
+
+
+def next_ny_midnight(as_of):
+    day = _aware(as_of).astimezone(NY).date()
+    return ny_midnight(day + timedelta(days=1))
+
+
+def rule_key(page_row):
+    """The account-wide rule versions a trade (or the newest setup) recorded."""
+    return tuple((page_row or {}).get(f) for f in RULE_FIELDS)
+
+
+def traded_row(row, page_row):
+    """The trades-view row with the levels actually traded: under CRYPTO_TRADE_PLAN_V1 the
+    plan's stop and target (and the risk the reservation planned on); every other trade its
+    research levels, unchanged. The research levels stay under ``research_*``."""
+    out = {**row, "research_stop": row["planned_stop"],
+           "research_target": row["planned_target"]}
+    if page_row and page_row.get("trade_plan_policy") == PLAN_VERSION and \
+            page_row.get("plan_stop") is not None and page_row.get("plan_target") is not None:
+        out["planned_stop"], out["planned_target"] = page_row["plan_stop"], page_row[
+            "plan_target"]
+        if page_row.get("risk_usd") is not None:
+            out["planned_risk_usd"] = page_row["risk_usd"]
+    return out
+
+
+def trade_plan(row, page_row):
+    """A trade's plan table: research and traded levels with the rule of each (None without
+    CRYPTO_TRADE_PLAN_V1)."""
+    if not page_row or page_row.get("trade_plan_policy") != PLAN_VERSION or \
+            page_row.get("plan_stop") is None:
+        return None
+    hr = _dec(page_row.get("hourly_range_fraction"))
+    multiple = _plain(page_row.get("stop_range_multiple"))
+    r_multiple = _plain(page_row.get("target_r_multiple"))
+    hr_words = f" ({_pct(hr)}%)" if hr is not None else ""
+    stop_rule = (f"{multiple}× the hourly range{hr_words} below the entry"
+                 if page_row.get("stop_basis") == "HOURLY_RANGE_FLOOR"
+                 else f"Research stop kept: already {multiple}× the hourly range{hr_words} "
+                      "or more below the entry")
+    target_rule = (f"Capped at {r_multiple}R above the entry"
+                   if page_row.get("target_basis") == "PLAN_CAP"
+                   else f"Research target kept: under the {r_multiple}R cap")
+    window = page_row.get("window_minutes")
+    return {
+        "version": PLAN_VERSION, "set_at": page_row.get("admitted_at"),
+        "research_stop": _plain(row["planned_stop"]),
+        "research_target": _plain(row["planned_target"]),
+        "stop": _plain(page_row["plan_stop"]), "target": _plain(page_row["plan_target"]),
+        "target_cap": _plain(page_row.get("plan_target_cap")),
+        "stop_basis": page_row.get("stop_basis"), "target_basis": page_row.get("target_basis"),
+        "hourly_range": _plain(page_row.get("hourly_range")),
+        "hourly_range_pct": _pct(hr), "stop_rule": stop_rule, "target_rule": target_rule,
+        "window_hours": int(window) // 60 if window is not None else None,
+        "risk_usd": _dec(page_row.get("risk_usd")),
+    }
+
+
+def plan_event(plan):
+    stop = (f"stop {number_text(plan['research_stop'])} → {number_text(plan['stop'])}"
+            if plan["stop"] != plan["research_stop"] else
+            f"stop {number_text(plan['stop'])} kept")
+    target = (f"target {number_text(plan['research_target'])} → {number_text(plan['target'])}"
+              if plan["target"] != plan["research_target"] else
+              f"target {number_text(plan['target'])} kept")
+    window = f", {plan['window_hours']}-hour window" if plan["window_hours"] else ""
+    return {"at": plan["set_at"], "kind": "PLAN", "actor": "APP",
+            "text": f"Plan set: {stop}, {target}{window}",
+            "note": f"{plan['stop_rule']}; {plan['target_rule'][0].lower()}"
+                    f"{plan['target_rule'][1:]}"}
+
+
+def wait_event(w):
+    reason = w["reason"]
+    words = WAIT_WORDS.get(reason, "entry held back")
+    if reason == "MACRO_EVENT_WINDOW" and w.get("release_kind"):
+        words = f"{w['release_kind']} release window"
+    note = None
+    if reason == "MARKET_DROP" and w.get("worst_median_1h_return") is not None:
+        move = _pct(_dec(w["worst_median_1h_return"]))
+        note = f"Median coin {'−' if move < 0 else '+'}{abs(move)}% over an hour at the worst"
+    count = int(w["waits"] or 0)
+    checks = f"{count} check{'' if count == 1 else 's'}"
+    return {"at": w["first_at"], "since": w["first_at"], "until": w["last_at"], "kind": "WAIT",
+            "actor": "PACING" if w["wait_kind"] == "PACING" else "LIMIT",
+            "reason": reason, "waits": count,
+            "text": f"Entry waited: {words}", "note": f"{checks}" + (f" · {note}" if note else "")}
+
+
+def regime_words(tag):
+    """``{"words", "short", "selloff"}`` of a MARKET_REGIME_V1 tag; unknown parts are left
+    out (never guessed). None without a tag."""
+    if not tag:
+        return None
+    trend, volatility, breadth, selloff = (tag.split("/") + [None] * 4)[:4]
+    parts = [w for w in (TREND_WORDS.get(trend), VOLATILITY_WORDS.get(volatility),
+                         BREADTH_WORDS.get(breadth)) if w]
+    short = [w for w in (TREND_SHORT.get(trend), VOLATILITY_WORDS.get(volatility)) if w]
+    if selloff == "SELLOFF":
+        short.append("sell-off")
+    return {"tag": tag, "words": ", ".join(parts) or None, "short": ", ".join(short) or None,
+            "selloff": None if selloff in (None, "UNKNOWN") else selloff == "SELLOFF"}
+
+
+def regime_day(row):
+    """One recorded day's regime with its words and worst hour."""
+    words = regime_words(row["tag"]) or {}
+    worst = _dec(row.get("worst_hour_pct"))
+    return {"day": row["day"], **words, "worst_hour_at": row.get("worst_hour_start"),
+            "worst_hour_pct": worst.quantize(D("0.1")) if worst is not None else None}
+
+
+def market_block(regimes, page_status, today):
+    """The latest recorded day's market (today's once its night has run), and whether the
+    entry pacing's market-drop rule applies to new setups."""
+    days = [regime_day(r) for r in regimes if r["tag"]]
+    latest = days[-1] if days else None
+    rule = bool(page_status and page_status.get("rules_entry_pacing_policy"))
+    if latest is None:
+        return {"day": None, "pacing_rule": rule}
+    return {**latest, "is_today": latest["day"] == (today.isoformat() if today else None),
+            "pacing_rule": rule}
+
+
+def entry_market(page_row):
+    """The market at a trade's entry (TRADE_REGIME), in words; None when not recorded."""
+    if not page_row or not (page_row.get("regime_median_coin_1h") or
+                            page_row.get("regime_day_tag")):
+        return None
+    pct = _dec(page_row.get("regime_median_coin_1h_pct"))
+    bucket = page_row.get("regime_median_coin_1h")
+    words = []
+    if pct is not None:
+        pct = pct.quantize(D("0.1"))
+        words.append(f"Median coin {'−' if pct < 0 else '+'}{abs(pct)}% the hour before")
+    elif bucket in BUCKET_WORDS:
+        words.append(f"Median coin {BUCKET_WORDS[bucket]} the hour before")
+    day = regime_words(page_row.get("regime_day_tag"))
+    if day and day["short"]:
+        words.append(f"day: {day['short'].lower()}")
+    return {"median_coin_1h": bucket, "median_coin_1h_pct": pct,
+            "btc_1h": page_row.get("regime_btc_1h"), "day_tag": page_row.get("regime_day_tag"),
+            "words": " · ".join(words) or None}
+
+
+def system_line(status, page_status, as_of):
+    """The status line: TRADING, PAUSED (market drop, entry pace, a CPI/FOMC window ...),
+    SOFT_LIMIT (no new entries today), HALTED (with when entries resume, when known) or STOPPED
+    (no runtime heartbeat), in that order of precedence: STOPPED, HALTED, SOFT_LIMIT, PAUSED."""
+    page = page_status or {}
+    as_of = _aware(as_of)
+    midnight = next_ny_midnight(as_of)
+
+    def line(state, text, *, reason=None, since=None, resume_at=None):
+        return {"state": state, "label": STATES[state], "reason": reason, "text": text,
+                "since": since, "resume_at": resume_at,
+                "rules_since": page.get("rules_since"),
+                "risk_policy": page.get("risk_policy")}
+
+    pill = status_pill(status)
+    beat = status["last_heartbeat_at"]
+    if pill == "STOPPED":
+        return line("STOPPED", "No heartbeat from the trader since "
+                    + (et_time(beat) if beat else "it started") + ".", since=beat)
+    if page.get("daily_halt_at") is not None or status["daily_loss_halt_today"]:
+        at = page.get("daily_halt_at")
+        when = f" at {et_time(at)}" if at else ""
+        return line("HALTED", f"Daily loss limit reached{when}. Open trades were sold; new "
+                    "entries resume at 00:00 ET.", reason="DAILY_LOSS_LIMIT", since=at,
+                    resume_at=midnight)
+    if int(status["active_halts"] or 0) > 0:
+        reason, at = page.get("execution_halt_reason"), page.get("execution_halt_at")
+        when = f" since {et_time(at)}" if at else ""
+        if reason == "OPERATOR_PAUSE":
+            return line("PAUSED", f"New entries paused by the operator{when}.",
+                        reason=reason, since=at)
+        return line("HALTED", f"Trading halted{when}; it resumes after a review.",
+                    reason=reason, since=at)
+    if page.get("soft_limit_at") is not None:
+        soft = page.get("soft_loss_pct")
+        limit = f"−{_pct(_dec(soft))}% " if soft is not None else ""
+        kept = (" It was kept after the day's start was corrected."
+                if page.get("soft_limit_kept") else "")
+        return line("SOFT_LIMIT", f"Daily loss reached the {limit}soft limit at "
+                    f"{et_time(page['soft_limit_at'])}: no new entries today; open trades keep "
+                    f"their stops. New entries resume at 00:00 ET.{kept}",
+                    reason="DAILY_SOFT_LOSS_LIMIT", since=page["soft_limit_at"],
+                    resume_at=midnight)
+    wait_at = page.get("pacing_wait_at")
+    if wait_at is not None and (as_of - _aware(wait_at)).total_seconds() <= PACING_RECENT_SECONDS:
+        reason = page.get("pacing_wait_reason")
+        resume = None
+        if reason == "MARKET_DROP":
+            move = _dec(page.get("pacing_median_1h_return"))
+            text = "Market drop: new entries wait while the median coin is down 2% in an hour"
+            if move is not None:
+                move = _pct(move)
+                text += f" (now {'−' if move < 0 else '+'}{abs(move)}%)"
+        elif reason == "ENTRY_RATE_LIMIT":
+            text = "Entry pace: at most 2 new entries per 30 minutes"
+        elif reason == "MACRO_EVENT_WINDOW":
+            kind = page.get("pacing_release_kind") or "US data"
+            resume = page.get("pacing_release_until")
+            text = f"{kind} release window: no new entries" + (
+                f" until {et_time(resume)}" if resume else "")
+        elif reason == "MARKET_BREADTH_UNAVAILABLE":
+            text = "Market breadth unavailable: new entries wait until it can be measured"
+        elif reason == "MACRO_CALENDAR_EXPIRED":
+            text = "Release calendar expired: new entries wait until it is extended"
+        else:
+            text = "New entries are waiting"
+        return line("PAUSED", text + ".", reason=reason, since=wait_at, resume_at=resume)
+    withdrawn = page.get("soft_limit_withdrawn_latch_at")
+    if withdrawn is not None:  # DAILY_SOFT_LOSS_LIMIT_WITHDRAWN (RISK_SESSION_BASELINE_V2).
+        return line("TRADING", f"New entries allowed. The soft limit of {et_time(withdrawn)} was "
+                    "withdrawn after the day's start was corrected.", reason="SOFT_LIMIT_WITHDRAWN",
+                    since=page.get("soft_limit_withdrawn_at"))
+    return line("TRADING", "New entries allowed.")
+
+
+def day_limits(page_status, live, closed_today):
+    """Today's P&L against the active policy's soft and hard daily limits, on a bar that spans
+    7/6 of the hard limit; None without the day's starting equity or a policy.
+
+    With RISK_SESSION_BASELINE_V2's basis (what JEV_MANAGED_RISK_V4's halt measures the day
+    from) and an account equity recorded after it, today's P&L is that equity minus the basis
+    (``measure`` ``ACCOUNT_EQUITY``, as of ``equity_at``; the halt engine also subtracts the
+    day's deposits and withdrawals, which the public views do not hold). Otherwise it is the sum
+    of the closed-today and open trades' P&L (``TRADES``)."""
+    page = page_status or {}
+    base = _dec(page.get("day_start_equity"))
+    hard, soft = _dec(page.get("hard_loss_pct")), _dec(page.get("soft_loss_pct"))
+    realized = [t["pnl_usd"] for t in closed_today if t["pnl_usd"] is not None]
+    unrealized = [t["pnl_usd"] for t in live if t["pnl_usd"] is not None]
+    realized_sum, open_sum = sum(realized, D(0)), sum(unrealized, D(0))
+    total, measure = realized_sum + open_sum, "TRADES"
+    equity, equity_at = _dec(page.get("equity_usd")), page.get("equity_at")
+    base_at = page.get("day_start_observed_at")
+    if (page.get("day_start_basis") == "ACCOUNT_EQUITY_AT_NY_MIDNIGHT_V2" and base is not None
+            and equity is not None and equity > 0 and equity_at is not None
+            and base_at is not None and _aware(equity_at) >= _aware(base_at)):
+        total, measure = equity - base, "ACCOUNT_EQUITY"
+    out = {
+        "measure": measure, "account_equity_usd": equity if measure == "ACCOUNT_EQUITY" else None,
+        "equity_at": equity_at if measure == "ACCOUNT_EQUITY" else None,
+        "day_start_basis": page.get("day_start_basis"),
+        "baseline_corrected_at": page.get("baseline_corrected_at"),
+        "baseline_corrected_from_usd": _dec(page.get("baseline_corrected_from")),
+        "policy": page.get("risk_policy"), "day_start_equity_usd": base,
+        "day_start_at": page.get("day_start_observed_at"), "pnl_usd": total,
+        "realized_usd": realized_sum, "open_usd": open_sum,
+        "open_unpriced": sum(1 for t in live if t["pnl_usd"] is None),
+        "fees_pending": sum(1 for t in closed_today if t["fees_pending"]),
+        "soft_pct": _pct(soft), "hard_pct": _pct(hard),
+        "pnl_pct": None, "loss_fraction": None, "soft_at": None, "hard_at": None,
+        "soft_limit_usd": None, "hard_limit_usd": None,
+        "halt_pnl_usd": _dec(page.get("daily_halt_pnl")), "halt_at": page.get("daily_halt_at"),
+        "soft_limit_at": page.get("soft_limit_at"),
+    }
+    if base is None or base <= 0 or hard is None:
+        return out
+    scale = hard * LIMIT_SCALE
+    loss = max(D(0), -total) / base
+    out.update({
+        "pnl_pct": _pct(total / base), "loss_fraction": _frac(min(loss / scale, D(1))),
+        "hard_at": _frac(hard / scale), "hard_limit_usd": -hard * base,
+        "soft_at": _frac(soft / scale) if soft is not None else None,
+        "soft_limit_usd": -soft * base if soft is not None else None,
+    })
+    return out
+
+
+def open_risk(page_status, live, equity):
+    """The open trades' planned risk (the reservation's: quantity x (max entry - the planned
+    stop)) against the active policy's crypto cap, as fractions of the day's starting equity
+    (else the last recorded equity)."""
+    page = page_status or {}
+    base = _dec(page.get("day_start_equity")) or equity
+    cap = _dec(page.get("crypto_cap_pct"))
+    risks = [_dec(t.get("risk_usd")) for t in live]
+    known = [r for r in risks if r is not None]
+    total = sum(known, D(0))
+    out = {"risk_usd": total, "trades": len(live), "unknown": len(risks) - len(known),
+           "cap_pct": _pct(cap), "risk_pct": None, "fraction": None,
+           "risk_per_trade_pct": _pct(_dec(page.get("risk_pct")))}
+    if base is not None and base > 0:
+        out["risk_pct"] = _pct(total / base)
+        if cap:
+            out["fraction"] = _frac(min(total / base / cap, D(1)))
+    return out
+
+
+def result_cell(trades):
+    """Closed trades' figures: count, wins, P&L (net where verified, else gross), total R, and
+    the net-R average over fee-verified trades only (None under ``MIN_SAMPLE`` of them)."""
+    figures = totals(trades)
+    verified = [t["pnl_r"] for t in trades if not t["fees_pending"] and t["pnl_r"] is not None]
+    days = sorted({_ny_day(t["exit_at"]) for t in trades if t["exit_at"] is not None})
+    return {
+        "trades": figures["closed"], "wins": figures["wins"], "win_rate": figures["win_rate"],
+        "pnl_usd": figures["pnl_usd"], "pnl_r": figures["pnl_r"],
+        "fees_pending": figures["fees_pending"], "verified": len(verified),
+        "avg_net_r": (sum(verified, D(0)) / len(verified)).quantize(R_PLACES)
+        if len(verified) >= MIN_SAMPLE else None,
+        "days": len(days), "first_day": days[0].isoformat() if days else None,
+        "last_day": days[-1].isoformat() if days else None,
+    }
+
+
+def results(closed, closed_today, regimes, page_status, keys):
+    """Since start, today, by the exit day's market (sell-off days and other recorded days),
+    and earlier rules against the current ones (the newest setup's account-wide versions)."""
+    selloff = {r["day"]: (regime_words(r["tag"]) or {}).get("selloff") for r in regimes}
+    by_day = {"selloff": [], "other": [], "untagged": []}
+    for t in closed:
+        flag = selloff.get(_ny_day(t["exit_at"]).isoformat()) if t["exit_at"] else None
+        by_day["selloff" if flag is True else "other" if flag is False else "untagged"].append(t)
+    current = rule_key({f: (page_status or {}).get("rules_" + f) for f in RULE_FIELDS})
+    known = page_status is not None and any(current)
+    now_rules = [t for t in closed if known and keys.get(t["trade_no"]) == current]
+    earlier = [t for t in closed if not (known and keys.get(t["trade_no"]) == current)]
+    return {
+        "minimum_sample": MIN_SAMPLE, "since_start": result_cell(closed),
+        "today": result_cell(closed_today), "selloff_days": result_cell(by_day["selloff"]),
+        "other_days": result_cell(by_day["other"]), "untagged": len(by_day["untagged"]),
+        "rules": {
+            "earlier": result_cell(earlier),
+            "current": {**result_cell(now_rules),
+                        "since": (page_status or {}).get("rules_since") if known else None,
+                        "versions": dict(zip(RULE_FIELDS, current, strict=True))
+                        if known else None},
+        },
     }
 
 
@@ -1042,26 +1633,81 @@ def account_equity(status):
     return equity, status["equity_at"]
 
 
+EXCLUDED_LISTS = ("trades", "recent", "trade_decisions", "day_decisions", "page_trades",
+                  "page_waits", "page_reviews", "cycle_picks", "latest_picks")
+
+
+def without_excluded(snapshot):
+    """PAGE_EXCLUSION_V2 (owner, 2026-10-03: "Just take it off from list from everywhere, do
+    not consider it"): the snapshot without the STATS_EXCLUSION_V1 trades — no row of theirs
+    reaches any list, figure or chart. Returns ``(snapshot, excluded_closed_rows,
+    exclusion_rows)``; the ledger is untouched."""
+    excluded = {r["trade_no"] for r in snapshot.get("exclusions", [])}
+    if not excluded:
+        return snapshot, [], []
+    out = dict(snapshot)
+    for name in EXCLUDED_LISTS:
+        if name in snapshot:
+            out[name] = [r for r in snapshot[name] if r.get("trade_no") not in excluded]
+    gone = [r for r in snapshot["trades"] if r["trade_no"] in excluded and r["closed"]]
+    pages = {r["trade_no"]: r for r in snapshot.get("page_trades", [])}
+    return out, [closed_trade(traded_row(r, pages.get(r["trade_no"]))) for r in gone], \
+        snapshot.get("exclusions", [])
+
+
 def build_dashboard(snapshot, *, title=None, fixture_data=False, schedule=None):
     """The whole dashboard as a JSON-safe dict (Decimals become strings)."""
+    snapshot, excluded_closed, exclusion_rows = without_excluded(snapshot)
     status = snapshot["status"]
     as_of = _aware(status["as_of"])
     rows, runs, recent = snapshot["trades"], snapshot["runs"], snapshot["recent"]
     window_full = len(recent) >= RECENT_LIMIT
     # Each shown trade's decisions (read_snapshot), else the latest ones read for the feed.
-    stories = by_trade(snapshot.get("trade_decisions", recent))
+    reviews_v5 = snapshot.get("page_reviews", [])
+    recent = with_v5(recent, reviews_v5)
+    stories = by_trade(with_v5(snapshot.get("trade_decisions", snapshot["recent"]),
+                               reviews_v5))
+    # Page V2 (migration 028): the levels actually traded, versions, waits and regimes.
+    page_status = snapshot.get("page_status")
+    page_rows = {r["trade_no"]: r for r in snapshot.get("page_trades", [])}
+    waits = defaultdict(list)
+    for w in snapshot.get("page_waits", []):
+        waits[w["trade_no"]].append(w)
+    regimes = snapshot.get("regimes", [])
+    current_rules = rule_key({f: (page_status or {}).get("rules_" + f) for f in RULE_FIELDS})
+    keys = {}
     closed, live, pairs = [], [], []
     for row in rows:
-        trade = closed_trade(row) if row["closed"] else open_trade(row, as_of)
-        trade.update(trade_story(row, trade, stories.get(row["trade_no"], [])))
+        page_row = page_rows.get(row["trade_no"])
+        traded = traded_row(row, page_row)
+        trade = closed_trade(traded) if row["closed"] else open_trade(traded, as_of)
+        plan = trade_plan(row, page_row)
+        decisions = stories.get(row["trade_no"], [])
+        trade.update(trade_story(traded, trade, decisions, plan=plan,
+                                 waits=waits.get(row["trade_no"], [])))
+        keys[row["trade_no"]] = rule_key(page_row) if page_row else None
+        trade.update({
+            "research_stop": _plain(row["planned_stop"]),
+            "research_target": _plain(row["planned_target"]),
+            "risk_usd": _dec(traded["planned_risk_usd"]), "plan": plan,
+            "versions": {f: page_row.get(f) for f in (*RULE_FIELDS, "maintenance_policy",
+                                                      "holding_policy")} if page_row else None,
+            "rules": None if not page_row or not any(current_rules) else (
+                "CURRENT" if keys[row["trade_no"]] == current_rules else "EARLIER"),
+            "market_at_entry": entry_market(page_row),
+            "agent": next((d["agent"] for d in decisions if d["kind"] == "PICK"), None),
+            # No after-exit price is recorded by any job yet (plan section 11, item 4 waits
+            # for the learning loop's after-exit path): the page omits the block.
+            "after_exit": None,
+        })
         (closed if row["closed"] else live).append(trade)
         pairs.append((row, trade))
     by_number = {row["trade_no"]: (trade, row["closed"]) for row, trade in pairs}
     # The current cycle's picks and Jev's scoped logs (read_snapshot; else what was read).
-    cycle = cycle_runs(runs)
-    cycle_rows = snapshot.get("cycle_picks", snapshot["latest_picks"])
-    day_rows = snapshot.get("day_decisions", recent)
     schedule = schedule or DEFAULT_SCHEDULE
+    cycle = cycle_runs(runs, schedule)
+    cycle_rows = snapshot.get("cycle_picks", snapshot["latest_picks"])
+    day_rows = with_v5(snapshot.get("day_decisions", recent), reviews_v5)
     today = status["ny_today"]
     closed_today = [t for t in closed if _ny_day(t["exit_at"]) == today]
     opened_today = [r for r in rows if _ny_day(r["entry_at"]) == today]
@@ -1069,6 +1715,34 @@ def build_dashboard(snapshot, *, title=None, fixture_data=False, schedule=None):
     open_pnl = [t["pnl_usd"] for t in live if t["pnl_usd"] is not None]
     open_cost = [t["entry_value_usd"] for t in live if t["entry_value_usd"] is not None]
     equity, equity_at = account_equity(status)
+    # EXPERIMENT_DASHBOARD_V3: positions and the account. PAGE_EXCLUSION_V2: the excluded
+    # trades are already gone (without_excluded); only a summary with counts remains.
+    summary = v3.exclusion_summary(exclusion_rows)
+    exclusions = {"trade_nos": [], "trades": summary["trades"], "days": summary["days"],
+                  "text": summary["text"]}
+    excluded_nos = set()
+    for trade in closed:
+        trade["excluded"] = False
+    for trade in live:
+        trade["position"] = v3.position(trade)
+        trade["jev_check"] = v3.jev_check(stories.get(trade["trade_no"], []))
+    included = [t for t in closed if t["trade_no"] not in excluded_nos]
+    open_risk_block = open_risk(page_status, live, equity)
+    newest, newest_at, _ = v3.latest_equity(snapshot, page_status)
+    newest_status = page_status
+    if page_status is not None and newest is not None:
+        newest_status = {**page_status, "equity_usd": newest, "equity_at": newest_at}
+    excluded_days = {d["day"] for d in summary["days"]}
+    equity_block = v3.pnl_section(snapshot, closed, closed + excluded_closed, live,
+                                  excluded_days, page_status, as_of)
+    worst = equity_block["max_drawdown"] or {}
+    performance = v3.performance_section(
+        closed, excluded_nos, keys, current_rules, (page_status or {}).get("rules_since"),
+        exclusions, worst.get("pct"),
+        {r["day"]: (regime_words(r["tag"]) or {}).get("selloff") for r in regimes})
+    days = past_days(closed, regimes)
+    for day in days:
+        day["excluded"] = day["day"] in excluded_days
     document = {
         "dashboard_version": DASHBOARD_VERSION,
         "title": (title or "").strip() or DEFAULT_TITLE,
@@ -1108,10 +1782,47 @@ def build_dashboard(snapshot, *, title=None, fixture_data=False, schedule=None):
                             day_full=len(day_rows) >= DAY_LIMIT, cycle=cycle,
                             cycle_rows=cycle_rows, pairs=pairs),
         },
-        "feed": feed(recent, runs, window_full=window_full),
-        "past": {"days": past_days(closed), "closed_trades": closed_history(closed)},
+        # PAGE_EXCLUSION_V2: no line about a research run of an excluded day either.
+        "feed": feed(recent, [r for r in runs if _ny_day(r["run_at"]) is None
+                              or _ny_day(r["run_at"]).isoformat() not in excluded_days],
+                     window_full=window_full),
+        "past": {"days": days, "closed_trades": closed_history(closed)},
+        "system": system_line(status, page_status, as_of),
+        # V3: today's P&L against the limits from the newest account read (a five-minute
+        # snapshot when newer than the last risk decision's), so it agrees with the hero.
+        "limits": day_limits(newest_status, live, closed_today),
+        "open_risk": open_risk_block,
+        "market": market_block(regimes, page_status, today),
+        # V3: the statistics leave out STATS_EXCLUSION_V1 trades (owner ruling 2026-10-03).
+        "results": {**results(included, [t for t in closed_today
+                                         if t["trade_no"] not in excluded_nos],
+                              regimes, page_status, keys),
+                    "excluded": {k: exclusions[k] for k in ("trades", "days", "text")}},
+        "account": trading_account(v3.account_section(
+            snapshot, page_status, live, closed, closed_today, open_risk_block,
+            {**equity_block, "start_equity_usd": equity_block["capital_usd"]}, performance,
+            as_of), equity_block, summary),
+        "exclusions": summary,
+        "equity": equity_block,
+        "daily": v3.daily_section(closed, [regime_day(r) for r in regimes if r["tag"]],
+                                  excluded_days, today),
+        "performance": performance,
     }
     return json_safe(_rounded(document))
+
+
+def trading_account(account, curve, summary):
+    """The hero stays the real broker equity and Today stays real; "since start" becomes the
+    trading P&L of the included trades (realized plus open), labelled with the exclusion."""
+    account.update({
+        "since_start_usd": curve["trading_pnl_usd"], "since_start_pct": curve["trading_pnl_pct"],
+        "trading_pnl_usd": curve["trading_pnl_usd"], "trading_pnl_pct": curve["trading_pnl_pct"],
+        "trading_pnl_label": "Trading P&L" + (
+            " excl. " + summary["text"].removeprefix("Excludes ").split(" (")[0]
+            if summary["text"] else ""),
+        "start_equity_usd": curve["capital_usd"],
+    })
+    return account
 
 
 def _rounded(value):
@@ -1140,5 +1851,7 @@ __all__ = [
     "pending_run", "pick_status", "read_snapshot", "repeated_text", "repeated_words",
     "research_cycle", "run_decisions", "run_summary", "schedule_summary", "scope_start",
     "shown_trades", "status_pill", "todays_runs", "totals", "trade_lines", "trade_story",
-    "validity_limit",
+    "validity_limit", "day_limits", "entry_market", "market_block", "open_risk", "plan_event",
+    "regime_words", "result_cell", "results", "system_line", "trade_plan", "traded_row",
+    "wait_event", "et_time", "rule_key",
 ]

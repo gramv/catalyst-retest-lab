@@ -363,3 +363,48 @@ def test_aggregates_exclude_engineering_setups(mx):  # noqa: F811
         record_shadow_outcome(store, conn, pick, simulation)
     aggregates = pick_outcome_aggregates(engine.repo)
     assert aggregates["items"] == []  # The only pick recorded is engineering-only: excluded.
+
+
+def test_an_admitted_plan_setup_also_gets_its_traded_levels_outcome(mx):  # noqa: F811
+    """TRADED_LEVELS_V1 (package learning-loop2): a pick whose setup was admitted under
+    CRYPTO_TRADE_PLAN_V1 is also walked on the plan's stop and target, recorded beside the
+    research levels' outcome (which every pick, selected or not, keeps)."""
+    from catalyst_lab import trade_plan
+
+    engine, _venue, _ = mx
+    store = engine.store
+    real_packet = packet(mx, "BTC/USD")
+    cycle_id, item_key = real_packet["cycle_id"], real_packet["item_key"]
+    sid = engine.admit(real_packet)
+    plan = {"policy": trade_plan.CRYPTO_TRADE_PLAN.record(), "stop": "94", "target": "109",
+            "target_cap": "109"}
+    with store.transaction() as conn:
+        current = store.state(conn, sid)["state"]
+        store.transition(conn, sid, current, trade_plan=plan)
+    started(store, cycle_id=cycle_id, contender_count=1)
+    pick_body = pick_packet(store, cycle_id=cycle_id, item_key=item_key, symbol="BTC/USD")
+    ranking(store, cycle_id=cycle_id, entries=[rank_entry(item_key, status=RANKED, rank=1)])
+    selected(store, cycle_id=cycle_id, pick_body={**pick_body, "rank": 1, "agent_rank": 1,
+                                                  "replacement_for": None},
+             selection_event_seq_holder=[])
+    [pick] = cycle_picks(engine.repo, cycle_id)
+    assert pick.traded_levels == {"entry_trigger": "100", "max_entry_price": "100.10",
+                                  "stop": "94", "target": "109"}
+
+    def row(at, o, h, low, c):
+        return {"t": at.isoformat(), "o": o, "h": h, "l": low, "c": c, "v": "1"}
+
+    bars = FakeBars({"BTC/USD": [
+        row(GEN, "100", "100", "99.9", "100"),  # Touches the entry trigger.
+        row(GEN + timedelta(minutes=1), "100", "109.5", "100", "109"),  # Plan target only.
+        row(GEN + timedelta(hours=24, minutes=1), "108", "108", "108", "108")]})
+    summary = run_shadow_outcome_job(store, bars, now=ready_at(pick) + timedelta(minutes=1),
+                                     cycle_id=cycle_id)
+    assert summary.recorded == 1
+    with engine.repo.connect() as conn:
+        body = conn.execute("SELECT body FROM lab.managed_events WHERE kind=%s",
+                            (SHADOW_EVENT_KIND,)).fetchone()["body"]
+    assert body["outcome"]["outcome"] == "HOLD_24H_EXIT"  # Research target 111 never reached.
+    traded = body["traded_plan"]
+    assert traded["levels_basis"] == "CRYPTO_TRADE_PLAN_V1"
+    assert traded["levels"]["stop"] == "94" and traded["outcome"]["outcome"] == "TARGET"

@@ -47,10 +47,14 @@ def test_v3_is_v2_plus_the_spend_guard_exactly_and_is_what_admission_records():
     assert type(v3) is cm.MaintenancePolicyV3 and v3 == cm.CRYPTO_MAINTENANCE_V3
     assert cm.active({"maintenance_policy": V3_RECORD}) and cm.guarded(v3)
     assert not cm.guarded(cm.CRYPTO_MAINTENANCE_V2) and not cm.guarded(cm.CRYPTO_MAINTENANCE)
-    # Admission records V3 in the maintained arm; the control arm is never maintained.
-    assert cm.ADMITTED_MAINTENANCE is cm.CRYPTO_MAINTENANCE_V3
+    # Admission recorded V3 in the maintained arm until package trade-plan, which records V4
+    # (V3 plus the stop-raise guards, still guarded), and from package jev-b1 V5 (still
+    # guarded: EXHAUSTED withholds its reviews); the control arm is never maintained.
+    assert cm.ADMITTED_MAINTENANCE is cm.CRYPTO_MAINTENANCE_V5 and cm.guarded(
+        cm.CRYPTO_MAINTENANCE_V4) and cm.guarded(cm.CRYPTO_MAINTENANCE_V5)
     assert cm.admission_fields(V3_CRYPTO, JEV_MANAGED_ARM) == {
-        "maintenance_policy": V3_RECORD, "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}
+        "maintenance_policy": cm.CRYPTO_MAINTENANCE_V5.record(),
+        "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}
     assert cm.admission_fields(V3_CRYPTO, FIXED_EXIT_ARM) == {
         "partial_entry_policy": cm.CRYPTO_PARTIAL_ENTRY.record()}
     # What Jev reads and how its answer is read are V2's: context and questions V5, rule V2.
@@ -58,7 +62,8 @@ def test_v3_is_v2_plus_the_spend_guard_exactly_and_is_what_admission_records():
     assert (v3.context_version, v3.question_version) == (
         "JEV_MANAGED_POSITION_CONTEXT_V5", "JEV_MANAGED_POSITION_QUESTIONS_V5")
     assert cm.MAINTENANCE_VERSIONS == (
-        "CRYPTO_MAINTENANCE_V1", "CRYPTO_MAINTENANCE_V2", "CRYPTO_MAINTENANCE_V3")
+        "CRYPTO_MAINTENANCE_V1", "CRYPTO_MAINTENANCE_V2", "CRYPTO_MAINTENANCE_V3",
+        "CRYPTO_MAINTENANCE_V4", "CRYPTO_MAINTENANCE_V5")  # V4: trade-plan; V5: jev-b1.
 
 
 def test_the_tier_sets_v3s_routine_cadence_and_exhausted_allows_no_review():

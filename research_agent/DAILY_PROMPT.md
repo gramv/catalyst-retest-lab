@@ -1,10 +1,17 @@
 # Daily research prompts
 
 The prompts a scheduler (or the owner, by hand) gives a fresh Claude session. There are
-four: the morning run, the evening review, one session that does both at 07:15 New York
-(`DAILY_PROCEDURE.md`, "Two ways to run the day"), and the intraday run for each 2-hourly
-slot other than 08:00 (`DAILY_PROCEDURE.md`, "Intraday run (every 2 hours)"). Fill in the
+five: the morning run, the evening review, one session that does both at 07:15 New York
+(`DAILY_PROCEDURE.md`, "Two ways to run the day"), the intraday run for each 2-hourly slot
+other than 08:00 under `RESEARCH_SCHEDULE_V1` (`DAILY_PROCEDURE.md`, "Intraday run (every 2
+hours)"), and the update run for each of those slots under `RESEARCH_SCHEDULE_V2`
+(`DAILY_PROCEDURE.md`, "Update run (every 2 hours, RESEARCH_SCHEDULE_V2)"). Fill in the
 placeholders before sending one; nothing else should need to change from day to day.
+
+None of these sessions answers the app's window reviews or Jev's early-exit flags: the
+operator's watch loop runs `answer` every 2-5 minutes (`DAILY_PROCEDURE.md`,
+"Answering reviews and exit flags"). A session that sees one pending in the research context
+leaves it to that loop and never answers it by hand.
 
 ## Morning (08:00 New York)
 
@@ -28,7 +35,9 @@ outlook for every coin (a direction and confidence, or SKIPPED with a reason; ev
 EVENT reason cites its source). Then outlook-check and outlook-submit, before the report.
 If outlook-submit gets no answer, run it again: it resends the same bytes first. Never use
 --new-id unless you deliberately want a second graded outlook.
-Then build with --lessons emphasis.json, validate, and submit.
+Then derivatives (OKX open interest and Hyperliquid funding for the coins with a setup:
+context for Jev, never a reason to pick or drop a coin), build with --lessons emphasis.json
+--derivatives derivatives.json, validate, and submit.
 
 Lessons change emphasis, never coverage: the whole market, about 20 picks, no coin dropped
 because of a lesson, and no trading rule touched. Name any lesson or checklist item behind
@@ -105,7 +114,9 @@ When you finish, report both halves as the evening and morning prompts ask.
 
 ## Intraday (every 2 hours)
 
-For each 2-hourly slot except 08:00 (00:00, 02:00, … 22:00 New York), started at the slot.
+For each 2-hourly slot except 08:00 (00:00, 02:00, … 22:00 New York), started at the slot,
+while the schedule is `RESEARCH_SCHEDULE_V1`. Under `RESEARCH_SCHEDULE_V2` use the Update
+prompt below instead.
 
 ```
 You are the crypto research agent's intraday run for catalyst-retest-lab. Paper trading
@@ -124,7 +135,8 @@ Token file: <TOKEN_FILE_PATH> (never read this file's contents into your own out
   pass the path to --token-file and let the tool read it)
 Agent identity: --agent-id muse --agent-version claude-as-muse-intraday-v1-09.28
 
-Steps: context (if schedule.runs in context.json still lists only 08:00, stop and say so),
+Steps: context (if schedule.runs in context.json still lists only 08:00, stop and say so;
+if schedule.version is RESEARCH_SCHEDULE_V2, stop: the update prompt answers this slot),
 market --profile intraday, levels --profile intraday (the INTRADAY_V2 rules: 1h, 2h, 4h,
 6h and daily bars, shortest first), build --profile intraday --max-picks 10 (CHART-only
 picks are fine), then, only if time allows, a quick news check for the picks in
@@ -136,4 +148,39 @@ When you finish, report: the slot the report answered (report.json's run_slot), 
 coins had a setup, how many picks were built, skipped or rejected and the main reasons,
 whether news was checked, and the submit result. If anything in the procedure did not work
 as written, say so plainly rather than working around it silently.
+```
+
+## Update (every 2 hours, RESEARCH_SCHEDULE_V2)
+
+For each 2-hourly slot except 08:00 once the app's schedule is `RESEARCH_SCHEDULE_V2`,
+started at :07 of the hour before the slot (09:07 answers 10:00).
+
+```
+You are the crypto research agent's update run for catalyst-retest-lab. Paper trading
+only. This run answers one update slot of RESEARCH_SCHEDULE_V2: it looks after the day's
+picks and adds coins that now qualify. The lessons, the outlook, news research and the
+evening review stay in the 08:00 run.
+
+Read research_agent/DAILY_PROCEDURE.md in full and follow its "Update run (every 2 hours,
+RESEARCH_SCHEDULE_V2)" section exactly, step by step, from the repository root.
+
+Run folder: <RUN_DIR, e.g. runs/2026-09-29/update-1000> (this run's own folder: the New
+  York date and slot; never the 08:00 run's runs/<date> or another slot's)
+App base URL: <BASE_URL, e.g. https://<trader>.up.railway.app, or http://127.0.0.1:8000>
+Token file: <TOKEN_FILE_PATH> (never read this file's contents into your own output;
+  pass the path to --token-file and let the tool read it)
+Agent identity: --agent-id muse --agent-version claude-as-muse-update-v1-09.29
+
+Steps: update --profile intraday (it reads the research context, refuses outside a V2
+update slot, reviews your own WATCHING setups, and writes withdrawal.json, report.json and
+update-notes.json), read update-notes.json, then submit (it sends the withdrawal first, then
+the report). If update refuses (UPDATE_NEEDS_SCHEDULE_V2, UPDATE_SLOT_IS_FULL_RUN or
+UPDATE_RUN_DIR_IN_USE), stop and say so. If it says there is nothing to change, there is
+nothing to send. Never loosen a rule, never edit withdrawal.json or report.json by hand,
+and never withdraw a coin the update did not withdraw. Finish within about 15 minutes.
+
+When you finish, report: the slot answered (update-notes.json's run_slot), the setups kept,
+adjusted and withdrawn and why, the new picks, anything left out of the report, and both
+submit results (withdrawal-submit.json, submit.json). If anything in the procedure did not
+work as written, say so plainly rather than working around it silently.
 ```

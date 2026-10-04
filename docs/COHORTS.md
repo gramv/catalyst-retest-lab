@@ -12,8 +12,8 @@ Step 4, 2026-09-19. All executable strategy references remain `CATALYST_RETEST_V
 
 Schema 12's bridge is a separate explicit test configuration requiring fresh receipt,
 worker health, validation, actual trigger and risk authorization. Old inert Step 4
-intents remain inert. See US-JEV-INTEGRATION.md; the Step 4 descriptions below record
-that earlier implementation boundary.
+intents remain inert. The Step 4 descriptions below record that earlier implementation
+boundary.
 
 The server derives purpose from the immutable candidate; callers cannot choose a
 cohort. Contexts, evidence bundles and inert intents each store purpose, cohort and
@@ -39,7 +39,7 @@ for every report, item, request and outcome. The server requires TEST-prefixed r
 keys and stamps ENGINEERING_TEST; clients cannot choose a performance cohort. US_STOCKS,
 CRYPTO and INDIA remain separate market labels. These local research outcomes never
 enter trade statistics, the public dashboard or the Jev-free baseline. No currency P&L
-is inferred from proposed levels. See RESEARCH-REPORT-SELECTION.md.
+is inferred from proposed levels.
 
 
 ## Attribution for the owner-approved architecture

@@ -3,6 +3,7 @@ source (package maintenance). Fixture evidence only: per-test databases, the fak
 mock transports; no broker, provider, network or owner-ledger contact."""
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
@@ -38,10 +39,15 @@ from tests.maintenance_fixtures import (
     stop_orders,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_trade_plan_admission as pre_trade_plan_admission
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 from tests.test_managed_execution import observation, packet
 from tests.test_managed_runtime import Research, Source
+
+# Every setup here is admitted as before package trade-plan (CRYPTO_MAINTENANCE_V3 or earlier,
+# the one-tick stop-limit); the new versions are tests/test_trade_plan_*.py.
+pytestmark = pytest.mark.usefixtures("pre_trade_plan_admission")
 
 NOW = datetime(2026, 9, 27, 15, 7, 30, tzinfo=UTC)
 ASSET = CryptoAsset("SOL/USD", D("0.0001"), D("0.0001"), D("0.01"))
@@ -102,6 +108,53 @@ def test_a_retained_entry_is_not_cancelled_until_an_exit_or_the_caller_says_so()
     first = plan(uncovered, protect_after_entries=True)
     assert (first.reason, [p.action for p in first.proposals]) == (
         "CANCEL_ENTRY_BEFORE_PROTECT", ["CRYPTO_CANCEL"])
+
+
+def test_a_remainder_being_cancelled_is_cancelled_before_any_protection_is_proposed():
+    """CRYPTO_PARTIAL_ENTRY_V1 (PEPE/USD, 2026-09-30 19:15 UTC): a partial fill whose next pass
+    finds the ask above M. One plan held the stop-limit and the remainder's cancel; Alpaca refused
+    the sell while the buy worked. The plan now holds only the cancel, sends nothing while the
+    cancel is in flight, and protects once the entry is gone."""
+    reason = "PARTIAL_ENTRY_ABOVE_MAX_ENTRY"
+    working = CryptoOrder("entry-1", "e1", "ENTRY", D("20"), D("10"), "partially_filled", True,
+                          None, D("100.10"))
+
+    def v1(status, **options):
+        entry = replace(working, status=status)
+        return plan(snapshot(entry, qty="10", available="10"), entry_cancel_reason=reason,
+                    **{"retain_entry": False, **options})
+
+    first = v1("partially_filled")
+    assert (first.state, first.reason, first.residual_qty) == (
+        "CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT", D("10"))
+    assert [(p.action, p.method, p.path, p.reason) for p in first.proposals] == [
+        ("CRYPTO_CANCEL", "DELETE", "/v2/orders/entry-1", reason)]
+    in_flight = v1("pending_cancel")
+    assert (in_flight.state, in_flight.reason, in_flight.proposals) == (
+        "CANCELING", "CANCEL_ENTRY_BEFORE_PROTECT", ())
+    gone = v1("canceled")
+    assert (gone.state, gone.reason) == ("PROTECTION_REQUIRED", "UNCOVERED_BROKER_INVENTORY")
+    [protect] = gone.proposals
+    assert (protect.action, protect.method, D(protect.payload["qty"]),
+            protect.payload["stop_price"], protect.payload["limit_price"]) == (
+        "CRYPTO_PROTECT", "POST", D("10"), "103", "102.99")
+    # A retained remainder that works is protected at once, as the version says; one whose
+    # cancel is in flight is on its way out and blocks protection too.
+    assert [p.action for p in v1("partially_filled", retain_entry=True).proposals] == [
+        "CRYPTO_PROTECT"]
+    assert v1("pending_cancel", retain_entry=True).proposals == ()
+    # An exit still comes first: the app-watched stop sells while the cancel is in flight.
+    breached = plan(snapshot(replace(working, status="pending_cancel"), qty="10", available="10",
+                             bid="102", breached=NOW - timedelta(seconds=2)),
+                    retain_entry=False, entry_cancel_reason=reason)
+    assert (breached.state, breached.reason) == ("CANCELING", "STOP_LIMIT_NOT_FILLED")
+    # Every other setup (retain_entry None) keeps its recorded plan: protection with the cancel,
+    # and a pending entry cancel does not suppress it (docs/CRYPTO-EXECUTION-CONTRACT.md).
+    default = plan(snapshot(working, qty="10", available="10"))
+    assert [(p.action, p.reason) for p in default.proposals] == [
+        ("CRYPTO_PROTECT", "PROTECT_BROKER_INVENTORY"), ("CRYPTO_CANCEL", "CANCEL_REMAINING_ENTRY")]
+    pending = plan(snapshot(replace(working, status="pending_cancel"), qty="10", available="10"))
+    assert [p.action for p in pending.proposals] == ["CRYPTO_PROTECT"]
 
 
 def test_only_the_maintenance_amend_may_patch_a_crypto_order():

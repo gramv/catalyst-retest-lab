@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "LOCAL_STACK_V1 managed-engine defaults (package oss-packaging). PAPER TRADING ONLY.",
+    "Read by `local_stack trader` when CATALYST_VENUE=alpaca-paper. Engine settings in the user's own",
+    ".env.paper override these; the broker key comes only from there and is never in this file.",
+    "NO_AI_MODE_V1: only promoted mechanical strategies (MANAGED_STRATEGIES_JSON) trade; every trade",
+    "keeps fixed exits. See docs/CONFIGURATION.md for each setting and the reference deployment."
+  ],
+  "environment": {
+    "CATALYST_AI_MODE": "NO_AI_MODE_V1",
+    "JEV_CREDENTIAL_SLOT": "local-compose-unused",
+    "JEV_REVIEW_POLICY_JSON": "{\"version\": \"JEV_LIVE_REVIEW_POLICY_V2\", \"retry_http_statuses\": [429, 529], \"max_attempts\": 3, \"backoff_base_ms\": 250, \"backoff_multiplier\": 2, \"backoff_cap_ms\": 2000, \"jitter_mode\": \"EQUAL\", \"jitter_lower_fraction\": 0.5, \"retry_after_policy\": \"RESPECT_MINIMUM_OR_ABANDON\", \"breaker_scope\": \"PROVIDER_MODEL_CREDENTIAL_SLOT\", \"breaker_failure_threshold\": 3, \"breaker_failure_classes\": [\"HTTP_ERROR\", \"TRANSPORT_FAILURE\", \"TIMEOUT\", \"INVALID_RESPONSE\", \"MODEL_MISMATCH\", \"CREDENTIAL_ECHO\"], \"breaker_cooldown_seconds\": 30, \"half_open_max_inflight\": 1, \"half_open_max_attempts\": 1, \"breaker_recovery_successes\": 2, \"recovery_probe_spacing_seconds\": 1, \"recovery_probe_policy\": \"SYNTHETIC_NON_AUTHORIZING\", \"question_timeout_seconds\": 8, \"batch_timeout_seconds\": 8, \"overall_review_deadline_seconds\": 10, \"evidence_max_age_seconds\": 60, \"context_max_age_seconds\": 60, \"expiry_grace_seconds\": 0, \"max_clock_offset_ms\": 250, \"same_candidate_max_active_chains\": 1, \"selection_policy\": \"EXACT_REVISION_FIRST_VALID_CONFLICT_NEEDS_REVIEW\", \"material_supersession_policy\": \"MATERIAL_REVISION_ONLY\", \"duplicate_policy\": \"AUDIT_REJECT_SAME_REQUEST_RETRY\", \"heartbeat_period_seconds\": 5, \"heartbeat_deadline_seconds\": 15}",
+    "JEV_WORKER_MAX_INFLIGHT": "5",
+    "JEV_WORKER_POLL_SECONDS": "1",
+    "MANAGED_CLASSIFICATION_POLICY": "ALPACA_CRYPTO_SECTORS_V1",
+    "MANAGED_CRYPTO_CLASSIFICATIONS_JSON": "null",
+    "MANAGED_CRYPTO_DAY_POLICY_JSON": "{\"policy_id\": \"CRYPTO_NY_DAY_PAPER_V1\", \"entry_cutoff_minutes_before_midnight\": 10, \"flatten_minutes_before_midnight\": 5, \"max_hold_seconds\": 86400}",
+    "MANAGED_CRYPTO_EXECUTION_JSON": "{\"stop_execution\": null, \"maker_entry\": null}",
+    "MANAGED_CRYPTO_WINDOW_JSON": "{\"version\": \"CRYPTO_WINDOW_REVIEW_V1\", \"window_minutes\": 1440}",
+    "MANAGED_CYCLE_POLICY_JSON": "{\"selection_limit\": 10, \"review_deadline_seconds\": 10, \"claim_lease_seconds\": 15, \"max_packet_age_seconds\": 60, \"max_inflight\": 5, \"review_validity_seconds\": 1800, \"require_technical_evidence\": true}",
+    "MANAGED_ENVIRONMENT": "supervised_paper",
+    "MANAGED_HTTP_PORT": "8780",
+    "MANAGED_MANAGEMENT_REVIEWS": "DISABLED",
+    "MANAGED_MONITOR_TRIGGER_POLICY_JSON": "{\"policy_id\": \"JEV_MONITOR_SCHEDULING_ENGINEERING_V1\", \"minimum_interval_seconds\": 5, \"near_target_progress_fraction\": \"0.8\"}",
+    "MANAGED_POSITION_POLICY_JSON": "{\"quote_max_age_seconds\": 5, \"context_max_age_seconds\": 60, \"max_options\": 5, \"max_bars\": 20, \"max_news\": 4, \"max_structural_bars\": 64, \"max_history\": 4, \"context_version\": \"JEV_MANAGED_POSITION_CONTEXT_V3\", \"state_byte_budget\": 11000}",
+    "MANAGED_POSITION_REVIEW_SECONDS": "10",
+    "MANAGED_REPORT_MAX_SECONDS": "86400",
+    "MANAGED_RISK_POLICY_ID": "JEV_MANAGED_RISK_V5",
+    "MANAGED_RUNTIME_POLICY_JSON": "{\"profile\": \"MUSE_JEV_MANAGED_TEST_V1\", \"execution_tick_seconds\": 1, \"market_poll_seconds\": 1, \"research_poll_seconds\": 1, \"heartbeat_seconds\": 5, \"reconcile_seconds\": 30, \"stream_open_timeout_seconds\": 8, \"stream_read_timeout_seconds\": 1, \"reconnect_seconds\": 1, \"max_reconnect_seconds\": 30, \"shutdown_timeout_seconds\": 5, \"market_queue_capacity\": 5000}",
+    "MANAGED_SOURCE_POLICY_JSON": "{\"stock_feed\": \"iex\", \"timeout_seconds\": 3, \"batch_size\": 50, \"page_size\": 10000, \"max_pages\": 10, \"lookback_padding_bars\": 5}",
+    "MANAGED_STRATEGIES_JSON": "[]",
+    "MANAGED_US_CLASSIFICATIONS_JSON": "[]"
+  }
+}

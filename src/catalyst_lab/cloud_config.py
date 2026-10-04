@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from catalyst_lab import ai_mode
 from catalyst_lab.agent_identity import validated_agent_tokens
 from catalyst_lab.jev_contract import strict_json
 from catalyst_lab.managed_ops import ENV_NAMES, environment_findings, package_directory
@@ -204,27 +205,40 @@ def _token(environ, name):
 
 
 def trader_config(environ, *, cwd=None, release_root=None):
-    """Validate the whole trader environment before anything connects anywhere."""
+    """Validate the whole trader environment before anything connects anywhere.
+
+    ``CATALYST_AI_MODE`` (package oss-packaging, ``ai_mode``): absent or ``JEV_AI_MODE_V1``, the
+    checks below are exactly the reference deployment's; ``NO_AI_MODE_V1`` refuses the TypeSafe
+    key, research-agent tokens and every Jev selection, budget and schedule setting by name and
+    no longer requires them."""
     runtime = cloud_runtime(environ, cwd=cwd, release_root=release_root)
     unknown = unknown_names(environ, TRADER_NAMES)
     if unknown:
         raise CloudConfigError("CLOUD_UNKNOWN_ENGINE_VARIABLE", unknown)
-    missing = [name for name in TRADER_SECRETS
+    try:
+        mode = ai_mode.require(environ)
+    except ai_mode.AiModeError as exc:
+        raise CloudConfigError(exc.code, exc.names) from None
+    no_ai = mode == ai_mode.NO_AI_MODE
+    required = [name for name in TRADER_SECRETS
+                if not (no_ai and name in ai_mode.NO_AI_NOT_REQUIRED)]
+    missing = [name for name in required
                if not environ.get(name) or _placeholder(environ[name])]
     if missing:
         raise CloudConfigError("CLOUD_SECRET_MISSING", missing)
     tokens = [_token(environ, name) for name in ROLE_TOKENS]
     if len(set(tokens)) != len(tokens):
         raise CloudConfigError("ROLE_TOKENS_NOT_SEPARATED", ROLE_TOKENS)
-    try:
-        agents = validated_agent_tokens(strict_json(environ[AGENT_TOKENS]), reserved=tokens)
-    except (TypeError, ValueError):
-        raise CloudConfigError("AGENT_TOKENS_INVALID", [AGENT_TOKENS]) from None
-    if not agents:
-        raise CloudConfigError("AGENT_TOKENS_INVALID", [AGENT_TOKENS])
-    key = environ["TYPESAFE_API_KEY"]
-    if any(c.isspace() for c in key):
-        raise CloudConfigError("CLOUD_SECRET_INVALID", ["TYPESAFE_API_KEY"])
+    if not no_ai:
+        try:
+            agents = validated_agent_tokens(strict_json(environ[AGENT_TOKENS]), reserved=tokens)
+        except (TypeError, ValueError):
+            raise CloudConfigError("AGENT_TOKENS_INVALID", [AGENT_TOKENS]) from None
+        if not agents:
+            raise CloudConfigError("AGENT_TOKENS_INVALID", [AGENT_TOKENS])
+        key = environ["TYPESAFE_API_KEY"]
+        if any(c.isspace() for c in key):
+            raise CloudConfigError("CLOUD_SECRET_INVALID", ["TYPESAFE_API_KEY"])
     from catalyst_lab.alpaca import AlpacaCredentials
 
     try:  # The paper-only key prefix and the fixed paper endpoints, exactly as startup checks.
@@ -237,7 +251,8 @@ def trader_config(environ, *, cwd=None, release_root=None):
     engine = {name: environ[name] for name in ENV_NAMES if name in environ}
     absent, invalid = environment_findings(engine)
     absent = sorted(set(absent) | {name for name in CLOUD_REQUIRED_OPTIONAL
-                                   if not engine.get(name) or _placeholder(engine[name])})
+                                   if not (no_ai and name in ai_mode.NO_AI_NOT_REQUIRED)
+                                   and (not engine.get(name) or _placeholder(engine[name]))})
     if absent:
         raise CloudConfigError("CLOUD_ENGINE_SETTING_MISSING", absent)
     if invalid:

@@ -131,6 +131,7 @@ class UnchangedPlanOutcome:
     source_event_seq: int | None
     original_stop: D
     original_target: D
+    initial_stop: D
     exit_reason: str
     exit_price: D | None
     exit_at: datetime | None
@@ -147,7 +148,8 @@ class UnchangedPlanOutcome:
         return json_safe({
             "method": self.method, "change_kind": self.change_kind, "change_at": self.change_at,
             "source_event_seq": self.source_event_seq, "original_stop": self.original_stop,
-            "original_target": self.original_target, "exit_reason": self.exit_reason,
+            "original_target": self.original_target, "initial_stop": self.initial_stop,
+            "exit_reason": self.exit_reason,
             "exit_price": self.exit_price, "exit_at": self.exit_at,
             "same_bar_ambiguous": self.same_bar_ambiguous, "data_complete": self.data_complete,
             "unchanged_gross_r": self.unchanged_gross_r, "unchanged_net_r": self.unchanged_net_r,
@@ -156,7 +158,7 @@ class UnchangedPlanOutcome:
         })
 
 
-def replay_unchanged_plan(entry_price, change, bars_from_change, *, hold_deadline,
+def replay_unchanged_plan(entry_price, change, bars_from_change, *, initial_stop, hold_deadline,
                           actual_r=None, fee_rate=TAKER_FEE_TIER1, method=UNCHANGED_PLAN_METHOD):
     """What would have happened from ``change.at`` had ``change`` never been applied.
 
@@ -167,9 +169,14 @@ def replay_unchanged_plan(entry_price, change, bars_from_change, *, hold_deadlin
     counterfactual's own *assumed*-fee net R; that fee-basis mismatch is unavoidable for a trade
     that never happened and is named in ``limitations``, not hidden.
 
-    ``entry_price``, in the same denominator convention as ``official_r``, should be the
-    setup's *admitted* max entry price, not its actual average fill. ``method``
-    ``UNCHANGED_PLAN_REPLAY_V2``: ``hold_deadline`` is the first fill plus the setup's window.
+    ``entry_price`` and ``initial_stop`` are the setup's *admitted* max entry price and stop:
+    the R of every replay is (exit - entry) / (entry - initial_stop), ``official_r``'s own
+    denominator, so the two R values share one scale whichever change is replayed. (Until
+    2026-09-29 the denominator was the stop in force before the change: the same for a first
+    change, but a later change's R was on another scale, and a change made after the stop had
+    reached the max entry refused ``NONPOSITIVE_RISK_DENOMINATOR``; no replay had been recorded
+    then.) ``method`` ``UNCHANGED_PLAN_REPLAY_V2``: ``hold_deadline`` is the first fill plus the
+    setup's window.
     """
     walk = walk_to_exit(change.old_stop, change.old_target, bars_from_change,
                         hold_deadline=hold_deadline)
@@ -188,7 +195,7 @@ def replay_unchanged_plan(entry_price, change, bars_from_change, *, hold_deadlin
             "window); its outcome is not yet known."
         )
     else:
-        gross, net = r_values(entry_price, change.old_stop, walk.price, fee_rate=fee_rate)
+        gross, net = r_values(entry_price, initial_stop, walk.price, fee_rate=fee_rate)
         limitations.append(
             "unchanged_net_r assumes Alpaca's tier-1 taker fee on both legs (see "
             "pick_outcomes.FEE_ASSUMPTION); actual_r, when supplied, is the trade's own "
@@ -198,12 +205,22 @@ def replay_unchanged_plan(entry_price, change, bars_from_change, *, hold_deadlin
     return UnchangedPlanOutcome(
         method=method, change_kind=change.change_kind, change_at=change.at,
         source_event_seq=change.source_event_seq, original_stop=change.old_stop,
-        original_target=change.old_target, exit_reason=walk.reason, exit_price=walk.price,
+        original_target=change.old_target, initial_stop=initial_stop, exit_reason=walk.reason,
+        exit_price=walk.price,
         exit_at=walk.at, same_bar_ambiguous=walk.ambiguous,
         data_complete=walk.reason != DATA_INCOMPLETE, unchanged_gross_r=gross,
         unchanged_net_r=net, actual_r=actual_r, r_difference=difference,
         bars_examined=walk.bars_examined, limitations=tuple(limitations),
     )
+
+
+def traded_scale(levels, state):
+    """``(max entry, initial stop)`` on official R's scale: the plan's stop for a setup admitted
+    under ``CRYPTO_TRADE_PLAN_V1`` (``trade_plan.initial_levels``), the packet's otherwise."""
+    from catalyst_lab import trade_plan
+
+    traded = trade_plan.initial_levels(levels, state or {})
+    return D(str(traded["max_entry_price"])), D(str(traded["stop"]))
 
 
 # --- Reading today's maintenance mechanism (read-only) -------------------------------------------
@@ -289,7 +306,9 @@ def maintenance_level_changes(repository, setup_id):
 
 def maintenance_exit_changes(repository, setup_id):
     """Every agreed early exit of one setup (``EXIT_FLAG_RESOLVED`` ``EXIT_AGREED``,
-    ``EARLY_EXIT_FLAG_V1``, package maintenance) -- the "original" levels are the flag's own
+    ``EARLY_EXIT_FLAG_V1``, package maintenance; or ``NO_ANSWER_EXIT``, a
+    ``CRYPTO_MAINTENANCE_V5`` invalidation flag that exited unanswered, package jev-b1) --
+    the "original" levels are the flag's own
     recorded ``evidence.levels`` at the moment it was raised, never the setup's state at read
     time. A flag resolved any other way (``EXIT_NOT_AGREED``, ``NO_ANSWER_IN_TIME``,
     ``LIFECYCLE_ENDED``) or still pending changed nothing and is not returned.
@@ -301,7 +320,7 @@ def maintenance_exit_changes(repository, setup_id):
             JOIN lab.managed_events f ON f.kind='EXIT_FLAG_RAISED' AND f.setup_id=r.setup_id
               AND f.body->>'flag_id'=r.body->>'flag_id'
             WHERE r.setup_id=%s AND r.kind='EXIT_FLAG_RESOLVED'
-              AND r.body->>'outcome'='EXIT_AGREED'
+              AND r.body->>'outcome' IN ('EXIT_AGREED','NO_ANSWER_EXIT')
             ORDER BY r.event_seq""",
             (setup_id,),
         ).fetchall()
@@ -363,8 +382,11 @@ def unchanged_plan_comparisons(repository, bar_reader, setup_id, *, now):
         ).fetchone()["at"]
     if first_fill is None:
         return []  # Never entered: no maintenance to have changed anything about.
-    levels = setup["record_json"]["levels"]
-    entry_price = D(str(levels["max_entry_price"]))
+    # TRADED_LEVELS_V1 (package learning-loop2, 2026-10-03): official R's own scale, the plan's
+    # stop for a CRYPTO_TRADE_PLAN_V1 setup (``trade_plan.initial_levels``, as
+    # ``managed_measurement`` reads it), the packet's for every other setup. Until then a plan
+    # setup's replay was priced on the research stop, a different scale from its official R.
+    entry_price, initial_stop = traded_scale(setup["record_json"]["levels"], setup["state"])
     window = recorded_window_seconds(setup["state"])
     method = UNCHANGED_PLAN_METHOD if window is None else UNCHANGED_PLAN_WINDOW_METHOD
     hold_deadline = first_fill + (HOLD_HORIZON if window is None else timedelta(seconds=window))
@@ -386,8 +408,8 @@ def unchanged_plan_comparisons(repository, bar_reader, setup_id, *, now):
         except ShadowDataError:
             continue
         results.append(replay_unchanged_plan(
-            entry_price, change, bars, hold_deadline=hold_deadline, actual_r=actual_r,
-            method=method,
+            entry_price, change, bars, initial_stop=initial_stop, hold_deadline=hold_deadline,
+            actual_r=actual_r, method=method,
         ))
     return results
 
@@ -415,7 +437,8 @@ def setups_with_level_changes(repository, *, setup_id=None, after_event_seq=0, l
             LEFT JOIN lab.managed_states t ON t.setup_id=s.setup_id
             WHERE ((e.kind='MANAGEMENT_PLAN_AUTHORIZED')
                OR (e.kind='MAINTENANCE_DECISION' AND e.body->>'outcome'='APPLIED')
-               OR (e.kind='EXIT_FLAG_RESOLVED' AND e.body->>'outcome'='EXIT_AGREED'))
+               OR (e.kind='EXIT_FLAG_RESOLVED'
+                    AND e.body->>'outcome' IN ('EXIT_AGREED','NO_ANSWER_EXIT')))
               AND (%(setup)s::uuid IS NULL OR s.setup_id=%(setup)s::uuid)
             GROUP BY s.setup_id, s.symbol, t.body->>'arm', s.record_json->'agent'->>'agent_id'
             HAVING max(e.event_seq) > %(after)s
@@ -514,5 +537,6 @@ __all__ = [
     "TARGET_RAISE", "UNCHANGED_PLAN_METHOD", "UnchangedPlanOutcome", "maintenance_exit_changes",
     "maintenance_level_changes", "maintenance_replay_aggregates", "maintenance_replay_page",
     "maintenance_replay_rows", "replay_unchanged_plan", "setup_level_changes",
-    "setups_with_level_changes", "stop_target_changes", "unchanged_plan_comparisons",
+    "setups_with_level_changes", "stop_target_changes", "traded_scale",
+    "unchanged_plan_comparisons",
 ]

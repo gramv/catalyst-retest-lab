@@ -285,6 +285,20 @@ def test_managed_full_fill_with_stop_held_is_protected(mx):
     assert not venue.orders_of("sell", "market")
 
 
+def test_managed_protection_with_a_print_and_no_quote_is_left_unchanged(mx):
+    """After a market gap the runtime's observation can hold a print and no quote: the bracket is
+    then left as it is, like a stale quote."""
+    engine, venue, _ = mx
+    sid, entry = managed_filled(mx)
+    now = venue.now.isoformat()
+    print_only = {"trade_price": "100", "trade_at": now, "trade_id": "7", "feed_healthy": True,
+                  "data_provider": "ALPACA", "data_feed": "iex", "retrieved_at": now}
+    assert engine.manage(sid, print_only) == "STALE_QUOTE_PROTECTION_UNCHANGED"
+    assert [leg["status"] for leg in entry["legs"]] == ["held", "new"]
+    assert not any(method in {"DELETE", "PATCH"} for method, _, _ in venue.calls)
+    assert engine.manage(sid, observation(mx)) == "PROTECTED"
+
+
 @pytest.mark.parametrize("stop,target", [("held", "held"), ("pending_replace", "new"),
                                          ("new", "pending_new")])
 def test_managed_transitioning_legs_wait_for_the_grace_then_flatten(mx, stop, target):

@@ -67,6 +67,10 @@ REALITY_EVENT = "MARKET_REALITY"  # market_reality.REALITY_EVENT (kept here: no 
 LEARNING_EVENT_KINDS = frozenset({
     OUTLOOK_EVENT, POST_MORTEM_EVENT, REALITY_EVENT, "DAILY_SCORECARD", "WEEKLY_REVIEW",
     "UNCHANGED_PLAN_REPLAY", "DAY_REVIEW_DECISION_REPLAY",
+    # Package learning-loop2 (2026-10-03): the daily brief (it carries the account's picks and
+    # trades; agents read its sanitized view in their lessons), the missed-tradeable records and
+    # the per-trade path and decision-context records.
+    "DAILY_BRIEF", "MISSED_TRADEABLE", "AFTER_EXIT_PATH", "MANAGEMENT_CHANGE_CONTEXT",
 })
 HORIZON_HOURS = 24
 # An outlook must list every coin of the universe, so its cap may never sit below the largest

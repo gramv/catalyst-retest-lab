@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal as D
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from catalyst_lab import exit_flags
@@ -29,9 +30,16 @@ from catalyst_lab.unchanged_plan import (
 )
 from tests.maintenance_fixtures import bodies, maintainer, open_trade, quote
 from tests.maintenance_fixtures import mt as mt  # noqa: F401
+from tests.maintenance_fixtures import (  # noqa: F401
+    pre_jev_b1_admission as pre_jev_b1_admission,
+)
 from tests.test_execution import er as er  # noqa: F401
 from tests.test_execution import pristine_cluster as pristine_cluster  # noqa: F401
 from tests.test_managed_service import TOKEN, FixtureCycle
+
+# The replays read V4 maintenance decisions (action questions): admission as before package
+# jev-b1. V5's exits are replayed in tests/test_jev_b1_flows.py.
+pytestmark = pytest.mark.usefixtures("pre_jev_b1_admission")
 
 
 def reviewed(mt, kit, *, symbol="SOL/USD", bid="106", seconds=1):
@@ -236,7 +244,7 @@ def test_unchanged_plan_comparisons_replays_a_maintenance_decision(mt):  # noqa:
     assert len(comparisons) == 1
     outcome = comparisons[0]
     assert outcome.change_kind == STOP_RAISE
-    assert outcome.original_stop == D("95")
+    assert outcome.original_stop == D("95") and outcome.initial_stop == D("95")
     assert outcome.data_complete is True  # Flat bars: rides to the 24-hour hold exit.
 
 

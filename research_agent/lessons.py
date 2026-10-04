@@ -16,6 +16,13 @@ did, the outlook's hit rate and calibration, the misses, and the post-mortems st
 * a hint needs evidence: at least ``MIN_SAMPLE`` resolved picks in two or more buckets and a
   spread of at least ``MIN_SPREAD`` between the best and the worst. Otherwise there is no
   hint, and the text says there was not enough data.
+* since package learning-loop2 (2026-10-03, plan L2) every dimension ranks by **net R per
+  resolved pick** (``RANKING``): the shadow net R after the assumed fee summed over a bucket's
+  resolved picks, a pick the price never reached counting 0 R, divided by those picks -- what
+  sending a pick of that bucket earned. The trigger rate (how often price reached the entry) is
+  kept beside it as the secondary figure; it no longer decides, since it favoured easy fills
+  over profitable ones. A scorecard written before the per-pick figure existed is read from its
+  mean net R x the triggered count / the resolved count (the same quantity, rounded).
 
 The wording never names the agent, and never writes the literal level-rule tags the
 scorecard reads from ``why_over_peers`` ("rule-" followed by the rule letter), so a lesson
@@ -36,19 +43,18 @@ RULE_WORDS = {"A": "the stop under the whole window's low",
 KIND_WORDS = {"CHART": "chart-only picks", "NEWS": "news-only picks",
               "BOTH": "picks with a fresh catalyst"}
 DIMENSIONS = {
-    "distance_bucket": {"values": DISTANCE_BUCKETS, "lines": "fill_rate_by_distance",
-                        "metric": "shadow_trigger_rate", "count": "shadow_recorded"},
-    "timeframe": {"values": tuple(TIMEFRAME_WORDS), "lines": "results_by_timeframe",
-                  "metric": "shadow_hit_rate", "count": "shadow_r_count"},
-    "rule": {"values": tuple(RULE_WORDS), "lines": "results_by_rule",
-             "metric": "shadow_hit_rate", "count": "shadow_r_count"},
-    "kind": {"values": tuple(KIND_WORDS), "lines": "results_by_kind",
-             "metric": "shadow_hit_rate", "count": "shadow_r_count"},
+    "distance_bucket": {"values": DISTANCE_BUCKETS, "lines": "fill_rate_by_distance"},
+    "timeframe": {"values": tuple(TIMEFRAME_WORDS), "lines": "results_by_timeframe"},
+    "rule": {"values": tuple(RULE_WORDS), "lines": "results_by_rule"},
+    "kind": {"values": tuple(KIND_WORDS), "lines": "results_by_kind"},
 }
+RANKING = "NET_R_PER_RESOLVED_PICK_V1"  # Package learning-loop2 (L2).
+METRIC = "shadow_r_net_per_resolved_pick"
+SECONDARY = "shadow_trigger_rate"
 WINDOWS = ("7d", "30d")  # The 30-day lines only when the 7-day ones lack the evidence.
 WINDOW_WORDS = {"1d": "the last day", "7d": "the last 7 days", "30d": "the last 30 days"}
 MIN_SAMPLE = 5
-MIN_SPREAD = Decimal("0.20")
+MIN_SPREAD = Decimal("0.10")  # R per pick between the best and the worst bucket.
 HINT_KEYS = frozenset({"dimension", "prefer", "window", "metric", "evidence", "text"})
 MAX_HINT_TEXT = 200
 USE = ("Ordering hints only: build ranks picks by them after its own pick limit, and never "
@@ -103,38 +109,66 @@ def _describe(dimension, value):
     return KIND_WORDS[value]
 
 
+def _signed(value):
+    text = _text(value)
+    return text if text.startswith("-") or text == "n/a" else f"+{text}"
+
+
+def net_per_pick(row):
+    """``(net R per resolved pick, resolved picks, trigger rate)`` of one scorecard bucket, or
+    ``(None, n, rate)``. Read from ``shadow_r_net_per_resolved_pick`` / ``shadow_resolved``;
+    a scorecard without them gives mean x triggered / recorded over ``shadow_recorded``."""
+    rate = _decimal(row.get(SECONDARY))
+    if row.get(METRIC) is not None:
+        return _decimal(row[METRIC]), int(row.get("shadow_resolved") or 0), rate
+    recorded, mean = int(row.get("shadow_recorded") or 0), _decimal(row.get("mean_shadow_r_net"))
+    count = int(row.get("shadow_r_count") or 0)
+    if not recorded:
+        return None, 0, rate
+    if mean is None:
+        return (Decimal(0), recorded, rate) if count == 0 else (None, recorded, rate)
+    return mean * count / recorded, recorded, rate
+
+
 def _hint_text(dimension, eligible, prefer, window):
-    verb = "reached the entry" if dimension == "distance_bucket" else "hit"
     best, worst = eligible[0], eligible[-1]
-    evidence = (f"{_describe(dimension, best[0])} {verb} {_count(best[1], best[2])} of "
-                f"{best[2]} times, {_describe(dimension, worst[0])} "
-                f"{_count(worst[1], worst[2])} of {worst[2]}, in {WINDOW_WORDS[window]}")
+
+    def part(row):
+        value, net, total, rate = row
+        reached = f" (entry reached {_count(rate, total)})" if rate is not None else ""
+        return f"{_describe(dimension, value)} {_signed(net)}R a pick over {total}{reached}"
+
     first = ", ".join(_describe(dimension, value) for value in prefer)
-    return f"{evidence}: rank {first} first"[:MAX_HINT_TEXT]
+    text = f"{part(best)}; {part(worst)}; {WINDOW_WORDS[window]}: rank {first} first"
+    if len(text) > MAX_HINT_TEXT:  # The short form keeps the decision and the figures.
+        text = (f"{_describe(dimension, best[0])} {_signed(best[1])}R a pick over {best[2]}, "
+                f"{_describe(dimension, worst[0])} {_signed(worst[1])}R over {worst[2]}, "
+                f"{window}: rank {first} first")
+    return text[:MAX_HINT_TEXT]
 
 
 def derive_hint(dimension, windows):
-    """One dimension's hint from the scorecard windows, or ``None`` without evidence."""
+    """One dimension's hint from the scorecard windows, or ``None`` without evidence: the
+    buckets ranked by net R per resolved pick (``RANKING``), the trigger rate beside it."""
     spec = DIMENSIONS[dimension]
     for window in WINDOWS:
         buckets = ((windows or {}).get(window) or {}).get(spec["lines"]) or {}
         eligible = []
         for value in spec["values"]:
-            row = buckets.get(value) or {}
-            total, rate = int(row.get(spec["count"]) or 0), _decimal(row.get(spec["metric"]))
-            if total >= MIN_SAMPLE and rate is not None:
-                eligible.append((value, rate, total))
+            net, total, rate = net_per_pick(buckets.get(value) or {})
+            if total >= MIN_SAMPLE and net is not None:
+                eligible.append((value, net, total, rate))
         if len(eligible) < 2:
             continue  # Not enough evidence in this window; a longer one may have it.
         eligible.sort(key=lambda row: (-row[1], spec["values"].index(row[0])))
         if eligible[0][1] - eligible[-1][1] < MIN_SPREAD:
             return None  # Enough evidence, and no difference worth ranking by.
-        prefer = [value for value, rate, _n in eligible if rate > eligible[-1][1]]
+        prefer = [row[0] for row in eligible if row[1] > eligible[-1][1]]
         return {
-            "dimension": dimension, "prefer": prefer, "window": window,
-            "metric": spec["metric"],
-            "evidence": {value: {"n": total, "rate": _text(rate)}
-                         for value, rate, total in eligible},
+            "dimension": dimension, "prefer": prefer, "window": window, "metric": METRIC,
+            "evidence": {value: {"n": total, "net_r_per_pick": _text(net),
+                                 "trigger_rate": _text(rate) if rate is not None else None}
+                         for value, net, total, rate in eligible},
             "text": _hint_text(dimension, eligible, prefer, window),
         }
     return None
@@ -157,7 +191,8 @@ def emphasis_doc(lessons, *, context_as_of, now, unavailable=None):
         "scorecard_day": (lessons or {}).get("scorecard_day"),
         "unavailable": unavailable,
         "rules": {"min_sample": MIN_SAMPLE, "min_spread": str(MIN_SPREAD),
-                  "windows": list(WINDOWS)},
+                  "windows": list(WINDOWS), "ranking": RANKING, "metric": METRIC,
+                  "secondary": SECONDARY},
         "use": USE,
         "hints": hints,
     }
@@ -306,6 +341,49 @@ def _pending_lines(pending):
     return out
 
 
+def brief_lines(brief):
+    """The app's latest daily brief (``DAILY_BRIEF_V1``'s agent view, package learning-loop2):
+    the market, the movers and tomorrow's research focus. Attention only: no hint comes from it,
+    and nothing in it narrows coverage."""
+    if not brief:
+        return ["Daily brief: none recorded yet (the nightly jobs write it after the day's "
+                "market reality)."]
+    market = brief.get("market") or {}
+    out = [f"Daily brief {brief.get('day')}: {market.get('regime_tag')}. "
+           f"{market.get('words') or ''}".rstrip()]
+    for cluster in brief.get("sector_clusters") or []:
+        out.append(f"  cluster: {cluster.get('sector')} {cluster.get('direction')} "
+                   f"({', '.join(cluster.get('symbols') or [])})")
+    for mover in brief.get("movers") or []:
+        tradeable = mover.get("tradeable") or {}
+        best = tradeable.get("best_net_r")
+        out.append(f"  mover {mover.get('symbol')} {mover.get('return_pct')}% "
+                   f"({mover.get('sector')}): {mover.get('knowability')}; mechanical signals "
+                   f"{tradeable.get('signals', 0)}"
+                   + (f", best simulated net R {best}" if best is not None else "")
+                   + (" (hold pending)" if tradeable.get("pending") else ""))
+    previous = brief.get("previous_day_missed_tradeable")
+    if previous:
+        out.append(f"  missed tradeable {previous.get('day')}: {previous.get('missed_tradeable')} "
+                   f"of {previous.get('movers')} movers (mean simulated net R "
+                   f"{previous.get('mean_net_r')})")
+    out.append("Research focus for today (attention only; every coin is still covered):")
+    out.extend(f"  {item.get('kind')}: {item.get('text')}"
+               for item in brief.get("research_focus") or [])
+    if not brief.get("research_focus"):
+        out.append("  none from the brief")
+    return out
+
+
+def queue_lines(queue):
+    """The post-mortems that still need an agent (``post_mortem_queue``)."""
+    if not queue:
+        return []
+    return [f"Post-mortem queue ({queue.get('days')} days): {queue.get('movers_total', 0)} "
+            f"movers and {len(queue.get('trades') or [])} notable trades need an agent's cited "
+            "web research; the app computed the rest (market reality, regime, brief, paths)."]
+
+
 def summary_lines(lessons, hints, *, unavailable=None):
     if unavailable and unavailable != "NO_LESSONS":
         return [f"Lessons unavailable this run ({unavailable}): the app could not read a "
@@ -325,9 +403,13 @@ def summary_lines(lessons, hints, *, unavailable=None):
         f"{day.get('day')} ({len(day.get('movers') or [])} movers, share "
         f"{_text(day.get('mover_share'))})" for day in days) or "none yet"))
     out.extend(_pending_lines(lessons.get("pending_post_mortems")))
-    out.append("Emphasis for today (ordering only; every coin is still covered):")
+    out.extend(queue_lines(lessons.get("post_mortem_queue")))
+    if "daily_brief" in lessons:
+        out.extend(brief_lines(lessons.get("daily_brief")))
+    out.append("Emphasis for today (ordering only, by net R per resolved pick; every coin is "
+               "still covered):")
     out.extend(f"  {hint['text']}" for hint in hints)
     if not hints:
         out.append(f"  none: no dimension has {MIN_SAMPLE}+ resolved picks in two buckets with a "
-                   f"spread of {MIN_SPREAD} or more")
+                   f"spread of {MIN_SPREAD}R a pick or more")
     return out

@@ -9,8 +9,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from catalyst_lab.audit import CREDENTIAL_PATTERNS, credential_matches
 from catalyst_lab.audit import FIXTURE_MARKERS as FIXTURE_MARKERS  # Used by test_ledger_backup.
 
@@ -21,9 +19,18 @@ BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".ico", ".woff", ".w
 PATTERNS = CREDENTIAL_PATTERNS
 
 
+SKIPPED_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+
+
 def _candidate_files():
-    if not shutil.which("git"):
-        pytest.skip("git is required to enumerate tracked files")
+    """Tracked plus untracked-but-not-ignored files; outside a git checkout (an exported copy),
+    every file under the root except tool caches, so the scan only grows."""
+    inside = shutil.which("git") and subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=ROOT, capture_output=True, text=True,
+    ).stdout.strip() == str(ROOT.resolve())
+    if not inside:
+        return [path for path in ROOT.rglob("*")
+                if path.is_file() and not SKIPPED_DIRS.intersection(path.relative_to(ROOT).parts)]
     listing = subprocess.run(
         ["git", "ls-files", "-co", "--exclude-standard", "-z"],
         cwd=ROOT, check=True, capture_output=True,

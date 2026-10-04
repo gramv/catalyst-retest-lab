@@ -328,16 +328,17 @@ def test_pause_blocks_managed_entries_but_protection_and_exits_continue(er, mx, 
     pause(er)
     with pytest.raises(ValueError, match="RISK_HALT"):
         engine.admit(packet(mx, "SOL/USD"))  # managed_execution admit
-    rejected = engine.observe_trigger(watching, observation(mx))  # managed authorize_entry
-    assert rejected["outcome"] == "REJECTED" and rejected["reason"] == "RISK_HALT"
-    assert engine._load(watching)[1]["state"] == "RISK_REJECTED"
+    # managed authorize_entry: OPERATOR_PAUSE_ENTRY_WAIT_V1 records a wait, no decision.
+    assert engine.observe_trigger(watching, observation(mx)) is None
+    assert engine._load(watching)[1]["state"] == "WATCHING"
+    assert not [o for o in venue.orders_of("buy") if o["symbol"] == "ETH/USD"]
     plan = engine.manage(sid, observation(mx))  # A pause alone never exits.
     assert plan.state == "PROTECTED" and stop["status"] == "new"
     assert not venue.orders_of("sell", "market")
     assert engine._load(sid)[1].get("exit_requested") is None
-    gap = observation(mx, bid="90", ask="90.01")
+    gap = observation(mx, trade_price="90", bid="90", ask="90.01")  # A print through the stop.
     engine.manage(sid, gap)
-    venue.now += timedelta(seconds=3)
+    venue.now += timedelta(seconds=5)
     engine.manage(sid, observation(mx, bid="90", ask="90.01"))
     assert stop["status"] == "canceled"  # Authorized CANCEL claim while paused.
     engine.manage(sid, observation(mx, bid="90", ask="90.01"))
@@ -584,7 +585,7 @@ def test_view_keeps_the_renamed_table_grants_and_is_auto_updatable(er):
                       "execution_halt_records": expected}
     assert view["is_insertable_into"] == "YES"
     assert {"immutable_rows", "immutable_truncate"} <= triggers
-    assert version["v"] == SCHEMA_VERSION == 25
+    assert version["v"] == SCHEMA_VERSION == 31
 
 
 def test_flatten_all_is_a_durable_audited_request_without_broker_action(er, capsys, monkeypatch):

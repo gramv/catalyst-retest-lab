@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
+from catalyst_lab.strategies import core
 from catalyst_lab.system_check import (
     LIVE_PRICE_MAX_AGE_SECONDS,
     REST_SOURCE,
@@ -232,17 +233,17 @@ def evaluate(levels, observation, *, now, admitted_at):
         # As today: a print before admission, or stamped after now, is not evaluated at all.
         return verdict(IGNORED, "TRIGGER_BEFORE_ADMISSION" if printed[1] < admitted_at
                        else "STALE_MARKET_OBSERVATION")
-    if printed is not None and printed[0] <= s:
+    if printed is not None and core.reaches_stop(printed[0], s):
         return verdict(INVALIDATE, STOP_TRADED_BEFORE_TRIGGER, PRINT)
     if observation.get("feed_healthy") is not True:
         return verdict(INVALIDATE, DATA_FEED_FAILURE)
-    if fresh and bid <= s:
+    if fresh and core.reaches_stop(bid, s):
         return verdict(INVALIDATE, STOP_QUOTED_BEFORE_TRIGGER, QUOTE)
     print_touch = (
-        printed is not None and printed[0] <= t
+        printed is not None and core.touches_entry(printed[0], t)
         and 0 <= (now - printed[1]).total_seconds() <= PRINT_MAX_AGE_SECONDS
     )
-    quote_touch = fresh and ask <= t
+    quote_touch = fresh and core.touches_entry(ask, t)
     if not print_touch and not quote_touch:
         return verdict(NO_TOUCH)
     touch = PRINT if print_touch else QUOTE

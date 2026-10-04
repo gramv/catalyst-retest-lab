@@ -34,6 +34,7 @@ from pydantic import (
     model_validator,
 )
 
+from catalyst_lab import strategies
 from catalyst_lab.jev_contract import digest, encoded
 from catalyst_lab.muse_reports import (
     AgentIdentity,
@@ -194,6 +195,17 @@ class AgentPick(BaseModel):
     sources: list[SourceExcerpt] = Field(default_factory=list, max_length=8)
     technical_evidence: PickTechnicalEvidence | None = None
     agent_confidence: Confidence  # Analytics only: never reviewed, never a threshold.
+    # STRATEGY_REGISTRY_V1 (package strategy-c1): the strategy the pick is proposed for. Absent
+    # is PULLBACK_V1 (every report before this field); a present id must name a registered
+    # strategy that is live on paper and fed by research reports. Never reviewed by Jev.
+    strategy_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("strategy_id")
+    @classmethod
+    def registered_strategy(cls, value):
+        if value is not None:
+            strategies.report_strategy(value)  # STRATEGY_NOT_REGISTERED / _NOT_OPEN_TO_REPORTS
+        return value
 
     @field_validator("agent_price_at", "valid_until", mode="before")
     @classmethod
@@ -351,7 +363,12 @@ def _parse_pick(index, value):
         return PickIntake(
             index, signal, item_sha256, None, {"invalid_item_sha256": item_sha256}
         ).rejected(code, errors)
-    return PickIntake(index, pick.signal_id, item_sha256, pick, pick.model_dump(mode="json"))
+    canonical = pick.model_dump(mode="json")
+    # An absent strategy keeps the pre-registry canonical form, so every report accepted before
+    # STRATEGY_REGISTRY_V1 still hashes identically (as V2's optional extensions do).
+    if canonical.get("strategy_id") is None:
+        canonical.pop("strategy_id", None)
+    return PickIntake(index, pick.signal_id, item_sha256, pick, canonical)
 
 
 def _duplicates(items, key, code, path):

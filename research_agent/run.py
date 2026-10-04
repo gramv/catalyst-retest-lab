@@ -6,9 +6,10 @@ Morning commands: ``context``, ``lessons``, ``checklist export``, ``market``, ``
 never ``submit``, which stays an explicit, separate step; see ``submit.py``). Evening
 commands: ``movers``, ``postmortem``, ``postmortem-check``, ``postmortem-submit`` and
 ``checklist update``; ``checklist show`` prints the checklist. The three ``*submit``
-commands are the only network writes. Every command reads and writes plain JSON files in
-one run folder (``--run-dir``, default ``runs/<NY date>``, or ``runs/<day>/evening`` for the
-evening commands given a day), so a whole run is inspectable afterwards. See
+commands and ``answer`` (below) are the only network writes. Every command reads and writes
+plain JSON files in one run folder (``--run-dir``, default ``runs/<NY date>``, or
+``runs/<day>/evening`` for the evening commands given a day), so a whole run is inspectable
+afterwards. See
 ``research_agent/DAILY_PROCEDURE.md`` for the full daily sequence and
 ``docs/OPERATIONS-RUNBOOK.md`` for how to run this by hand.
 
@@ -25,6 +26,20 @@ harness (``scripts/agent_research_session.py``), which has no research-context r
 it accepts ``context --offline``'s output and writes a report the harness's own
 ``submit --report`` completes and sends. This CLI's own ``submit`` refuses to send a
 session-mode report to a live app (``build.SESSION_MARKER_FILENAME`` in the run folder).
+
+Research loop V2 (``docs/RESEARCH-LOOP-V2.md``, package research-loop-kit): ``update`` is
+the update run of ``RESEARCH_SCHEDULE_V2`` (every run but the daily one; ``update.py``). It
+reads the context, market and levels as the other runs do, reviews the agent's own WATCHING
+setups, and writes ``withdrawal.json``, ``report.json`` and ``update-notes.json``; ``validate``
+checks both files and ``submit`` sends the withdrawal first, then the report. ``update
+--lessons`` (package learning-loop2) orders its new picks by the lessons' hints, derived from
+the context it reads (or from an ``emphasis.json``); adjusted picks stay first. ``derivatives``
+writes the daily run's derivatives context (``derivatives.py``) for ``build --derivatives``.
+
+``answer`` (package kit-answers, 2026-09-29) answers the app's pending window reviews and Jev
+early-exit flags under ``MUSE_ANSWER_RULES_V1`` (``answers.py``), for an operator's watch loop
+every 2-5 minutes: one GET when nothing is pending; each item's record in the run folder's
+``items/`` and each run's line in ``polls/``. ``--dry-run`` writes the answers without sending.
 """
 
 from __future__ import annotations
@@ -40,9 +55,11 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from research_agent import (
+    answers,
     build,
     checklist,
     context,
+    derivatives,
     lessons,
     levels,
     market,
@@ -53,6 +70,7 @@ from research_agent import (
     submit,
     technicals,
     token,
+    update,
 )
 
 RUN_TIMEZONE = "America/New_York"
@@ -235,6 +253,50 @@ def cmd_levels(args):
     return 0
 
 
+def _add_evidence(parser):
+    """The operator's evidence filter (build.EvidenceFilter) on build, all and update."""
+    parser.add_argument("--exclude", type=build.EvidenceFilter.parse_exclude, default=frozenset(),
+                        help="Coins never offered as new picks, comma-separated (e.g. "
+                        "POL,LDO,WIF: never filled on Alpaca paper). An update also "
+                        "withdraws a watched setup of such a coin (method v9).")
+    parser.add_argument("--max-entry-distance-pct", type=build.EvidenceFilter.parse_distance_pct,
+                        default=None, help="Leave out a new pick whose maximum entry sits "
+                        "further under the live Alpaca mid than this percent (e.g. 2.5).")
+    # Method v8 (research_agent/evidence.py) for new picks; since method v9 an update also
+    # re-checks the watched setups it keeps or adjusts against --exclude,
+    # --min-alpaca-volume-usd and --trend-floor-pct and withdraws one whose premise no
+    # longer holds (update.premise_review). The distance and sell-off rules stay new-pick only.
+    parser.add_argument("--min-alpaca-volume-usd", type=build.EvidenceFilter.parse_usd,
+                        default=None, help="Leave out a new pick whose coin's Alpaca 24 h USD "
+                        "volume is under this unless the agent filled a trade of it in the "
+                        "context's window (e.g. 5000).")
+    parser.add_argument("--trend-floor-pct", type=build.EvidenceFilter.parse_trend_floor_pct,
+                        default=None, help="Leave out a new pick whose coin trades further "
+                        "under its 20-day average than this percent (0: at or above it).")
+    parser.add_argument("--selloff-pct", type=build.EvidenceFilter.parse_selloff_pct,
+                        default=None, help="Send no new picks while the median coin or BTC is "
+                        "down at least this percent over two hours (e.g. 2).")
+
+
+def _nonnegative_int(text):
+    value = int(text)
+    if value < 0:
+        raise ValueError("NEGATIVE")
+    return value
+
+
+def _evidence(args):
+    """``build.EvidenceFilter`` from the evidence options, or None when none is given."""
+    exclude = getattr(args, "exclude", None) or frozenset()
+    fields = {"max_entry_distance": getattr(args, "max_entry_distance_pct", None),
+              "min_alpaca_volume_usd": getattr(args, "min_alpaca_volume_usd", None),
+              "trend_floor": getattr(args, "trend_floor_pct", None),
+              "selloff": getattr(args, "selloff_pct", None)}
+    if not exclude and all(value is None for value in fields.values()):
+        return None
+    return build.EvidenceFilter(exclude=frozenset(exclude), **fields)
+
+
 def cmd_build(args):
     run_dir = _run_dir(args)
     ctx = _read_json(run_dir / "context.json")
@@ -266,6 +328,14 @@ def cmd_build(args):
         except lessons.LessonsError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+    derivatives_doc = summaries = None
+    if getattr(args, "derivatives", None):
+        derivatives_doc = _read_json(Path(args.derivatives))
+        try:
+            summaries = derivatives.load(derivatives_doc)
+        except derivatives.DerivativesFormatError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     now = _parse_now(args.now)
     try:
         result = build.build_report(
@@ -273,21 +343,25 @@ def cmd_build(args):
             news_by_coin=news_by_coin, agent_id=args.agent_id,
             agent_version=args.agent_version, now=now, max_picks=args.max_picks,
             session=args.session, emphasis=emphasis, run_id=records.run_id(run_dir),
-            profile=profile,
+            profile=profile, derivatives=summaries, evidence=_evidence(args),
         )
     except build.BuildError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     marker_path = run_dir / build.SESSION_MARKER_FILENAME
     marker_path.unlink(missing_ok=True)  # Clear a stale marker from an earlier build here.
-    _write_json(run_dir / "build-notes.json", {
+    build_notes = {
         "profile": profile.name,  # Every pick of this build came from this profile's setups.
         "accepted": [outcome.symbol for outcome in result.accepted],
         "rejected": [{"symbol": o.symbol, "error": o.error} for o in result.rejected],
         "skipped": list(result.skipped), "notes": list(result.notes),
         "lessons": ({"emphasis_file": args.lessons, **result.lessons} if result.lessons
                     else None),
-    })
+    }
+    if result.derivatives is not None:  # Only with --derivatives: other builds' notes as before.
+        build_notes["derivatives"] = {"file": args.derivatives, **result.derivatives,
+                                      "omitted": derivatives.omitted(derivatives_doc)}
+    _write_json(run_dir / "build-notes.json", build_notes)
     if result.report is None:
         print("no picks survived; report.json was not written (see build-notes.json)")
         return 1
@@ -306,24 +380,64 @@ def cmd_build(args):
              "'submit --report', not this CLI's 'submit'.")
     print(f"wrote {run_dir / 'report.json'}: {len(result.accepted)} picks, "
          f"{len(result.rejected)} rejected, {len(result.skipped)} skipped")
+    if result.derivatives is not None:
+        record = result.derivatives
+        crowded = sum(bool(row.get("crowded")) for row in record["attached"])
+        print(f"derivatives context: attached to {len(record['attached'])} picks ({crowded} "
+              f"crowded, as RISK claims), left out of {len(record['left_out'])}, no figures "
+              f"for {len(record['missing'])} (build-notes.json)")
     return 0
+
+
+def _withdrawal_check(run_dir):
+    """``(withdrawal.json's body or None, problems)``: the update's withdrawal, checked."""
+    path = run_dir / update.WITHDRAWAL_FILE
+    if not path.exists():
+        return None, []
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}, [f"{path.name}: not JSON"]
+    return body, update.withdrawal_problems(body)
 
 
 def cmd_validate(args):
     run_dir = _run_dir(args)
+    withdrawal, problems = _withdrawal_check(run_dir)
+    if not (run_dir / "report.json").exists() and (
+            withdrawal is not None or (run_dir / update.NOTES_FILE).exists()):
+        # An update run with no picks: only its withdrawal (if any) to check.
+        doc = {"accepted": [], "rejected": [], "dossier_bytes": {}}
+        if withdrawal is not None:
+            doc["withdrawal"] = {"items": len(withdrawal.get("items") or []),
+                                 "problems": problems}
+        _write_json(run_dir / "validate.json", doc)
+        _print_problems(problems, [])
+        print("validate: no report.json in this update run; "
+              + (f"withdrawal.json: {len(withdrawal.get('items') or [])} items, "
+                 f"{len(problems)} problems" if withdrawal is not None
+                 else "nothing to check (the update changed nothing)"))
+        return 0 if not problems else 1
     report = _read_json(run_dir / "report.json")
     now = _parse_now(args.now) or datetime.now(UTC)
     default_valid_until = None
     if (run_dir / build.SESSION_MARKER_FILENAME).exists():
         default_valid_until = now + build.DEFAULT_VALIDITY
     result = build.validate_report(report, now=now, default_valid_until=default_valid_until)
-    _write_json(run_dir / "validate.json", {
+    doc = {
         "accepted": [outcome.symbol for outcome in result.accepted],
         "rejected": [{"symbol": o.symbol, "error": o.error} for o in result.rejected],
         "dossier_bytes": {o.symbol: o.dossier_bytes for o in result.accepted},
-    })
+    }
+    if withdrawal is not None:  # An update run's withdrawal, checked beside its report.
+        doc["withdrawal"] = {"items": len(withdrawal.get("items") or []), "problems": problems}
+    _write_json(run_dir / "validate.json", doc)
     print(f"validate: {len(result.accepted)} ok, {len(result.rejected)} rejected")
-    return 0 if not result.rejected else 1
+    if withdrawal is not None:
+        _print_problems(problems, [])
+        print(f"validate: withdrawal.json: {len(withdrawal.get('items') or [])} items, "
+              f"{len(problems)} problems")
+    return 0 if not result.rejected and not problems else 1
 
 
 def cmd_submit(args):
@@ -339,12 +453,82 @@ def cmd_submit(args):
             file=sys.stderr,
         )
         return 2
-    report = _read_json(run_dir / "report.json")
+    if (run_dir / update.WITHDRAWAL_FILE).exists():
+        return _submit_update(args, run_dir)
+    if not (run_dir / "report.json").exists() and (run_dir / update.NOTES_FILE).exists():
+        print("submit: nothing to send: this update run changed nothing (update-notes.json)")
+        return 0
+    return _submit_report(args, run_dir)
+
+
+def _submit_update(args, run_dir):
+    """An update run's sends: withdrawal.json first, then report.json when there is one.
+    Any answer but 200 to the withdrawal stops before the report is sent."""
+    body, problems = _withdrawal_check(run_dir)
+    if problems:
+        _print_problems(problems, [])
+        print(f"error: {update.WITHDRAWAL_FILE} not sent, and the report neither: "
+              f"{len(problems)} problems", file=sys.stderr)
+        return 2
     try:
         agent_token = _load_token(args)
     except token.TokenUnavailable as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    code = _send_withdrawal(args, run_dir, body, agent_token)
+    if code != 0:
+        return code
+    if not (run_dir / "report.json").exists():
+        print("submit: this update run has no report.json (no adjusted or new picks); only "
+              "the withdrawal was sent")
+        return 0
+    return _submit_report(args, run_dir, agent_token)
+
+
+def _send_withdrawal(args, run_dir, body, agent_token):
+    """POST withdrawal.json unchanged (a resend of the same withdrawal_id with the same body
+    is a replay at the app); its answer goes to withdrawal-submit.json, never the token."""
+    result_path = run_dir / update.WITHDRAWAL_RESULT_FILE
+    recorded = _read_optional(result_path) or {}
+    if (recorded.get("withdrawal_id") == body["withdrawal_id"]
+            and recorded.get("status_code") == 200):
+        print(f"submit: withdrawal {body['withdrawal_id']} is already recorded "
+              f"({result_path.name}); not sent again")
+        return 0
+    try:
+        result = submit.submit_withdrawal(args.base_url, agent_token, body)
+    except submit.SubmitError as exc:
+        _write_json(result_path, {"withdrawal_id": body["withdrawal_id"], "error": str(exc)})
+        print(f"error: {exc}; whether the withdrawal was recorded is unknown. Run submit "
+              "again: it resends the same withdrawal first. The report was not sent.",
+              file=sys.stderr)
+        return 1
+    _write_json(result_path, {"withdrawal_id": body["withdrawal_id"],
+                              "status_code": result.status_code, "body": result.body})
+    answer = result.body or {}
+    if result.status_code != 200:
+        codes = ", ".join(str(error.get("code")) for error in answer.get("errors") or []
+                          if isinstance(error, dict))
+        print(f"error: withdrawal: HTTP {result.status_code} {answer.get('detail')}"
+              + (f" ({codes})" if codes else "") + "; the report was not sent",
+              file=sys.stderr)
+        return 1
+    results = [row for row in answer.get("results") or [] if isinstance(row, dict)]
+    print(f"submit: withdrawal HTTP 200 {answer.get('status')}"
+          + (" (a replay: already recorded)" if answer.get("idempotent_replay") else "")
+          + ": " + (", ".join(f"{row.get('symbol')} {row.get('result')}" for row in results)
+                    or "no results listed"))
+    return 0
+
+
+def _submit_report(args, run_dir, agent_token=None):
+    report = _read_json(run_dir / "report.json")
+    if agent_token is None:
+        try:
+            agent_token = _load_token(args)
+        except token.TokenUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # Stamped just before sending: the intake refuses a report whose generated_at is more
     # than max_report_age_seconds (60 in the deployed settings) older than its clock
     # (RESEARCH_REPORT_STALE_OR_FUTURE), and build, validate and a human review take longer.
@@ -897,6 +1081,274 @@ def cmd_checklist(args):
     return 0
 
 
+# --- Research loop V2: update runs and the daily run's derivatives context --------------------
+
+# Written by an earlier update in the same folder and replaced by this one's.
+_UPDATE_OUTPUTS = (update.WITHDRAWAL_FILE, "report.json", "validate.json", update.NOTES_FILE,
+                   build.SESSION_MARKER_FILENAME, "emphasis.json")
+
+
+LESSONS_FROM_CONTEXT = "context"
+
+
+def _update_emphasis(args, run_dir, ctx, now):
+    """``(hints or None, record for update-notes.json or None)`` for ``update --lessons``
+    (package learning-loop2, plan L3): ``--lessons`` alone derives the emphasis from this run's
+    research context (written to the run folder's ``emphasis.json``, as ``lessons`` writes it);
+    ``--lessons PATH`` reads an ``emphasis.json``. Hints only reorder; raises ``LessonsError``."""
+    source = getattr(args, "lessons", None)
+    if not source:
+        return None, None
+    if source == LESSONS_FROM_CONTEXT:
+        found, missing = context.usable_lessons(ctx)
+        doc = lessons.emphasis_doc(found, context_as_of=ctx.get("as_of"),
+                                   now=now or datetime.now(UTC), unavailable=missing)
+        _write_json(run_dir / "emphasis.json", doc)
+        for line in lessons.summary_lines(found, doc["hints"], unavailable=missing)[-12:]:
+            print(f"lessons: {line}")
+        origin = "context.json"
+    else:
+        doc = _read_json(Path(source))
+        origin = source
+    hints = lessons.load_emphasis(doc)
+    brief = ((context.usable_lessons(ctx)[0] or {}).get("daily_brief") or {})
+    return hints, {"source": origin, "hints": [hint["text"] for hint in hints],
+                   "scorecard_day": doc.get("scorecard_day"),
+                   "research_focus": [item.get("text") for item in
+                                      brief.get("research_focus") or []],
+                   "use": lessons.USE}
+
+
+def _update_build(args, run_dir, ctx, raw_market, result, profile, now, emphasis=None):
+    """``(report or None, build notes, symbols in the report, {symbol: why left out})`` for
+    the update's adjusted picks (built first) and new coins."""
+    adjusted = result.of(update.ADJUSTED)
+    levels_by_coin = {**result.new_coins, **result.skipped_coins,
+                      **{decision.coin: (decision.setup, list(decision.tried))
+                         for decision in adjusted}}
+    if not any(setup is not None for setup, _tried in levels_by_coin.values()):
+        return None, None, set(), {}
+    max_picks = args.max_picks
+    max_new = getattr(args, "max_new_picks", None)
+    if max_new is not None:
+        # --max-new-picks: the adjusted picks (built first) plus at most this many new coins.
+        max_picks = min(max_picks, sum(1 for d in adjusted if d.setup is not None) + max_new)
+    built = build.build_report(
+        context=ctx, market_data=raw_market, levels_by_coin=levels_by_coin,
+        agent_id=args.agent_id, agent_version=args.agent_version, now=now,
+        max_picks=max_picks, run_id=records.run_id(run_dir), profile=profile,
+        first_coins=frozenset(decision.coin for decision in adjusted),
+        evidence=_evidence(args), emphasis=emphasis)
+    with_setup = {f"{coin}/USD" for coin, (setup, _t) in levels_by_coin.items() if setup}
+    left_out = {outcome.symbol: f"refused by the app's own models ({outcome.error})"
+                for outcome in built.rejected}
+    left_out.update({row["symbol"]: row["reason"] for row in built.skipped
+                     if row["symbol"] in with_setup})
+    notes = {"accepted": [outcome.symbol for outcome in built.accepted],
+             "rejected": [{"symbol": o.symbol, "error": o.error} for o in built.rejected],
+             "skipped": list(built.skipped), "notes": list(built.notes)}
+    if built.lessons is not None:
+        notes["lessons"] = built.lessons
+    return built.report, notes, {outcome.symbol for outcome in built.accepted}, left_out
+
+
+def cmd_update(args):
+    """An update run of RESEARCH_SCHEDULE_V2 (update.py): the research context (read now
+    with --base-url, else the run folder's), market and levels exactly as 'market' and
+    'levels' fetch and find them, the review of the agent's own WATCHING setups, then
+    withdrawal.json, report.json and update-notes.json, checked as 'validate' checks them.
+    It never sends anything: 'submit' sends the withdrawal first, then the report."""
+    run_dir = _run_dir(args)
+    now = _parse_now(args.now) or datetime.now(UTC)
+    profile = _profile(args)
+    try:
+        update.check_folder(run_dir)
+        build.check_agent(args.agent_id, args.agent_version)
+    except (update.UpdateRefused, build.BuildError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.base_url:
+        code = cmd_context(args)
+        if code != 0:
+            return code
+    else:
+        print(f"note: no --base-url: reviewing against {run_dir / 'context.json'} as it is")
+    ctx = _read_json(run_dir / "context.json")
+    try:
+        if context.is_offline(ctx):
+            raise update.UpdateRefused("REAL_RESEARCH_CONTEXT_REQUIRED: an update reviews the "
+                                       "agent's own setups, which only the app's research "
+                                       "context lists")
+        run_slot, _limit = update.answered_slot(ctx.get("schedule"), now)
+    except update.UpdateRefused as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write_json(run_dir / update.MARKER_FILE, {"command": "update", "profile": profile.name,
+                                               "run_slot": run_slot,
+                                               "started_at": now.isoformat()})
+    for name in _UPDATE_OUTPUTS:  # An earlier update's outputs in this folder, replaced now.
+        (run_dir / name).unlink(missing_ok=True)
+    print(f"update: answering the {run_slot} run (an update run) under {profile.name}")
+    for step in (cmd_market, cmd_levels):
+        code = step(args)
+        if code != 0:
+            return code
+    raw_market = _read_json(run_dir / "market.json")
+    result = update.review(ctx, raw_market, _read_json(run_dir / "levels.json"),
+                           profile=profile, now=now)
+    # Method v9: the watched setups the review keeps or adjusts are re-checked against the
+    # same evidence rules as a new pick (update.premise_review); one whose premise no longer
+    # holds is withdrawn with the reason, before the adjusted picks are built.
+    result = update.premise_review(result, ctx, raw_market, _evidence(args))
+    try:
+        emphasis, lessons_record = _update_emphasis(args, run_dir, ctx, _parse_now(args.now))
+    except lessons.LessonsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # The report is stamped when it is built, after the market read, exactly as 'build' stamps
+    # it. Stamped with the update's start (``now``), every bar fetched since would read as
+    # retrieved after the report, and the app's own models would refuse each pick
+    # FUTURE_TECHNICAL_EVIDENCE (the live dry run of 2026-09-28). ``--now`` still fixes both.
+    try:
+        report, build_notes, in_report, left_out = _update_build(
+            args, run_dir, ctx, raw_market, result, profile, _parse_now(args.now),
+            emphasis=emphasis)
+    except build.BuildError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if report is not None and (datetime.fromisoformat(report["run_slot"])
+                               != datetime.fromisoformat(run_slot)):
+        print(f"error: UPDATE_SLOT_CHANGED: the report was built for the {report['run_slot']} "
+              f"run, not the {run_slot} run this update reviewed; nothing was written. Run the "
+              "update again in a new folder.", file=sys.stderr)
+        return 2
+    files = {"withdrawal": None, "report": None}
+    withdrawn = result.of(update.WITHDRAWN)
+    over_limit = {decision.symbol for decision in withdrawn[update.MAX_WITHDRAWAL_ITEMS:]}
+    if withdrawn:
+        _write_json(run_dir / update.WITHDRAWAL_FILE, update.withdrawal_body(
+            withdrawn, agent_id=args.agent_id, agent_version=args.agent_version))
+        files["withdrawal"] = update.WITHDRAWAL_FILE
+    if report is not None:
+        _write_json(run_dir / "report.json", report)
+        files["report"] = "report.json"
+    notes = update.notes_doc(
+        result, profile=profile, run_slot=run_slot, context_as_of=ctx.get("as_of"),
+        market_retrieved_at=raw_market.get("retrieved_at"), now=now,
+        max_picks=args.max_picks, in_report=in_report, left_out=left_out,
+        build_notes=build_notes, files=files, withdrawn_left_out=over_limit)
+    notes["lessons"] = lessons_record  # update --lessons (package learning-loop2), else None.
+    _write_json(run_dir / update.NOTES_FILE, notes)
+    for note in result.notes:
+        print(f"note: {note}")
+    for decision in result.decisions:
+        print(f"  {decision.action} {decision.symbol}: {decision.reason}")
+    for symbol, reason in sorted(left_out.items()):
+        print(f"  LEFT OUT {symbol}: {reason}")
+    print(f"update: {len(notes['kept'])} kept, {len(notes['adjusted'])} adjusted, "
+          f"{len(notes['withdrawn'])} withdrawn, {len(notes['new'])} new picks; "
+          f"{len(in_report)} picks in report.json; {len(result.open_symbols)} coins with an "
+          f"open trade left alone (update-notes.json)")
+    if notes["nothing_to_send"]:
+        print("update: nothing to change: no withdrawal and no picks, so nothing to send")
+        return 0
+    code = cmd_validate(args)
+    if code == 0:
+        print("update: review " + " and ".join(name for name in files.values() if name)
+              + ", then run 'submit': it sends the withdrawal first, then the report")
+    return code
+
+
+def cmd_derivatives(args):
+    """derivatives.json: OKX open interest and Hyperliquid funding for the coins with a
+    setup in levels.json (the would-be picks), for 'build --derivatives'. Context for Jev
+    only (derivatives.py): it chooses no coin and sets no level."""
+    run_dir = _run_dir(args)
+    raw_levels = _read_json(run_dir / "levels.json")
+    coins = sorted(coin for coin, row in raw_levels.items() if row.get("setup"))
+    now = _parse_now(args.now)
+    result = derivatives.fetch_derivatives(coins, clock=(lambda: now) if now else None)
+    crowded = []
+    for coin, entry in result["coins"].items():
+        entry["measures"] = derivatives.readable(derivatives.summarize(coin, entry))
+        if entry["measures"]["crowded"]:
+            crowded.append(coin)
+    _write_json(run_dir / "derivatives.json", result)
+    with_oi = sum(entry["okx"] is not None for entry in result["coins"].values())
+    with_funding = sum(entry["hyperliquid"] is not None for entry in result["coins"].values())
+    for coin, reasons in sorted(derivatives.omitted(result).items()):
+        print(f"  {coin}: " + "; ".join(f"{name}: {why}" for name, why in reasons.items()))
+    print(f"wrote {run_dir / 'derivatives.json'}: {len(coins)} coins with a setup; OKX open "
+          f"interest for {with_oi}, Hyperliquid funding for {with_funding}; crowded long "
+          f"positioning: {', '.join(crowded) or 'none'} (pass it to 'build --derivatives')")
+    return 0
+
+
+# --- Answering the app's reviews and exit flags (MUSE_ANSWER_RULES_V1) ------------------------
+
+def cmd_answer(args):
+    """The app's pending window reviews and Jev early-exit flags (``GET /api/v1/lab/reviews``),
+    each decided under MUSE_ANSWER_RULES_V1 (``answers.py``) from Coinbase's 5-minute candles
+    and answered with one AGENT_REVIEW_ANSWER_V1 to its own route. Every item's record (the item,
+    the candles and bar used, the decision and why, the body, every response) is
+    ``<run-dir>/items/<item>.json``; every run adds its line to ``<run-dir>/polls/<UTC
+    day>.jsonl``. Safe to repeat every few minutes: an item is decided once and its body resent
+    unchanged until the app answers; nothing pending is one GET. ``--dry-run`` writes the
+    answers without sending them."""
+    if not getattr(args, "run_dir", None):
+        print("error: answer needs --run-dir: one folder kept for every run (for example "
+              "runs/answers), where each item's answer is fixed before it is sent",
+              file=sys.stderr)
+        return 2
+    try:
+        build.check_agent(args.agent_id, args.agent_version)
+        submit.checked_base_url(args.base_url)
+    except (build.BuildError, submit.BaseUrlRefused) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    run_dir = _run_dir(args)
+    fixed_now = _parse_now(args.now)
+    with answers.run_lock(run_dir) as held:
+        if not held:
+            print(f"answer: another answer run holds {run_dir / answers.LOCK_FILE}; this one "
+                  "does nothing")
+            return 0
+        try:
+            agent_token = _load_token(args)
+        except token.TokenUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        now = fixed_now or datetime.now(UTC)
+        record = {"now": now, "dry_run": args.dry_run, "agent_id": args.agent_id,
+                  "agent_version": args.agent_version}
+        try:
+            pending = answers.fetch_pending(args.base_url, agent_token)
+        except answers.AnswerError as exc:
+            answers.append_poll(run_dir, answers.poll_line(pending=None, outcomes=[],
+                                                           error=str(exc), **record), now)
+            print(f"error: {exc}; nothing was answered", file=sys.stderr)
+            return 1
+        outcomes = answers.answer_pending(
+            pending, run_dir=run_dir, agent_id=args.agent_id,
+            agent_version=args.agent_version, now=now, dry_run=args.dry_run,
+            fetch=lambda coin: answers.read_candles(coin, now=fixed_now),
+            send=lambda kind, item_id, body: submit.submit_answer(
+                args.base_url, agent_token, kind, item_id, body))
+        path = answers.append_poll(run_dir, answers.poll_line(pending=pending,
+                                                              outcomes=outcomes, **record), now)
+    if not outcomes:
+        print(f"answer: nothing pending (as of {pending.get('as_of')}); {path.name} updated")
+        return 0
+    for outcome in outcomes:
+        print(outcome.line(), file=sys.stderr if outcome.state in answers.FAILED_STATES
+              or outcome.action in (answers.UNREADABLE, answers.RECORD_UNREADABLE)
+              else sys.stdout)
+    print(f"answer: {len(outcomes)} pending item(s) under {answers.RULES_VERSION}"
+          + (" (dry run: nothing sent)" if args.dry_run else "")
+          + f"; records in {run_dir / answers.ITEMS_DIR}")
+    return answers.exit_code(outcomes)
+
+
 def cmd_all(args):
     """The deterministic steps only: context, market, levels, build, validate. Never
     submit — that stays an explicit, separate step (see the module docstring)."""
@@ -985,9 +1437,62 @@ def build_parser():
     build_parser_.add_argument("--max-picks", type=int, default=None)
     build_parser_.add_argument("--lessons", help="emphasis.json from 'lessons': rank picks by "
                                "its ordering hints (never drops a coin).")
+    build_parser_.add_argument("--derivatives", help="derivatives.json from 'derivatives': add "
+                               "each pick's OKX open interest and Hyperliquid funding as cited "
+                               "sources (context only: the same picks, order and levels).")
+    _add_evidence(build_parser_)
     _add_session(build_parser_)
     _add_profile(build_parser_)
     build_parser_.set_defaults(func=cmd_build)
+
+    derivatives_parser = sub.add_parser(
+        "derivatives", help="derivatives.json: OKX open interest (4 and 24 hours) and the latest "
+        "Hyperliquid funding for the coins with a setup in levels.json, for 'build "
+        "--derivatives'. Public data reads only; context for Jev, never a selection input.")
+    _add_now(derivatives_parser)
+    derivatives_parser.set_defaults(func=cmd_derivatives)
+
+    update_parser = sub.add_parser(
+        "update", help="An update run of RESEARCH_SCHEDULE_V2 (every run but the daily one): "
+        "review the agent's own WATCHING setups, then write withdrawal.json, report.json "
+        "(adjusted and new picks) and update-notes.json, and validate them. Refuses a V1 "
+        "schedule and the daily full run's slot. Never submits.")
+    _add_now(update_parser)
+    update_parser.add_argument("--base-url", help="The app's base URL: read the research "
+                               "context now (without it, the run folder's context.json).")
+    _add_token_file(update_parser)
+    update_parser.add_argument("--agent-id", required=True)
+    update_parser.add_argument("--agent-version", required=True)
+    update_parser.add_argument("--max-picks", type=int, default=update.DEFAULT_MAX_PICKS,
+                               help="Adjusted and new picks together, adjusted first "
+                               f"(default {update.DEFAULT_MAX_PICKS}).")
+    update_parser.add_argument("--max-new-picks", type=_nonnegative_int, default=None,
+                               help="At most this many new coins in the report, after the "
+                               "adjusted picks (within --max-picks).")
+    update_parser.add_argument(
+        "--lessons", nargs="?", const=LESSONS_FROM_CONTEXT, default=None,
+        help="Apply the lessons' ordering hints to the new picks (adjusted picks stay first; "
+        "never drops a coin): alone, derived from this run's research context and written to "
+        "emphasis.json; with a path, that emphasis.json.")
+    _add_evidence(update_parser)
+    _add_profile(update_parser)
+    update_parser.set_defaults(func=cmd_update, offline=False)
+
+    answer_parser = sub.add_parser(
+        "answer", help="Answer the app's pending window reviews and Jev early-exit flags under "
+        f"{answers.RULES_VERSION} (GET /api/v1/lab/reviews; one AGENT_REVIEW_ANSWER_V1 per "
+        "item, decided from Coinbase's last completed 5-minute bar). Safe to run every 2-5 "
+        "minutes with the same --run-dir: nothing pending is one GET, and an item's answer is "
+        "fixed before it is sent.")
+    _add_now(answer_parser)
+    answer_parser.add_argument("--base-url", required=True, help="The app's base URL.")
+    _add_token_file(answer_parser)
+    answer_parser.add_argument("--agent-id", required=True)
+    answer_parser.add_argument("--agent-version", required=True)
+    answer_parser.add_argument("--dry-run", action="store_true", help="Decide and write each "
+                               "answer in the run folder without sending it (the pending items "
+                               "are still read from the app).")
+    answer_parser.set_defaults(func=cmd_answer)
 
     lessons_parser = sub.add_parser("lessons", help="Print the context's lessons plainly and "
                                     "write emphasis.json (ordering hints for 'build').")
@@ -1051,9 +1556,10 @@ def build_parser():
     _add_now(validate_parser)
     validate_parser.set_defaults(func=cmd_validate)
 
-    submit_parser = sub.add_parser("submit", help="POST report.json to the app. The only "
-                                   "network write in this package; refuses a --session "
-                                   "report (see 'build --session' help).")
+    submit_parser = sub.add_parser("submit", help="POST report.json to the app; after an "
+                                   "'update', withdrawal.json first (any answer but 200 stops "
+                                   "before the report). Refuses a --session report (see "
+                                   "'build --session' help).")
     submit_parser.add_argument("--base-url", required=True)
     _add_token_file(submit_parser)
     submit_parser.set_defaults(func=cmd_submit)
@@ -1095,6 +1601,7 @@ def build_parser():
     all_parser.add_argument("--agent-id", required=True)
     all_parser.add_argument("--agent-version", required=True)
     all_parser.add_argument("--max-picks", type=int, default=None)
+    _add_evidence(all_parser)
     _add_session(all_parser)
     _add_profile(all_parser)
     all_parser.set_defaults(func=cmd_all)

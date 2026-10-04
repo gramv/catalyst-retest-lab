@@ -1,0 +1,660 @@
+{
+ "note": "Live Alpaca paper CFEE activities (GET /v2/account/activities?activity_types=CFEE,FEE) read 2026-09-29 ~13:30 UTC, ids replaced by synthetic ones in the same format; and the ledger's 31 managed fills (fill ids synthetic; broker_order_id_group = first 8 chars of the real order id, same value = same order).",
+ "cfee_activities": [
+  {
+   "id": "20260928000000000::7b93c848-46de-4268-9ad1-95aeca410664",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T15:16:58.578641Z",
+   "net_amount": "-2.21",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260928000000000::a25dbeea-73ba-4ca3-9096-570adc59f3e1",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T19:17:03.98294Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "GRTUSD",
+   "cusip": "GRT123456",
+   "qty": "-12.743895",
+   "price": "0.0304"
+  },
+  {
+   "id": "20260928000000000::93a6a1fb-3c90-4bc3-8480-a0a09a37851f",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T14:29:34.569345Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "UNIUSD",
+   "cusip": "UNI123456",
+   "qty": "-0.282405188",
+   "price": "8.78"
+  },
+  {
+   "id": "20260928000000000::0290e956-9c5a-43e2-886c-62462c3c5a2d",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T17:09:06.987171Z",
+   "net_amount": "-1.64",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260928000000000::5b0db14f-9b0e-41a2-89cb-416a51029cb2",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T17:09:06.987171Z",
+   "net_amount": "-0.86",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260928000000000::fd9e2d85-e6d7-47f4-a04d-9e7e5c91e157",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T19:17:00.998988Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "GRTUSD",
+   "cusip": "GRT123456",
+   "qty": "-21.4465525",
+   "price": "0.0303"
+  },
+  {
+   "id": "20260928000000000::f8ff09f3-9b1e-4e3f-8a84-4dc0d87767b8",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T14:29:37.595784Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "LTCUSD",
+   "cusip": "LTC123456",
+   "qty": "-0.032006909",
+   "price": "68.86"
+  },
+  {
+   "id": "20260928000000000::5d7acde9-39ed-4274-acf9-00ad098f19bd",
+   "activity_type": "CFEE",
+   "date": "2026-09-28",
+   "created_at": "2026-09-28T19:17:03.98294Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "GRTUSD",
+   "cusip": "GRT123456",
+   "qty": "-0.695352298",
+   "price": "0.0304"
+  },
+  {
+   "id": "20260929000000000::2662e990-6ced-4a39-b121-43b02aacda5f",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T06:37:40.755549Z",
+   "net_amount": "-2.54",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::26ae1fa3-03c7-431b-8ab0-870a4e00c49e",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:32:26.726458Z",
+   "net_amount": "-2.28",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::e95f59ab-6bb9-47a5-a6a8-549aed1b8c26",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:37:14.827092Z",
+   "net_amount": "-0.42",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::c46800de-2bfc-478b-9325-1cca83bfe7eb",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:42.446486Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "UNIUSD",
+   "cusip": "UNI123456",
+   "qty": "-0.287780913",
+   "price": "8.6"
+  },
+  {
+   "id": "20260929000000000::1ff99823-dc1b-49a8-b343-c796ceb668f0",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:09.724053Z",
+   "net_amount": "-0.66",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::38cd766e-ee6b-4c16-9c44-b6a2c4961c23",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:52.209728Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "YFIUSD",
+   "cusip": "YFI123456",
+   "qty": "-0.000201657",
+   "price": "2328.34"
+  },
+  {
+   "id": "20260929000000000::360ad069-f523-4e24-a45b-00b5221a40ae",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:52.209728Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "YFIUSD",
+   "cusip": "YFI123456",
+   "qty": "-0.00020145",
+   "price": "2328.34"
+  },
+  {
+   "id": "20260929000000000::6f7b9767-9d5c-44d9-bde0-eedccb1ef659",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:37:14.827092Z",
+   "net_amount": "-0.7",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::feaf5d1e-205c-4622-bf92-b831c2947046",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:52.209728Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "YFIUSD",
+   "cusip": "YFI123456",
+   "qty": "-0.000035007",
+   "price": "2328.34"
+  },
+  {
+   "id": "20260929000000000::02364304-18a0-4ca9-a31d-a783820aa4be",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:32:26.726458Z",
+   "net_amount": "-0.21",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::f59a0f24-cc7d-4265-88ff-d413122f1744",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T02:51:37.528147Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "FILUSD",
+   "cusip": "FIL123456",
+   "qty": "-2.434493323",
+   "price": "1.01"
+  },
+  {
+   "id": "20260929000000000::465f1d04-4a9c-4113-9797-1cce4aeb84a6",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:55.472948Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "DOTUSD",
+   "cusip": "DOT123456",
+   "qty": "-1.971",
+   "price": "1.15"
+  },
+  {
+   "id": "20260929000000000::f1df6cbd-c183-4a57-9b94-cc5d29c139bd",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:09.724053Z",
+   "net_amount": "-0.68",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::e0378141-7f97-4417-b213-00e0a0a25ac5",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:37:14.827092Z",
+   "net_amount": "-1.38",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::d0d35215-b3b7-4248-bbd8-9ed93cc986c9",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:52.209728Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "YFIUSD",
+   "cusip": "YFI123456",
+   "qty": "-0.0003345",
+   "price": "2323.68"
+  },
+  {
+   "id": "20260929000000000::e5830bd4-156c-4125-b4c1-cba38dddf26b",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:22:29.179834Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "SUSHIUSD",
+   "cusip": "SUSHI123456",
+   "qty": "-1.040850685",
+   "price": "0.2467"
+  },
+  {
+   "id": "20260929000000000::3fbf334e-32d3-442f-b4b8-55167054047a",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:22:29.179834Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "SUSHIUSD",
+   "cusip": "SUSHI123456",
+   "qty": "-5.552725",
+   "price": "0.2466"
+  },
+  {
+   "id": "20260929000000000::5a95f14b-6074-404b-bbf1-5ca721784e8d",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:36:47.821069Z",
+   "net_amount": "-1.55",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::11d34c9c-3de9-4434-83c7-7061a809507d",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:36:47.821069Z",
+   "net_amount": "-0.15",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::99079d48-b4db-48ad-a032-be37e24c5d0f",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T02:51:37.438775Z",
+   "net_amount": "-2.43",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::b24a6aa5-3df8-495a-b56b-11b8158cd034",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:22:29.179834Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "SUSHIUSD",
+   "cusip": "SUSHI123456",
+   "qty": "-2.77909",
+   "price": "0.2462"
+  },
+  {
+   "id": "20260929000000000::4da2c6f3-b3f2-452d-b4ff-31ff3edbbce0",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T05:36:47.821069Z",
+   "net_amount": "-0.78",
+   "description": "Coin Pair Transaction Fee (USD)",
+   "status": "executed",
+   "currency": "USD"
+  },
+  {
+   "id": "20260929000000000::d0af69ec-a244-4eff-81c2-d0e5684810d9",
+   "activity_type": "CFEE",
+   "date": "2026-09-29",
+   "created_at": "2026-09-29T04:21:55.472948Z",
+   "net_amount": "0",
+   "description": "Coin Pair Transaction Fee (Non USD)",
+   "status": "executed",
+   "currency": "USD",
+   "symbol": "DOTUSD",
+   "cusip": "DOT123456",
+   "qty": "-0.109915615",
+   "price": "1.15"
+  }
+ ],
+ "ledger_fills": [
+  {
+   "fill_id": "9fbb8a66-9ed4-4371-9154-b74a110021e6",
+   "broker_order_id_group": "5d90bf9b",
+   "side": "buy",
+   "symbol": "UNI/USD",
+   "qty": "112.962074947",
+   "price": "8.78556",
+   "filled_at": "2026-09-28T14:29:31.164010+00:00"
+  },
+  {
+   "fill_id": "b59eccfd-2660-4d48-a701-eb02698071bf",
+   "broker_order_id_group": "fc5776f0",
+   "side": "buy",
+   "symbol": "LTC/USD",
+   "qty": "12.802763388",
+   "price": "68.865",
+   "filled_at": "2026-09-28T14:29:34.323568+00:00"
+  },
+  {
+   "fill_id": "a7b09fe3-aaef-41c3-8a04-8be56b094cf0",
+   "broker_order_id_group": "b557310c",
+   "side": "sell",
+   "symbol": "LTC/USD",
+   "qty": "12.770756479",
+   "price": "68.941",
+   "filled_at": "2026-09-28T15:16:57.242969+00:00"
+  },
+  {
+   "fill_id": "3b65e688-1f0d-4fee-b68f-424e35bee5de",
+   "broker_order_id_group": "9a06da1c",
+   "side": "sell",
+   "symbol": "UNI/USD",
+   "qty": "74.076634929",
+   "price": "8.8245",
+   "filled_at": "2026-09-28T17:09:03.926193+00:00"
+  },
+  {
+   "fill_id": "408741bd-a15e-4e2d-953c-6896c6049904",
+   "broker_order_id_group": "9a06da1c",
+   "side": "sell",
+   "symbol": "UNI/USD",
+   "qty": "38.60303483",
+   "price": "8.812",
+   "filled_at": "2026-09-28T17:09:03.926206+00:00"
+  },
+  {
+   "fill_id": "c07d2d55-a218-49d0-8097-53bd898f405f",
+   "broker_order_id_group": "ae483458",
+   "side": "buy",
+   "symbol": "GRT/USD",
+   "qty": "8578.621",
+   "price": "0.03038",
+   "filled_at": "2026-09-28T19:16:59.957141+00:00"
+  },
+  {
+   "fill_id": "8b055284-6384-448d-996d-d7817fd8515d",
+   "broker_order_id_group": "ae483458",
+   "side": "buy",
+   "symbol": "GRT/USD",
+   "qty": "8495.93",
+   "price": "0.030442596",
+   "filled_at": "2026-09-28T19:17:00.567015+00:00"
+  },
+  {
+   "fill_id": "3c1e2a39-309e-4aac-9dc9-a591b7c37c40",
+   "broker_order_id_group": "ae483458",
+   "side": "buy",
+   "symbol": "GRT/USD",
+   "qty": "463.56819833",
+   "price": "0.030442596",
+   "filled_at": "2026-09-28T19:17:01.018180+00:00"
+  },
+  {
+   "fill_id": "34858586-3db8-47a1-a625-c4132d115b6f",
+   "broker_order_id_group": "f190ad5c",
+   "side": "sell",
+   "symbol": "GRT/USD",
+   "qty": "8601.6",
+   "price": "0.0305733",
+   "filled_at": "2026-09-29T00:51:53.902274+00:00"
+  },
+  {
+   "fill_id": "a2b01404-8bbc-448a-a446-b320643ff149",
+   "broker_order_id_group": "f190ad5c",
+   "side": "sell",
+   "symbol": "GRT/USD",
+   "qty": "8901.633398532",
+   "price": "0.03054",
+   "filled_at": "2026-09-29T00:51:53.902289+00:00"
+  },
+  {
+   "fill_id": "4b3b3648-8368-4233-82ff-a77ad78090dd",
+   "broker_order_id_group": "d7357e8a",
+   "side": "buy",
+   "symbol": "UNI/USD",
+   "qty": "115.112365149",
+   "price": "8.604",
+   "filled_at": "2026-09-29T01:20:08.742852+00:00"
+  },
+  {
+   "fill_id": "e6dbe827-3f3f-4152-aea3-148b92ae776c",
+   "broker_order_id_group": "5edb3198",
+   "side": "buy",
+   "symbol": "YFI/USD",
+   "qty": "0.1338",
+   "price": "2323.68",
+   "filled_at": "2026-09-29T01:30:13.422397+00:00"
+  },
+  {
+   "fill_id": "cd09efe6-3034-47a2-9c8c-943bfeac21dd",
+   "broker_order_id_group": "5edb3198",
+   "side": "buy",
+   "symbol": "YFI/USD",
+   "qty": "0.134438",
+   "price": "2328.34729",
+   "filled_at": "2026-09-29T01:30:14.749275+00:00"
+  },
+  {
+   "fill_id": "39a0494f-6237-4c12-b321-acc899d6cbd3",
+   "broker_order_id_group": "5edb3198",
+   "side": "buy",
+   "symbol": "YFI/USD",
+   "qty": "0.1343",
+   "price": "2328.34729",
+   "filled_at": "2026-09-29T01:30:15.796299+00:00"
+  },
+  {
+   "fill_id": "4e6042d5-afaf-411c-a2b9-849dde67516e",
+   "broker_order_id_group": "5edb3198",
+   "side": "buy",
+   "symbol": "YFI/USD",
+   "qty": "0.023337901",
+   "price": "2328.34729",
+   "filled_at": "2026-09-29T01:30:16.419818+00:00"
+  },
+  {
+   "fill_id": "28629a88-12c5-4454-8da3-21125f9dbf90",
+   "broker_order_id_group": "10deaa82",
+   "side": "buy",
+   "symbol": "DOT/USD",
+   "qty": "788.4",
+   "price": "1.1504",
+   "filled_at": "2026-09-29T01:32:15.467143+00:00"
+  },
+  {
+   "fill_id": "ade2eb74-b366-409a-821e-31af74a63b73",
+   "broker_order_id_group": "10deaa82",
+   "side": "buy",
+   "symbol": "DOT/USD",
+   "qty": "73.277076045",
+   "price": "1.1527265",
+   "filled_at": "2026-09-29T01:32:15.726735+00:00"
+  },
+  {
+   "fill_id": "2def856b-e576-4678-b76a-006cad9b221e",
+   "broker_order_id_group": "77a8c271",
+   "side": "buy",
+   "symbol": "SUSHI/USD",
+   "qty": "1111.636",
+   "price": "0.246265",
+   "filled_at": "2026-09-29T02:09:08.115476+00:00"
+  },
+  {
+   "fill_id": "ee34bad6-b7f7-42c5-a52b-fd91feedd288",
+   "broker_order_id_group": "77a8c271",
+   "side": "buy",
+   "symbol": "SUSHI/USD",
+   "qty": "2221.09",
+   "price": "0.246699",
+   "filled_at": "2026-09-29T02:09:08.115488+00:00"
+  },
+  {
+   "fill_id": "25cb31f5-5481-40e5-a730-04a4f59d6f48",
+   "broker_order_id_group": "77a8c271",
+   "side": "buy",
+   "symbol": "SUSHI/USD",
+   "qty": "693.900456419",
+   "price": "0.2467696",
+   "filled_at": "2026-09-29T02:09:08.332665+00:00"
+  },
+  {
+   "fill_id": "c1c4ec17-ecde-4a2e-aa34-e596f7ebd4ef",
+   "broker_order_id_group": "e4fc30c1",
+   "side": "sell",
+   "symbol": "UNI/USD",
+   "qty": "114.824584236",
+   "price": "8.4403",
+   "filled_at": "2026-09-29T02:31:28.398681+00:00"
+  },
+  {
+   "fill_id": "bbcde682-234e-475d-b965-c33098cc3f73",
+   "broker_order_id_group": "c1aecc8a",
+   "side": "buy",
+   "symbol": "FIL/USD",
+   "qty": "973.797329162",
+   "price": "1.0137",
+   "filled_at": "2026-09-29T02:37:31.089212+00:00"
+  },
+  {
+   "fill_id": "b2958230-f89e-4a3b-a34b-55314e28d12f",
+   "broker_order_id_group": "6e0fbe9c",
+   "side": "sell",
+   "symbol": "DOT/USD",
+   "qty": "788.678",
+   "price": "1.15304",
+   "filled_at": "2026-09-29T05:32:24.403337+00:00"
+  },
+  {
+   "fill_id": "dcfb5e2b-7b1e-47a9-b8c4-e6d8b72ec93f",
+   "broker_order_id_group": "6e0fbe9c",
+   "side": "sell",
+   "symbol": "DOT/USD",
+   "qty": "70.91816043",
+   "price": "1.1505",
+   "filled_at": "2026-09-29T05:32:24.403351+00:00"
+  },
+  {
+   "fill_id": "d2ca69ad-8256-4cfa-b89e-460e1b79f885",
+   "broker_order_id_group": "8bb18c54",
+   "side": "sell",
+   "symbol": "YFI/USD",
+   "qty": "0.13375",
+   "price": "2331.3",
+   "filled_at": "2026-09-29T05:36:45.634129+00:00"
+  },
+  {
+   "fill_id": "7c10f858-d9c3-4acb-a8da-d97083f3ff0f",
+   "broker_order_id_group": "8bb18c54",
+   "side": "sell",
+   "symbol": "YFI/USD",
+   "qty": "0.26654",
+   "price": "2324.2",
+   "filled_at": "2026-09-29T05:36:45.634141+00:00"
+  },
+  {
+   "fill_id": "b5cf8a18-7f5f-44b1-bb01-d90eac613b7c",
+   "broker_order_id_group": "8bb18c54",
+   "side": "sell",
+   "symbol": "YFI/USD",
+   "qty": "0.024813287",
+   "price": "2319.2",
+   "filled_at": "2026-09-29T05:36:45.634146+00:00"
+  },
+  {
+   "fill_id": "2b295b8f-a2a0-4913-bafa-d429346d6f27",
+   "broker_order_id_group": "ca198d3a",
+   "side": "sell",
+   "symbol": "SUSHI/USD",
+   "qty": "1122.3",
+   "price": "0.2477",
+   "filled_at": "2026-09-29T05:37:12.660653+00:00"
+  },
+  {
+   "fill_id": "a0b11fe7-df83-4130-831a-0216f21fc107",
+   "broker_order_id_group": "ca198d3a",
+   "side": "sell",
+   "symbol": "SUSHI/USD",
+   "qty": "2218.947",
+   "price": "0.24731",
+   "filled_at": "2026-09-29T05:37:12.660670+00:00"
+  },
+  {
+   "fill_id": "e672e0f6-fbb8-407a-aceb-7c14d51c098c",
+   "broker_order_id_group": "ca198d3a",
+   "side": "sell",
+   "symbol": "SUSHI/USD",
+   "qty": "676.006790734",
+   "price": "0.24647",
+   "filled_at": "2026-09-29T05:37:12.660674+00:00"
+  },
+  {
+   "fill_id": "24ee36d2-51ba-4de7-86d4-bc71b2c47222",
+   "broker_order_id_group": "9a8af1c0",
+   "side": "sell",
+   "symbol": "FIL/USD",
+   "qty": "971.362835839",
+   "price": "1.044",
+   "filled_at": "2026-09-29T06:37:38.204321+00:00"
+  }
+ ]
+}

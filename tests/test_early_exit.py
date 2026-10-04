@@ -38,11 +38,14 @@ from tests.day_review_fixtures import (
     state,
 )
 from tests.maintenance_fixtures import mt as mt
+from tests.maintenance_fixtures import pre_jev_b1_admission as pre_jev_b1_admission
 from tests.maintenance_fixtures import quote
 from tests.test_execution import er as er
 from tests.test_execution import pristine_cluster as pristine_cluster
 
-pytestmark = pytest.mark.usefixtures("managed_arm")
+# Jev's side of the early exit here is CRYPTO_MAINTENANCE_V4's FLAG_EARLY_EXIT action:
+# admission as before package jev-b1 (V5's flags: tests/test_jev_b1_flows.py).
+pytestmark = pytest.mark.usefixtures("managed_arm", "pre_jev_b1_admission")
 _ = managed_arm
 
 

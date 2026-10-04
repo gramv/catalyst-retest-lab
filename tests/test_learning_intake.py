@@ -11,7 +11,14 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from catalyst_lab import learning_replays, market_reality, scorecard, weekly_review
+from catalyst_lab import (
+    daily_brief,
+    learning_replays,
+    market_reality,
+    scorecard,
+    trade_paths,
+    weekly_review,
+)
 from catalyst_lab.learning_intake import (
     LEARNING_EVENT_KINDS,
     OUTLOOK_EVENT,
@@ -414,7 +421,8 @@ def test_the_event_feed_never_carries_learning_records_to_a_research_agent(learn
     assert LEARNING_EVENT_KINDS == {
         OUTLOOK_EVENT, POST_MORTEM_EVENT, market_reality.REALITY_EVENT,
         scorecard.SCORECARD_EVENT, weekly_review.REVIEW_EVENT, learning_replays.REPLAY_EVENT,
-        learning_replays.DAY_REPLAY_EVENT}
+        learning_replays.DAY_REPLAY_EVENT, daily_brief.BRIEF_EVENT, daily_brief.MISSED_EVENT,
+        trade_paths.PATH_EVENT, trade_paths.CONTEXT_EVENT}
     store = learning.store
     with store.transaction() as conn:
         first = store.event(conn, "FIXTURE_FEED_EVENT", {"n": 1})

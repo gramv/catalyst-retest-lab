@@ -17,12 +17,18 @@ The day has two halves:
 Between them, when the app's schedule runs research every 2 hours, a short **intraday run**
 answers each of the other slots (00:00, 02:00, … 22:00 New York, all but 08:00) with a
 chart-first report built under the `INTRADAY_V2` profile. See "Intraday run (every 2 hours)"
-below.
+below. When the schedule is `RESEARCH_SCHEDULE_V2` (a `daily` run named), those slots are
+**update runs** instead, not full batches: they look after the day's picks and add coins that
+now qualify. See "Update run (every 2 hours, RESEARCH_SCHEDULE_V2)" below.
 
 Everything is deterministic and mechanical except the research itself (morning step 7,
 evening step 4), which only a research session can do: Claude reading and judging real
 pages. Follow the steps in order. Each writes into one run folder, so a whole run can be
 inspected afterward.
+
+Apart from the sessions, the operator's watch loop answers the app's window reviews and Jev's
+early-exit flags every few minutes with `answer` (`MUSE_ANSWER_RULES_V2`). A session never
+answers one by hand. See "Answering reviews and exit flags" below.
 
 ## Two ways to run the day
 
@@ -49,8 +55,7 @@ already holds last night's evidence.
 ## Before you start
 
 - **The app's base URL** (`--base-url`):
-  - the Railway trader's `https://` address when the app runs in the cloud (see
-    docs/RAILWAY-DEPLOYMENT.md);
+  - the Railway trader's `https://` address when the app runs in the cloud;
   - or `http://127.0.0.1:<port>` for an app on this Mac.
 
   The kit refuses plain `http://` to any other host.
@@ -118,8 +123,21 @@ This prints your own scorecard lines plainly, for 1, 7 and 30 days:
 - the post-mortems you still owe.
 
 It writes `emphasis.json`: **ordering hints only**, such as "rank setups closer than 2%
-first". A hint needs at least 5 resolved picks in two buckets and a spread of at least 0.20
-between the best and the worst.
+first". Since package learning-loop2 (2026-10-03) a hint ranks by **net R per resolved pick**
+(the shadow net R after the assumed fee over a bucket's resolved picks, a pick price never
+reached counting 0 R), with how often price reached the entry printed beside it; it no longer
+ranks by the trigger rate alone, which favoured easy fills over profitable ones. A hint needs at
+least 5 resolved picks in two buckets and a spread of at least 0.10R a pick between the best
+and the worst.
+
+The lessons also print the app's latest **daily brief** (`DAILY_BRIEF_V1`, recorded by the
+nightly jobs): the market in words, the movers with the facts known before each move and what
+a mechanical strategy's simulated entry on them earned, the sector clusters, and **today's
+research focus**. The focus is attention only: look at those sectors, catalysts and setups
+early, but cover the whole universe as always; it never filters, caps or ranks a pick. The
+**post-mortem queue** lists every mover of the last 7 recorded days, and your notable trades,
+still waiting for your cited research; everything that needs no judgment (movers, outlook
+grades, regime, pre-move facts, after-exit paths) the cloud jobs already did.
 
 If the app could not read your lessons this run (`lessons.available: false`, code
 `LESSONS_UNAVAILABLE`; the rest of the context is still served), `lessons` says so and writes
@@ -367,12 +385,38 @@ Sending again is safe:
 - **`--new-id`** is only for a deliberately changed outlook. The app records it as a second
   outlook and grades it separately.
 
-### 9. Build the report
+### 9. Read the derivatives context, then build the report
 
 ```sh
+./run python -m research_agent.run derivatives --run-dir "$RUN_DIR"
 ./run python -m research_agent.run build --run-dir "$RUN_DIR" --news "$RUN_DIR/news.json" \
-  --lessons "$RUN_DIR/emphasis.json" --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION"
+  --lessons "$RUN_DIR/emphasis.json" --derivatives "$RUN_DIR/derivatives.json" \
+  --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION"
 ```
+
+`derivatives` writes `derivatives.json` for every coin with a setup in `levels.json`. It reads
+two free public sources, with no key (`docs/RESEARCH-LOOP-V2.md` 3.6):
+
+- OKX's open-interest history for the coin's USDT perpetual swap (`<COIN>-USDT-SWAP`,
+  15-minute rows), when OKX's own instrument list shows that swap live;
+- Hyperliquid's funding history for the coin's perpetual (the coin itself, or its
+  thousand-unit contract such as `kPEPE` when Hyperliquid lists it that way).
+
+`build --derivatives` adds to each pick the open-interest change in the coin's own units over
+4 and 24 hours and the latest hourly funding. They go in as two cited sources, with the
+figures exactly as fetched, and `published_at` is the data's own time:
+
+- **crowded long positioning** (the latest funding at or above 0.01% per hour while open
+  interest rose over 24 hours) becomes a `RISK` claim citing both sources;
+- anything else becomes one sentence of the thesis (or of `why_now` when the thesis is full).
+
+This is context for Jev only. The same coins are picked in the same order at the same levels
+with or without it. A coin without an OKX swap or a Hyperliquid perpetual gets none of it,
+never a guess. The review dossier's 11,000-byte budget leaves the daily picks about 1,000
+bytes. When both sources do not fit, `build` keeps one (open interest first) or none, and
+never drops the pick. Crowded positioning is only ever the claim with both figures.
+`build-notes.json` records what was attached, what was left out, and why. Run `derivatives`
+right before `build`, so the figures are fresh; without `--derivatives` the build is as before.
 
 (Omit `--news` for a CHART-only run.) `build`:
 
@@ -640,8 +684,11 @@ Append a short note in the evening folder:
 
 **Paper trading only.** When the app's schedule takes research every 2 hours (00:00, 02:00,
 … 22:00 New York), one short run answers each slot except 08:00, which stays the full daily
-run above (Morning, or the 07:15 session). The aim is many trades to harden the engine
-(`docs/FAST-CYCLE-PLAN.md`), so the run is chart-first and quick:
+run above (Morning, or the 07:15 session). This section is for a `RESEARCH_SCHEDULE_V1`
+schedule. Under `RESEARCH_SCHEDULE_V2` (`schedule.version` in `context.json`, or a `daily`
+key), those slots are update runs: follow "Update run (every 2 hours, RESEARCH_SCHEDULE_V2)"
+below instead. The aim is many trades to harden the engine, so
+the run is chart-first and quick:
 
 - **no** lessons, checklist, outlook, evening review or post-mortems (they stay in the 08:00
   run and the evening review);
@@ -727,11 +774,13 @@ Never loosen a rule to make picks.
 
 ```sh
 ./run python -m research_agent.run build --profile intraday --max-picks 10 \
-  --run-dir "$RUN_DIR" --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION"
+  --run-dir "$RUN_DIR" --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION" \
+  --exclude POL,LDO,WIF --max-entry-distance-pct 2.5
 ```
 
 CHART-only picks are normal here. `build` keeps at most 10 picks, rule A first, then the
-highest reward:risk. It refuses a `--profile` other than the one `levels.json` records
+highest reward:risk, after the operator's evidence filter (the last line; see the UPDATE
+section's "Run the update" for what the two options do). It refuses a `--profile` other than the one `levels.json` records
 (`LEVELS_PROFILE_MISMATCH`), and `build-notes.json` records `"profile": "INTRADAY_V2"`, so
 every pick says which profile produced it. Check `report.json`'s `run_slot`: it must be the
 slot this run answers. When no pick survives, `build` writes no report: write the run notes
@@ -784,6 +833,278 @@ Without the news check, steps 1-4 and 6 are also one command (it never submits):
   --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION"
 ```
 
+## Update run (every 2 hours, RESEARCH_SCHEDULE_V2)
+
+**Paper trading only.** Under `RESEARCH_SCHEDULE_V2` the schedule names a daily run (`"daily":
+"08:00"`), and that run is the full daily run above (Morning). Every other 2-hourly run is an
+**update run**, not a full batch (`docs/RESEARCH-LOOP-V2.md` 3.5). A report answering any
+run stays valid until the next daily run plus the grace, so the day's picks have hours to
+fill. The update looks after them:
+
+- it reviews the agent's own setups still WATCHING (the context's `watching_setups`);
+- it withdraws a setup whose levels the market no longer shows;
+- it sends an adjusted pick where the plan has changed; Jev reviews it, and the app replaces
+  the old setup only if Jev selects it (`RESEARCH_RUN_SUPERSESSION_V2`);
+- it sends coins that now qualify as new picks.
+
+Open trades are never touched: Jev's maintenance and the trade's own window look after them.
+There is no checklist, outlook, news research or post-mortem in an update run. Since package
+learning-loop2 (2026-10-03) an update run **reads the lessons** with `--lessons` (below): the
+same ordering hints as the morning's `build --lessons`, from the context the update reads now.
+Under `RESEARCH_SCHEDULE_V1` there are no update runs: `update` refuses, and a 2-hourly slot
+is an intraday run (above).
+
+**Before you start.** Everything in "Before you start" above applies (the base URL, the
+token file you never read, `./run` from the repository root), plus:
+
+- **Its own run folder**: `runs/<YYYY-MM-DD>/update-<HHMM>`, the New York date and slot it
+  answers (for example `runs/2026-09-29/update-1000`), passed as `--run-dir`. `update`
+  refuses a folder holding another run's files (`UPDATE_RUN_DIR_IN_USE`) before it reads or
+  writes anything, so the daily run's `runs/<YYYY-MM-DD>` is never overwritten. A folder an
+  earlier update wrote (`update-run.json`) can be updated again.
+- **The agent identity** the update prompt gives (`DAILY_PROMPT.md`).
+- **When to start.** The report answers the slot `build.run_slot_for` gives: the latest run at
+  or before now, or the next one within the grace (60 minutes) before it. Started at :07 of
+  an odd hour (09:07), it answers the next even hour (10:00). Started within the hour before
+  08:00, or during the 08:00 hour, it would answer the daily run, and `update` refuses.
+
+### 1. Run the update
+
+```sh
+./run python -m research_agent.run update --profile intraday --run-dir "$RUN_DIR" \
+  --base-url "$BASE_URL" --token-file "$TOKEN_FILE" \
+  --agent-id "$AGENT_ID" --agent-version "$AGENT_VERSION" --lessons \
+  --exclude POL,LDO,WIF --max-entry-distance-pct 2.5
+```
+
+Add `--lessons` to every update run (package learning-loop2, plan L3; before it, about 10 of
+11 runs a day ignored the lessons). Alone, it derives `emphasis.json` from the research context
+this update just read (the same rule as the morning's `lessons` step), prints the hints and the
+daily brief's research focus, and orders the **new** coins by the hints; the adjusted picks stay
+first and no coin is ever dropped because of a hint. `--lessons PATH` uses an `emphasis.json`
+written earlier instead. `update-notes.json` records what was applied under `lessons` (the
+hints, the focus and the source), and `build.lessons` the order before and after. Without lessons
+in the context (`lessons: null`, or `available: false`) the update builds exactly as without
+the option.
+
+The last line is the operator's evidence filter (owner direction 2026-10-02: no new pick
+without solid evidence; `build` and `all` take the same options). `--exclude` names coins never
+offered as new picks (POL, LDO and WIF never filled on Alpaca paper); `--max-entry-distance-pct`
+leaves out a new pick whose maximum entry sits further under the live Alpaca mid than that
+percent (picks 3%+ away triggered 7% of the time, picks within 2% 57%). Neither touches an
+adjusted pick, which is a setup the agent already holds. Every coin left out is recorded with
+its reason in the report's `skipped` rows and the notes' `left_out`.
+
+Method v8 adds three more (`research_agent/evidence.py`; the same options on `build` and
+`all`), each for new picks only, plus a cap:
+- `--min-alpaca-volume-usd 5000`: the coin's Alpaca 24-hour USD volume (the context's
+  `volume_24h.usd`) must reach it unless the agent filled a trade of the coin in the context's
+  7-day window. The paper venue fills a marketable order only when Alpaca's own venue prints;
+  on 2026-10-02 only BTC, XRP, SOL, ETH, UNI, LINK, LTC, DOGE and AVAX were above $9,000 a day,
+  and POL ($0), LDO ($71) and WIF ($757) never filled.
+- `--trend-floor-pct 0`: the live mid at or above the average of the last 20 completed daily
+  closes (a pullback below it is a pullback in a downtrend); `-2` allows 2% under it. A coin
+  without 20 daily bars is left out under a floor.
+- `--selloff-pct 2`: while the median coin (every coin but BTC) or BTC is down 2% or more over
+  two hours (the latest price against the close of the latest completed hourly bar that
+  started at least two hours earlier), no new coin goes out; the update still reviews the
+  existing setups. Ten entries fired in ten minutes into such a drop on 2026-10-02.
+- `--max-new-picks 3` (update only): the adjusted picks first, then at most three new coins.
+
+With any evidence option, every pick's `why_now` ends with the facts: "Evidence: +4.9% vs its
+20-day average; Alpaca 24 h volume $35,918; filled on Alpaca 2 times in the last 7 days; the
+market's median coin +1.02% in 2 h." The operator's current values: `--exclude POL,LDO,WIF
+--max-entry-distance-pct 2.5 --min-alpaca-volume-usd 5000 --trend-floor-pct 0 --selloff-pct 2
+--max-new-picks 3`.
+
+Method v9 (2026-10-03) turns the same rules on the setups already in the system: with any of
+`--exclude`, `--min-alpaca-volume-usd` or `--trend-floor-pct`, the update re-checks every
+WATCHING setup it keeps or adjusts against them and withdraws one whose premise no longer holds
+(the withdrawal reason starts with "Evidence premise no longer holds:" and names the rule). A
+coin whose setup could not be re-checked (no market data, unreadable levels, expired) is left
+as it is. The entry-distance and sell-off rules stay new-pick only: a watched trigger is a
+fixed level the app decides, and a sell-off withdraws nothing by itself (the operator's
+RISK_OFF path does). This is the two-hourly review of the levels in the system the owner asked
+for on 2026-10-02: a watched coin that fell under its 20-day average, lost its Alpaca volume or
+joined the exclusion list is taken back before its trigger can fire.
+
+One command, and it never sends anything. In order, it:
+
+1. **Reads the research context** and saves it as `context.json`. It refuses unless the
+   schedule is V2 (`UPDATE_NEEDS_SCHEDULE_V2`) and the slot it answers is an update run
+   (`UPDATE_SLOT_IS_FULL_RUN`), before fetching anything. Stop and say so if it refuses.
+2. **Fetches the market data and finds the level setups** exactly as `market` and `levels` do
+   under `INTRADAY_V2` (`market.json`, `levels.json`).
+3. **Reviews each coin with a WATCHING setup:**
+   - **kept, found again**: one of the profile's rule/timeframe/window combinations still
+     shows it, with the entry within 0.25% and the stop and target within 0.5%. Every
+     combination is checked around the setup's own entry, so the daily run's 4-hour setup is
+     not replaced just because a 1-hour setup comes first in the search;
+   - **kept, price at the entry**: price is at or below the entry, or less than the
+     profile's 0.3% minimum above it. The app's trigger decides now, and a withdrawal or a
+     replacement would race it;
+   - **kept, not re-checked**: there are no market data or live quote for the coin now, its
+     levels cannot be read, or it has expired. The kit never withdraws what it cannot check;
+   - **adjusted**: it is not found again, but the profile finds a setup now (the entry moved
+     at least 0.25%, or the stop or target at least 0.5%). That setup becomes an adjusted
+     pick: a normal pick, built and checked like any other;
+   - **withdrawn**: no setup now (the reason is the first check that failed), or the coin has
+     left the research context's tradable universe.
+4. **Finds new coins**: no open trade and no WATCHING setup, and a qualifying setup now.
+5. **Writes the files and validates them** as `validate` does:
+   - `withdrawal.json`, only when something is withdrawn (`AGENT_RESEARCH_WITHDRAWAL_V1`);
+   - `report.json`, only with at least one pick: adjusted picks first, then new coins in
+     `build`'s order (rule A first, then the highest reward:risk), at most `--max-picks`
+     (default 8). An adjusted pick that does not fit is recorded, and its WATCHING setup
+     stays as it is;
+   - `update-notes.json`: every coin kept, adjusted, withdrawn or new, with its reason, and
+     what was left out of the report and why.
+
+An update with nothing to change writes `update-notes.json` alone and says so. There is
+nothing to send, and `submit` then sends nothing. A context without `watching_setups` (an app
+release before `RESEARCH_CONTEXT_V3`) has no WATCHING setups to review; `update-notes.json`
+says so, and only new coins are considered.
+
+Every level still comes from the level rules alone: each entry, stop and target is a cited
+bar's own low or high, and the app's 2% minimum stop and 2R rules are never loosened. A thin
+update is a real result. Never hand-edit `withdrawal.json` or `report.json`: `validate` and
+`submit` check both again.
+
+### 2. Submit
+
+```sh
+./run python -m research_agent.run submit --run-dir "$RUN_DIR" --base-url "$BASE_URL" \
+  --token-file "$TOKEN_FILE"
+```
+
+- **The withdrawal first**: `POST /api/v1/lab/research-withdrawals` with the agent's token.
+  HTTP 200 `RESEARCH_WITHDRAWAL_RECORDED` answers each coin with `WITHDRAWN` (and its setup
+  IDs), `NOT_WATCHING` (the setup is past watching, so it is left alone) or `NONE`.
+  `withdrawal-submit.json` records the answer. Only the agent's own WATCHING setups are ever
+  withdrawn; they have no broker order.
+- **Then the report**, exactly as in morning step 11.
+- **Any withdrawal answer but 200 stops before the report is sent.** That includes a 409
+  `WITHDRAWAL_ID_CONFLICT`, a 422 or a transport error. Fix the cause, then run `submit` again.
+  A withdrawal already recorded is not sent again. One that got no answer is resent unchanged
+  first, and the app replays a repeated `withdrawal_id` with the same body.
+
+### 3. Write the run notes
+
+Write a few lines in the run folder:
+
+- the slot answered;
+- the kept, adjusted, withdrawn and new coins with the main reasons (`update-notes.json`);
+- what was left out of the report;
+- both submit results;
+- anything that did not work as written.
+
+## Answering reviews and exit flags
+
+**Paper trading only.** `MUSE_ANSWER_RULES_V2` (2026-09-29; V1 was package kit-answers) is the
+agent's own policy for the app's pending requests: the review of each open trade at the end of
+its window (`CRYPTO_WINDOW_REVIEW_V1`: continue or exit), and each Jev early-exit flag
+(`EARLY_EXIT_FLAG_V1`). It is a kit-side policy, not an app rule. The app, with Jev, still
+decides and executes everything under its own authorization, and an answer carries no size,
+order, level or suggestion.
+
+Before it, the kit answered neither. Every window review was Jev's alone, and a Jev flag could
+only time out, because an early exit needs both sides. On 2026-09-29 at 02:28:58 UTC Jev
+flagged UNI/USD `BROKEN` at bid 8.467 (entry 8.604, stop 8.4427). Nobody answered, and the
+stop-limit fallback closed the trade at 8.4403 three minutes later.
+
+This is not a research session's step. The operator's watch loop runs it every 2-5 minutes
+(every 2 is better: a flag takes an answer for 15 minutes only, and tonight's fallback sold
+3 minutes after the flag), always with the same run folder:
+
+```sh
+./run python -m research_agent.run answer --run-dir runs/answers \
+  --base-url "$BASE_URL" --token-file "$TOKEN_FILE" \
+  --agent-id muse --agent-version "$AGENT_VERSION"
+```
+
+To see what it would answer, without sending anything (the pending items are still read):
+
+```sh
+./run python -m research_agent.run answer --dry-run --run-dir runs/answers \
+  --base-url "$BASE_URL" --token-file "$TOKEN_FILE" \
+  --agent-id muse --agent-version "$AGENT_VERSION"
+```
+
+### The rules
+
+The pending items are `GET /api/v1/lab/reviews` (the same items as the research context's
+`pending_reviews`). Each is decided from the last **completed** Coinbase 5-minute bar (public
+candles, no key; the bar still forming is never used), with the levels the item states:
+
+| Item | Answer |
+| --- | --- |
+| A Jev early-exit flag (`EXIT_FLAG`) | **EXIT** when the bar closed at or below the stop, or at or below the half-risk line, entry - 0.5 x (entry - stop), with the item's `trade.entry` (the average entry) and `trade.levels.stop` (the stop when Jev flagged): the trade has given back half of its planned risk. Otherwise **CONTINUE**: the stop decides. |
+| A window review (`DAY_REVIEW`, first round or discussion reply) | **CONTINUE** when the bar closed at or above the entry (`request.trade.entry`): the trade is working. Otherwise **EXIT**: a time stop, since the trade did not work within its window. A discussion reply is decided the same way, on the bar completed by then. |
+| No recent bar (V2) | No completed bar that closed in the last 15 minutes (Coinbase has no candle for five minutes without a trade: a thin coin at night; YFI's first window review on 2026-09-29 had none from 04:45 UTC), or the candles unavailable: the **app's own bid** stated in the item (a review's `request.trade.bid` and `quote_at`, a flag's evidence `trade.quote`) is the price instead, by the same rules, when it is at most 15 minutes old. The texts say so ("The app's bid at HH:MM:SS UTC was …"). |
+| No usable data | Neither a usable bar nor an app bid at most 15 minutes old (`NO_COMPLETED_5M_BAR_IN_15_MINUTES`, `COINBASE_CANDLES_UNAVAILABLE`), or a level missing (`LEVEL_MISSING`): **no answer**. The reason is recorded and the app's fallback applies: a review is Jev's alone, and a flag times out with the trade kept. The next run reads again while the item is pending. |
+
+The check, on tonight's UNI flag: at 02:29 UTC the last completed bar was 02:20-02:25, which
+closed at 8.5061. The half-risk line is 8.604 - 0.5 x (8.604 - 8.4427) = 8.52335, and 8.5061
+is at or below it, so the answer is EXIT.
+
+The texts are facts built only from those numbers: the bar's time and close against the line
+(`what_changed`), what the rule expects (`next_24h`: the stop decides, a move toward the target,
+or a time stop), and the line a 5-minute close back above would invalidate (`proves_wrong`;
+after a CONTINUE, a close at or below it). No confidence, no sources, no suggested levels and
+nothing that names the agent; the app's own validator checks each body before it is sent. The
+UNI answer:
+
+```json
+{
+  "schema_version": "AGENT_REVIEW_ANSWER_V1",
+  "answer_id": "<UUID5 of the flag ID>",
+  "decision": "EXIT",
+  "what_changed": "The last completed 5-minute bar (2026-09-29 02:20-02:25 UTC) closed at 8.5061, at or below 8.52335, halfway between the entry 8.604 and the stop 8.4427: the trade has given back half of its planned risk.",
+  "next_24h": "The setup has failed by this rule: exit now near 8.5061 rather than wait for the stop at 8.4427.",
+  "proves_wrong": "A 5-minute close back above 8.52335."
+}
+```
+
+### What the answer does together with Jev's
+
+- **A flag.** EXIT agrees, and the trade sells at market (`EXIT_AGREED`); CONTINUE keeps it
+  with its stop and target (`EXIT_NOT_AGREED`). So a Jev flag ends the trade exactly when the
+  last 5-minute close is at or below the half-risk line (or the stop); otherwise the stop
+  decides.
+- **A window review** (the app's answer rule `DAY_REVIEW_ANSWER_RULE_V2`). Agreement decides at
+  T. A disagreement opens one discussion round, whose reply this rule decides again on the bar
+  completed by then; after it, anything but agreement exits. An unusable Jev answer exits
+  whatever the agent said. So a trade continues past its window only when its last 5-minute
+  close is at or above the entry and Jev also says continue. A time stop (EXIT) ends it, unless
+  by the discussion reply the close is back at or above the entry and Jev's final answer is
+  continue.
+- **Unchanged.** Stops, targets, the daily loss halt and an operator flatten close a trade at
+  any time. The first answer goes in on the first run after the request appears (30 minutes
+  before T). With `MANAGED_MANAGEMENT_REVIEWS=DISABLED` a review exits at T whatever the
+  answer.
+
+### What it writes, and why it is safe to repeat
+
+- `runs/answers/items/<item>.json`, one per flag or per review round: the item as read, every
+  reading (the candles read, the bar used, the decision and why), the body sent and every
+  response.
+- `runs/answers/polls/<UTC day>.jsonl`: one line per run, with the items read and what was
+  done. With nothing pending, a run is one GET and this one line.
+- An item is decided once. Its body is written to its record before it is sent, and it is the
+  only body ever sent for it: `answer_id` is a UUID5 of the flag ID (or of the review ID and its
+  round), a run that got no answer (a transport error), a 5xx or a 401 sends the same body
+  again next time, and the app replays it (`idempotent_replay`). Only an answer never sent (a
+  `--dry-run`, or one the app's own validator refused in the kit) is decided again.
+- A 409 (already answered, resolved, window closed) or a 404 (the trade closed) is final, not an
+  error: the item is never sent again. Another refusal (422, 403) is recorded and not resent.
+- A run that finds another holding `runs/answers/answer.lock` does nothing.
+- Exit code 0: everything answered, final or without usable data, or nothing pending. 1: an
+  answer failed, was refused or could not be read (the printout and the item's record say
+  which). 2: a setting (the run folder, the agent, the base URL or the token).
+- The token is read from the file, sent only in the `Authorization` header, and never written
+  or printed. Never edit an item's record, and never answer an item by hand while the watch
+  runs.
+
 ## Testing against a session harness
 
 This is a separate workflow, not part of the daily run above: a way to get a real proof of
@@ -801,8 +1122,7 @@ this workflow covers the report only.
      --jev fixture --extra-crypto-pairs <your researched coins not in the default 20>
    ```
    - `--jev fixture` is free. `--jev typesafe` spends real provider credits and is the
-     owner's or coordinator's call, per `docs/OPERATIONS-RUNBOOK.md`'s "Supervised
-     research-agent session".
+     owner's or coordinator's call.
    - The session's own report-V3 universe is its default owner-bucket pairs plus whatever
      `--extra-crypto-pairs` you add at start. It is **not** the same as the offline
      context's Alpaca-quote universe, and there is no route to read it back.
@@ -844,6 +1164,14 @@ marker automatically.
 - It never sizes, authorizes, prices, or places a broker order; it has no broker-order code
   path at all. Everything after submission (Jev's selection, the system check, execution on
   Alpaca Paper) is the app's, not this kit's.
+- An update run's withdrawal only asks the app to withdraw the agent's own setups still
+  WATCHING, which have no broker order. It never touches an open trade or another agent's
+  setup (the app refuses both anyway).
+- An answer to a review or a Jev flag (`answer`) is only the agent's side of a decision the
+  app takes with Jev: CONTINUE or EXIT and three factual texts, never a size, an order, a level
+  or a suggestion. The app sells, if both sides say exit, under its own authorization.
+- The derivatives context (open interest and funding) never chooses a coin, orders the picks
+  or sets a level: it is cited context for Jev.
 - It never invents a fact, a time, or an excerpt, and it never modifies the app's intake
   rules, question sets or selection logic.
 - Lessons and the checklist change the order of research and picks, never coverage and

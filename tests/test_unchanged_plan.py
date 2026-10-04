@@ -48,7 +48,8 @@ def test_a_stop_raise_that_actually_helped_shows_a_positive_r_difference():
         bar(1, "105", "112", "104", "111"),
     ])
     outcome = replay_unchanged_plan(
-        D("100.10"), change, bars, hold_deadline=T0 + HOLD_HORIZON, actual_r=D("0.5"),
+        D("100.10"), change, bars, initial_stop=D("95"), hold_deadline=T0 + HOLD_HORIZON,
+        actual_r=D("0.5"),
     )
     assert outcome.exit_reason == TARGET
     assert outcome.exit_price == D("111")
@@ -65,7 +66,8 @@ def test_a_stop_raise_that_actually_hurt_the_unchanged_plan_would_have_reached_t
     bars = parse_bars([bar(0, "100", "100.1", "98.5", "99")])  # dips to 98.5: below new (99),
     # above original (95) -- the actual trade stopped out here, the unchanged plan keeps going.
     outcome = replay_unchanged_plan(
-        D("100.10"), change, bars, hold_deadline=T0 + HOLD_HORIZON, actual_r=D("-1"),
+        D("100.10"), change, bars, initial_stop=D("95"), hold_deadline=T0 + HOLD_HORIZON,
+        actual_r=D("-1"),
     )
     assert outcome.exit_reason == DATA_INCOMPLETE
     assert outcome.unchanged_net_r is None
@@ -78,7 +80,8 @@ def test_a_target_raise_that_actually_helped():
     change = target_raise()
     bars = parse_bars([bar(0, "105", "112", "104", "111")])
     outcome = replay_unchanged_plan(
-        D("100.10"), change, bars, hold_deadline=T0 + HOLD_HORIZON, actual_r=D("3.0"),
+        D("100.10"), change, bars, initial_stop=D("95"), hold_deadline=T0 + HOLD_HORIZON,
+        actual_r=D("3.0"),
     )
     assert outcome.exit_reason == TARGET
     assert outcome.exit_price == D("111")
@@ -93,7 +96,8 @@ def test_a_target_raise_that_actually_hurt():
     change = target_raise(new_target="150")
     bars = parse_bars([bar(0, "105", "112", "104", "111")])  # hits the ORIGINAL target 111
     outcome = replay_unchanged_plan(
-        D("100.10"), change, bars, hold_deadline=T0 + HOLD_HORIZON, actual_r=D("-1"),
+        D("100.10"), change, bars, initial_stop=D("95"), hold_deadline=T0 + HOLD_HORIZON,
+        actual_r=D("-1"),
     )
     assert outcome.exit_reason == TARGET
     assert outcome.r_difference == D("-1") - outcome.unchanged_net_r
@@ -103,7 +107,8 @@ def test_a_target_raise_that_actually_hurt():
 def test_same_bar_ambiguity_is_resolved_as_the_stop_and_counted():
     change = stop_raise()
     bars = parse_bars([bar(0, "100", "112", "94", "100")])  # low<=95 and high>=111, one bar
-    outcome = replay_unchanged_plan(D("100.10"), change, bars, hold_deadline=T0 + HOLD_HORIZON)
+    outcome = replay_unchanged_plan(D("100.10"), change, bars, initial_stop=D("95"),
+                                    hold_deadline=T0 + HOLD_HORIZON)
     assert outcome.exit_reason == STOP and outcome.same_bar_ambiguous is True
 
 
@@ -114,9 +119,38 @@ def test_a_24_hour_exit_replay_and_no_actual_r_leaves_the_difference_unknown():
         bar(0, "100", "100.2", "99.9", "100"),
         {"t": deadline.isoformat(), "o": "103", "h": "103.2", "l": "102.9", "c": "103", "v": "1"},
     ])
-    outcome = replay_unchanged_plan(D("100.10"), change, bars, hold_deadline=deadline)
+    outcome = replay_unchanged_plan(D("100.10"), change, bars, initial_stop=D("95"),
+                                    hold_deadline=deadline)
     assert outcome.exit_price == D("103")
     assert outcome.actual_r is None and outcome.r_difference is None
+
+
+def test_a_later_change_is_measured_in_the_trades_own_r():
+    """A second raise walks the levels in force before it (stop 99) but is measured in the
+    trade's own R: (exit - max entry) / (max entry - admitted stop), official_r's denominator,
+    not the raised stop's much smaller risk."""
+    change = stop_raise(old_stop="99", new_stop="100")
+    bars = parse_bars([bar(0, "100", "100.2", "99.5", "100"),
+                       bar(1, "105", "112", "104", "111")])
+    outcome = replay_unchanged_plan(D("100.10"), change, bars, initial_stop=D("95"),
+                                    hold_deadline=T0 + HOLD_HORIZON)
+    assert outcome.exit_reason == TARGET and outcome.original_stop == D("99")
+    assert outcome.initial_stop == D("95")
+    assert outcome.unchanged_gross_r == (D("111") - D("100.10")) / (D("100.10") - D("95"))
+    assert outcome.to_dict()["initial_stop"] == "95"
+
+
+def test_a_change_after_the_stop_passed_the_entry_still_replays():
+    """Once a raise has lifted the stop to the max entry or above, the next change's replay
+    still has a positive denominator (the admitted risk); it used to refuse
+    NONPOSITIVE_RISK_DENOMINATOR, which dropped the whole trade from the nightly replays."""
+    change = stop_raise(old_stop="100.50", new_stop="101")
+    bars = parse_bars([bar(0, "101", "101.2", "100.4", "100.6")])  # Trades through 100.50.
+    outcome = replay_unchanged_plan(D("100.10"), change, bars, initial_stop=D("95"),
+                                    hold_deadline=T0 + HOLD_HORIZON)
+    assert outcome.exit_reason == STOP and outcome.exit_price == D("100.50")
+    assert outcome.unchanged_gross_r == (D("100.50") - D("100.10")) / (D("100.10") - D("95"))
+    assert outcome.unchanged_gross_r > 0
 
 
 def test_level_change_rejects_invalid_original_levels():

@@ -215,3 +215,254 @@ def test_a_refused_set_shows_the_cli_reason_but_never_the_value():
     assert "Config as Code" not in reason
     assert cloud_secrets.cli_reason(argparse.Namespace(returncode=1, stdout="", stderr=""),
                                     value) == ""
+
+
+# --- Adding a research agent without replacing another (package agent-api) --------------------
+
+NEW_AGENT = "dots-agent"
+
+
+def add_args(railway, agent_file, token_file, *keep, add=NEW_AGENT, dry_run=False, rotate=None,
+             agent_id="muse"):
+    return argparse.Namespace(agent_token_file=str(agent_file), agent_id=agent_id,
+                              rotate=rotate, environment=None, railway=str(railway[0]),
+                              dry_run=dry_run, add_agent=add,
+                              token_file=None if token_file is None else str(token_file),
+                              keep_agent=[f"{a}={p}" for a, p in keep] or None)
+
+
+def add(railway, tmp_path, *args, **kwargs):
+    out = io.StringIO()
+    report = cloud_secrets.run(add_args(railway, *args, **kwargs), home=tmp_path / "home",
+                               out=out)
+    return report, out.getvalue()
+
+
+def deployed(railway, private_dir, tmp_path):
+    """The first deployment's secrets: Muse's token in Railway and in its local file."""
+    muse_file = private_dir / "muse-agent-token"
+    run(railway, muse_file, tmp_path)
+    return muse_file
+
+
+def agent_tokens(railway):
+    return json.loads(stored(railway)["trader"]["MANAGED_AGENT_TOKENS_JSON"])
+
+
+def token_of(path):
+    return path.read_text().removesuffix("\n")
+
+
+def test_adding_an_agent_writes_the_union_and_keeps_muses_token(railway, private_dir, tmp_path,
+                                                                 capsys):
+    from catalyst_lab.agent_identity import validated_agent_tokens
+
+    muse_file = deployed(railway, private_dir, tmp_path)
+    muse_token, before = token_of(muse_file), stored(railway)
+    new_file = private_dir / "dots-agent-token"
+    report, printed = add(railway, tmp_path, muse_file, new_file)
+    tokens = agent_tokens(railway)
+    assert sorted(tokens) == ["dots-agent", "muse"]
+    assert tokens["muse"] == muse_token and tokens["dots-agent"] == token_of(new_file)
+    assert token_of(muse_file) == muse_token  # Muse's own file is never touched.
+    assert stat.S_IMODE(new_file.stat().st_mode) == 0o600
+    assert validated_agent_tokens(tokens) == tokens  # The app's own rules accept the union.
+    # Only the agent variable changed; every other secret is as the first run left it.
+    after = stored(railway)
+    assert {k: v for k, v in after["trader"].items() if k != "MANAGED_AGENT_TOKENS_JSON"} == {
+        k: v for k, v in before["trader"].items() if k != "MANAGED_AGENT_TOKENS_JSON"}
+    assert after["ops"] == before["ops"]
+    assert (report["applied"], report["new_agent_token"], report["agents"]) == (
+        True, "GENERATE", ["dots-agent", "muse"])
+    # The summary (IDs only) was printed before the change, then the applied report.
+    first, _, second = printed.partition("}\n{")
+    assert '"applied": false' in first and '"applied": true' in second
+    argv_log = railway[2].read_text()
+    sets = [json.loads(line) for line in argv_log.splitlines()
+            if json.loads(line)[:2] == ["variable", "set"]]
+    assert sets[-1][:3] == ["variable", "set", "MANAGED_AGENT_TOKENS_JSON"]
+    captured = capsys.readouterr()
+    for token in tokens.values():
+        assert token not in printed and token not in argv_log
+        assert token not in captured.out and token not in captured.err
+
+
+def test_the_dry_run_shows_agent_ids_only_and_changes_nothing(railway, private_dir, tmp_path):
+    muse_file = deployed(railway, private_dir, tmp_path)
+    before, log_lines = stored(railway), len(railway[2].read_text().splitlines())
+    new_file = private_dir / "dots-agent-token"
+    report, printed = add(railway, tmp_path, muse_file, new_file, dry_run=True)
+    assert report == {
+        "mode": "ADD_AGENT", "dry_run": True, "applied": False, "service": "trader",
+        "variable": "MANAGED_AGENT_TOKENS_JSON", "agents": ["dots-agent", "muse"],
+        "new_agent": "dots-agent", "new_agent_token": "GENERATE",
+        "new_agent_token_file": str(new_file)}
+    assert json.loads(printed) == report
+    assert not new_file.exists() and stored(railway) == before
+    new_lines = railway[2].read_text().splitlines()[log_lines:]
+    assert new_lines and all(json.loads(line)[:2] == ["variable", "list"] for line in new_lines)
+    assert token_of(muse_file) not in printed
+
+
+def test_an_existing_private_token_file_is_reused_and_a_rerun_is_idempotent(
+        railway, private_dir, tmp_path):
+    muse_file = deployed(railway, private_dir, tmp_path)
+    new_file = private_dir / "dots-agent-token"
+    fixture_token = "fixture-dots-agent-token-" + "d" * 40
+    new_file.write_text(fixture_token + "\n")
+    new_file.chmod(0o600)
+    report, _ = add(railway, tmp_path, muse_file, new_file)
+    assert report["new_agent_token"] == "REUSE_LOCAL_FILE"
+    assert agent_tokens(railway)["dots-agent"] == fixture_token == token_of(new_file)
+    value = stored(railway)["trader"]["MANAGED_AGENT_TOKENS_JSON"]
+    again, _ = add(railway, tmp_path, muse_file, new_file)  # The same union again.
+    assert again["new_agent_token"] == "REUSE_LOCAL_FILE"
+    assert stored(railway)["trader"]["MANAGED_AGENT_TOKENS_JSON"] == value
+    # A third agent keeps both others when both are listed.
+    third = private_dir / "third-agent-token"
+    add(railway, tmp_path, muse_file, third, ("dots-agent", new_file), add="third-agent")
+    tokens = agent_tokens(railway)
+    assert sorted(tokens) == ["dots-agent", "muse", "third-agent"]
+    assert tokens["dots-agent"] == fixture_token and tokens["muse"] == token_of(muse_file)
+
+
+def test_rotating_muses_token_keeps_the_agents_listed(railway, private_dir, tmp_path):
+    muse_file = deployed(railway, private_dir, tmp_path)
+    new_file = private_dir / "dots-agent-token"
+    add(railway, tmp_path, muse_file, new_file)
+    dots, old_muse = token_of(new_file), token_of(muse_file)
+    out = io.StringIO()
+    rotation = argparse.Namespace(**{**vars(args(railway, muse_file, "MANAGED_AGENT_TOKENS_JSON")),
+                                     "keep_agent": [f"dots-agent={new_file}"]})
+    report = cloud_secrets.run(rotation, home=tmp_path / "home", out=out)
+    tokens = agent_tokens(railway)
+    assert report["secrets"]["MANAGED_AGENT_TOKENS_JSON"] == {
+        "action": "ROTATE", "services": ["trader"], "agents": ["dots-agent", "muse"]}
+    assert tokens["dots-agent"] == dots and tokens["muse"] == token_of(muse_file) != old_muse
+    assert dots not in out.getvalue() and tokens["muse"] not in out.getvalue()
+    # Listing agents is refused when the agent variable is not being rotated.
+    status_only = argparse.Namespace(**{**vars(args(railway, muse_file, "MANAGED_STATUS_TOKEN")),
+                                        "keep_agent": [f"dots-agent={new_file}"]})
+    with pytest.raises(cloud_secrets.Refused, match="^KEEP_AGENT_ONLY_WITH_ADD_AGENT_OR_ROTATE"):
+        cloud_secrets.run(status_only, home=tmp_path / "home", out=io.StringIO())
+
+
+def test_invalid_ids_duplicates_and_missing_files_are_refused_before_any_change(
+        railway, private_dir, tmp_path):
+    muse_file = deployed(railway, private_dir, tmp_path)
+    new_file = private_dir / "dots-agent-token"
+    shared = private_dir / "shared-token"
+    shared.write_text(token_of(muse_file) + "\n")  # The same token under another agent.
+    shared.chmod(0o600)
+    readable = private_dir / "readable-token"
+    readable.write_text("fixture-readable-agent-token-" + "r" * 40 + "\n")
+    readable.chmod(0o644)
+    short = private_dir / "short-token"
+    short.write_text("too-short\n")
+    short.chmod(0o600)
+    before, log = stored(railway), railway[2].read_text()
+    refusals = {
+        "AGENT_ID_INVALID": [dict(add=bad) for bad in ("Dots", "d", "1dots", "dots agent",
+                                                       "x" * 33, "dots/agent")]
+        + [dict(agent_id="Muse")],
+        "AGENT_ALREADY_LISTED muse": [dict(add="muse")],
+        "AGENT_ID_DUPLICATE other": [dict(keep=(("other", shared), ("other", readable)))],
+        "AGENT_TOKEN_FILE_MISSING other": [dict(keep=(("other", private_dir / "absent"),))],
+        "AGENT_TOKEN_FILE_NOT_PRIVATE": [dict(keep=(("other", readable),)),
+                                         dict(token_file=readable)],
+        "AGENT_TOKEN_FILE_INVALID other": [dict(keep=(("other", short),))],
+        "AGENT_TOKENS_NOT_DISTINCT": [dict(keep=(("other", shared),)), dict(token_file=shared)],
+        "AGENT_TOKEN_FILE_SHARED": [dict(token_file=muse_file)],
+        "TOKEN_FILE_REQUIRED": [dict(token_file=None)],
+        "ADD_AGENT_WITH_ROTATE_REFUSED": [dict(rotate=["MANAGED_AGENT_TOKENS_JSON"])],
+        "KEEP_AGENT_INVALID": [dict(raw_keep=["dots"]), dict(raw_keep=["Bad=/x"])],
+        "AGENT_TOKEN_FILE_MUST_BE_ABSOLUTE": [dict(token_file="relative/token")],
+        "AGENT_TOKEN_FILE_LOCATION_FORBIDDEN": [
+            dict(token_file=cloud_secrets.REPOSITORY / "agent-token")],
+    }
+    for code, cases in refusals.items():
+        for case in cases:
+            keep = case.pop("keep", ())
+            raw_keep = case.pop("raw_keep", None)
+            token_file = case.pop("token_file", new_file)
+            parsed = add_args(railway, muse_file, token_file, *keep, **case)
+            if raw_keep is not None:
+                parsed.keep_agent = raw_keep
+            with pytest.raises(cloud_secrets.Refused) as refused:
+                cloud_secrets.run(parsed, home=tmp_path / "home", out=io.StringIO())
+            assert str(refused.value).startswith(code), (code, str(refused.value))
+    assert not new_file.exists() and stored(railway) == before
+    assert railway[2].read_text() == log  # Refused before Railway was even asked.
+    # Without the first deployment's variable there is nothing to add to.
+    railway[1].write_text("{}")
+    with pytest.raises(cloud_secrets.Refused,
+                       match="^AGENT_TOKENS_VARIABLE_MISSING trader MANAGED_AGENT_TOKENS_JSON"):
+        add(railway, tmp_path, muse_file, new_file)
+    assert not new_file.exists() and stored(railway) == {}
+    with pytest.raises(cloud_secrets.Refused, match="^TOKEN_FILE_ONLY_WITH_ADD_AGENT$"):
+        cloud_secrets.run(add_args(railway, muse_file, new_file, add=None),
+                          home=tmp_path / "home", out=io.StringIO())
+
+
+FAILING_SET = """#!{python}
+import json, os, sys
+argv = sys.argv[1:]
+state = json.load(open(os.environ["FAKE_RAILWAY_STATE"]))
+service = argv[argv.index("--service") + 1]
+if argv[:2] == ["variable", "list"]:
+    print(json.dumps(state.get(service, {{}})))
+else:
+    value = sys.stdin.read()
+    print("Error: refused " + value, file=sys.stderr)
+    print("the value begins " + value[2:12], file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def test_a_failed_set_names_no_token_and_the_rerun_reuses_the_new_file(railway, private_dir,
+                                                                        tmp_path, capsys):
+    muse_file = deployed(railway, private_dir, tmp_path)
+    failing = tmp_path / "bin" / "railway-failing"
+    failing.write_text(FAILING_SET.format(python=sys.executable))
+    failing.chmod(0o700)
+    new_file = private_dir / "dots-agent-token"
+    parsed = add_args(railway, muse_file, new_file)
+    parsed.railway = str(failing)
+    with pytest.raises(cloud_secrets.Refused) as refused:
+        cloud_secrets.run(parsed, home=tmp_path / "home", out=io.StringIO())
+    message = str(refused.value)
+    assert message.startswith("RAILWAY_VARIABLE_SET_FAILED trader MANAGED_AGENT_TOKENS_JSON")
+    new_token, muse_token = token_of(new_file), token_of(muse_file)
+    captured = capsys.readouterr()
+    for token in (new_token, muse_token):
+        for piece in (token, token[:8], token[-8:]):
+            assert piece not in message and piece not in captured.out + captured.err
+    assert agent_tokens(railway) == {"muse": muse_token}  # Unchanged on Railway.
+    report, _ = add(railway, tmp_path, muse_file, new_file)  # The working CLI: reuse the file.
+    assert report["new_agent_token"] == "REUSE_LOCAL_FILE"
+    assert agent_tokens(railway) == {"muse": muse_token, "dots-agent": new_token}
+
+
+def test_the_script_keeps_agent_identitys_rules():
+    from catalyst_lab.agent_identity import (
+        AGENT_ID_PATTERN,
+        MAX_AGENT_TOKENS,
+        valid_token,
+    )
+
+    assert cloud_secrets.MAX_AGENTS == MAX_AGENT_TOKENS
+    assert "^" + cloud_secrets.AGENT_ID.pattern + "$" == AGENT_ID_PATTERN
+    for value in ("x" * 31, "x" * 32, "x" * 31 + " ", "a\tb" * 20, "fixture-" * 5, "", None, 7):
+        assert cloud_secrets.valid_token(value) == valid_token(value), value
+
+
+def test_main_parses_the_add_agent_flags(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cloud_secrets, "run", lambda parsed, **_: seen.update(args=parsed))
+    cloud_secrets.main(["--agent-token-file", "/abs/private/muse-agent-token",
+                        "--add-agent", "dots-agent", "--token-file", "/abs/private/dots",
+                        "--keep-agent", "other=/abs/private/other", "--dry-run"])
+    parsed = seen["args"]
+    assert (parsed.add_agent, parsed.token_file, parsed.keep_agent, parsed.agent_id,
+            parsed.dry_run) == ("dots-agent", "/abs/private/dots",
+                                ["other=/abs/private/other"], "muse", True)

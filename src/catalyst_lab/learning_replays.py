@@ -46,7 +46,7 @@ from catalyst_lab.pick_outcomes import (
 )
 from catalyst_lab.repository import json_safe
 from catalyst_lab.trade_review import decision_records
-from catalyst_lab.unchanged_plan import unchanged_plan_comparisons
+from catalyst_lab.unchanged_plan import traded_scale, unchanged_plan_comparisons
 
 REPLAY_EVENT = "UNCHANGED_PLAN_REPLAY"
 DAY_REPLAY_EVENT = "DAY_REVIEW_DECISION_REPLAY"
@@ -157,7 +157,8 @@ def replay_candidates(repository, *, since):
               WHERE e.setup_id IS NOT NULL AND e.recorded_at >= %s AND (
                 e.kind='MANAGEMENT_PLAN_AUTHORIZED'
                 OR (e.kind='MAINTENANCE_DECISION' AND e.body->>'outcome'='APPLIED')
-                OR (e.kind='EXIT_FLAG_RESOLVED' AND e.body->>'outcome'='EXIT_AGREED')
+                OR (e.kind='EXIT_FLAG_RESOLVED'
+                    AND e.body->>'outcome' IN ('EXIT_AGREED','NO_ANSWER_EXIT'))
                 OR (e.kind=%s AND e.body->>'outcome' IN (%s, %s))))
             ORDER BY s.event_seq""",
             (since, dr.DECISION, dr.CONTINUE, dr.EXIT),
@@ -178,10 +179,12 @@ def _identity(setup):
 
 def record_replays(store, reader, *, now):
     """Append every complete replay not yet recorded; counts by outcome. A setup whose bars
-    cannot be read is counted and left for the next run; the others proceed."""
+    cannot be read, or whose recorded data cannot be replayed (``invalid``, also counted in
+    ``failed``), is left for the next run; the others proceed."""
     now = _aware(now)
     bars = CachedBars(reader)
-    summary = {"setups": 0, "recorded": 0, "already_recorded": 0, "pending": 0, "failed": 0}
+    summary = {"setups": 0, "recorded": 0, "already_recorded": 0, "pending": 0, "failed": 0,
+               "invalid": 0}
     for setup in replay_candidates(store.repo, since=now - LOOKBACK):
         if is_engineering(setup["record_json"]):
             continue
@@ -190,7 +193,9 @@ def record_replays(store, reader, *, now):
         try:
             outcomes = unchanged_plan_comparisons(store.repo, bars, setup["setup_id"], now=now)
             levels = setup["record_json"]["levels"]
-            entry, initial_stop = D(str(levels["max_entry_price"])), D(str(levels["stop"]))
+            # TRADED_LEVELS_V1 (package learning-loop2): official R's scale, the plan's stop.
+            entry, initial_stop = traded_scale(levels, setup.get("state"))
+            basis = traded_basis(levels, setup.get("state"))
             # CRYPTO_WINDOW_REVIEW_V1 setups: V2, their continue lasts their recorded window.
             window = crypto_holding.recorded_window_seconds(setup.get("state"))
             decisions = [d for d in decision_records(store.repo, setup["setup_id"])
@@ -209,6 +214,7 @@ def record_replays(store, reader, *, now):
                     window_seconds=window)))
         except (ShadowDataError, KeyError, TypeError, ValueError, InvalidOperation):
             summary["failed"] += 1
+            summary["invalid"] += 1  # Its ledger data, not the bars: counted apart.
             continue
         except Exception:  # noqa: BLE001 -- a bar transport failure: this setup only, retried.
             summary["failed"] += 1
@@ -226,7 +232,8 @@ def record_replays(store, reader, *, now):
                 for derived in ("actual_r", "r_difference"):  # Read live, never frozen here.
                     record.pop(derived, None)
                 store.event(conn, REPLAY_EVENT, json_safe({
-                    **identity, **record, "fee_assumption": FEE_ASSUMPTION_VERSION}), key=key)
+                    **identity, **record, "fee_assumption": FEE_ASSUMPTION_VERSION,
+                    **basis}), key=key)
                 summary["recorded"] += 1
             for decision, record in day:
                 if not record["data_complete"]:
@@ -238,7 +245,7 @@ def record_replays(store, reader, *, now):
                     continue
                 store.event(conn, DAY_REPLAY_EVENT, json_safe({
                     **identity, **record, "source_event_seq": decision["source_event_seq"],
-                    "review_number": decision.get("review_number")}), key=key)
+                    "review_number": decision.get("review_number"), **basis}), key=key)
                 summary["recorded"] += 1
     return summary
 
@@ -263,14 +270,50 @@ def decision_type(kind, body):
     return body["change_kind"]
 
 
-def counterfactual_r(kind, body):
+def traded_basis(levels, state):
+    """The replay record's R scale (TRADED_LEVELS_V1, package learning-loop2): ``r_basis``
+    and the research levels kept beside the traded ones."""
+    from catalyst_lab import trade_plan
+
+    return {"r_basis": "TRADE_PLAN_STOP" if trade_plan.active(state or {})
+            else "ADMITTED_PACKET_STOP",
+            "research_levels": {k: str(levels[k]) for k in ("max_entry_price", "stop", "target")
+                                if k in levels}}
+
+
+def counterfactual_r(kind, body, basis=None):
+    """A recorded replay's counterfactual net R. ``basis`` (``{"entry", "stop"}``: the trade's
+    official-R scale, ``scale_of``) rebases a replay recorded before TRADED_LEVELS_V1 (no
+    ``r_basis``) whose ``initial_stop`` is not that scale's stop -- a CRYPTO_TRADE_PLAN_V1
+    setup's replay priced on the research stop -- from its own recorded exit price, with the
+    same assumed fee; the record itself is never changed."""
     value = body.get("alternative_net_r" if kind == DAY_REPLAY_EVENT else "unchanged_net_r")
-    return D(str(value)) if value is not None else None
+    if value is None:
+        return None
+    if basis and body.get("r_basis") is None and body.get("exit_price") is not None:
+        try:
+            recorded_stop = D(str(body["initial_stop"]))
+            if recorded_stop != basis["stop"]:
+                _gross, net = r_values(basis["entry"], basis["stop"], D(str(body["exit_price"])))
+                return net
+        except (KeyError, TypeError, ValueError, InvalidOperation, ShadowDataError):
+            return D(str(value))
+    return D(str(value))
+
+
+def scale_of(record_json, state):
+    """``{"entry", "stop"}``: a trade's official-R scale (for ``counterfactual_r``), or None
+    when its levels cannot be read."""
+    try:
+        entry, stop = traded_scale((record_json or {})["levels"], state)
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+    return {"entry": entry, "stop": stop}
 
 
 __all__ = [
     "CONTINUE_24H", "CONTINUE_WINDOW", "CachedBars", "DAY_REPLAY_EVENT", "DAY_REPLAY_METHOD",
     "DAY_REPLAY_WINDOW_METHOD", "EXIT_AT_DECISION", "REPLAY_EVENT", "counterfactual_r",
     "day_decision_replay", "decision_type", "record_replays", "recorded_replays",
-    "replay_candidates",
+    "replay_candidates", "scale_of", "traded_basis",
 ]

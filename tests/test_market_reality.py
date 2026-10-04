@@ -213,6 +213,7 @@ def test_the_day_is_recorded_once_with_movers_factors_and_grades(learning):  # n
     assert row["idempotency_key"] == "market-reality:2026-09-27"
     body = row["body"]
     assert body["reality_version"] == "MARKET_REALITY_V1" and body["day"] == "2026-09-27"
+    assert body["regime"] == {"regime_version": "MARKET_REGIME_V1", "status": "NOT_RECORDED"}
     assert body["universe"]["symbols"] == ["BTC/USD", "DOGE/USD", "ETH/USD", "SOL/USD"]
     assert body["universe"]["recorded_by"] == "MARKET_OUTLOOK"
     assert body["measured_count"] == 3 and body["unmeasured"] == ["DOGE/USD"]

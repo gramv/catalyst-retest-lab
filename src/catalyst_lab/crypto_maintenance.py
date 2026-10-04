@@ -65,6 +65,47 @@ target run unchanged. Event-triggered reviews run in every tier below ``EXHAUSTE
 questions, answer rule, options, checks, the minute floor and the in-flight skip are V2's.
 Admission records V3 in the maintained arm from that package on; setups that recorded V1 or V2
 keep their recorded cadence whatever the budget.
+
+``CRYPTO_MAINTENANCE_V4`` (package trade-plan; owner approval 2026-10-02 of
+docs/TRADING-QUALITY-PLAN.md A4: 12 of 13 stop-outs to 2026-10-01 were on raised stops) is V3
+with guarded stop raises; cadence, context, questions, answer rule and every other check are
+V3's. A stop raise (Jev's maintenance answer or a 24-hour review's continue, which the agent's
+answer feeds) is offered and applied only when all hold:
+
+* the trade has reached +1R: the best bid since entry is at least the average entry plus the
+  setup's official R per coin (max entry minus the initial stop, ``r_per_coin``, the trade
+  plan's stop under ``CRYPTO_TRADE_PLAN_V1``);
+* the new stop is at least ``RAISE_RANGE_MULTIPLE`` (2) hourly ranges below the current bid,
+  the hourly range being the mean high-low of the coin's completed 1-hour bars of the last 24
+  hours (at least 20 of them; ``trade_plan.hourly_range``); without it no stop is raised
+  (``HOURLY_RANGE_UNAVAILABLE``);
+* no stop raise was applied to the trade in the last ``RAISE_SPACING_SECONDS`` (900; the state's
+  ``stop_raised_at``, recorded by every applied raise of a V4 trade);
+* breakeven is the entry plus round-trip fees: the average entry x (1 + f) / (1 - f) with f the
+  Alpaca tier-1 crypto taker fee (0.25%, ``pick_outcomes.TAKER_FEE_TIER1``), rounded up to the
+  grid, never the plain entry.
+
+Swing-low or breakeven options that break any of these are not offered. Targets keep V3's rules,
+except that a trade under ``CRYPTO_TRADE_PLAN_V1`` never has its target raised above the plan's
+1.5R cap (``target_cap``): such options are not offered and such a change is refused. Setups
+that recorded V1, V2 or V3 keep their rules exactly.
+
+``CRYPTO_MAINTENANCE_V5`` (package jev-b1; docs/TRADING-QUALITY-PLAN.md sections 4 and 10, B1,
+owner: "go ahead with B1") is V4 (its numbers and raise guards, which the 24-hour/window
+review's continue still applies) with Jev's role narrowed to two yes/no questions
+(``maintenance_v5``): ``invalidation_met`` (the pick's own disproof against code-computed
+observed facts) and ``news_contradicts`` (asked only about news no earlier review settled). No
+question names an action, a stop, a target or a price: maintenance under V5 never changes a
+level. Context ``JEV_MANAGED_POSITION_CONTEXT_V6`` (at most 3,072 bytes), questions
+``JEV_MANAGED_POSITION_QUESTIONS_V6``, answer rule ``MAINTENANCE_ANSWER_RULE_V3`` (p >= 0.80 yes,
+p <= 0.20 no, else uncertain; three counted yeses in a row on new completed bars confirm).
+Cadence: a routine review at every completed 15-minute bar, at once on a completed 1-hour bar,
+new agent news about the coin, or Bitcoin 3% from its price at the trade's last review; after a
+counted yes the next two completed 5-minute bars (confirm mode). The once-a-minute floor stays;
+milestone, near-target and near-stop triggers are still recorded but are not V5 review reasons.
+A confirmed invalidation raises an early-exit flag that exits when unanswered at its deadline;
+confirmed contradicting news raises one that keeps the trade when unanswered. The spend guard's
+``EXHAUSTED`` (or unavailable) tier still withholds every V5 review.
 """
 
 import threading
@@ -75,6 +116,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 
 from catalyst_lab import crypto_trigger
 from catalyst_lab.account_risk import JEV_MANAGED_ARM
+from catalyst_lab.strategies import core
 
 D = Decimal
 
@@ -95,7 +137,8 @@ V3_TIGHT_REVIEW_BAR_SECONDS = 900  # TIGHT: a review at every completed 15-minut
 MAINTENANCE_ANSWER_RULE_V2 = "MAINTENANCE_ANSWER_RULE_V2"
 CONTEXT_V5_VERSION = "JEV_MANAGED_POSITION_CONTEXT_V5"
 QUESTION_V5_VERSION = "JEV_MANAGED_POSITION_QUESTIONS_V5"
-CONTEXT_VERSIONS = (CONTEXT_VERSION, CONTEXT_V5_VERSION)
+# Every maintenance context version (the pending-request lookups); V6 is CRYPTO_MAINTENANCE_V5's.
+CONTEXT_VERSIONS = (CONTEXT_VERSION, CONTEXT_V5_VERSION, "JEV_MANAGED_POSITION_CONTEXT_V6")
 V2_REVIEW_BAR_SECONDS = 60  # A review at every completed 1-minute bar.
 BARS_1M = 60  # The last hour of 1-minute bars (context V5).
 REVIEW_HISTORY = 5  # The trade's last 5 maintenance reviews (context V5).
@@ -168,6 +211,12 @@ ANSWER_TOO_OLD = "ANSWER_TOO_OLD"
 STOP_LEVEL_CROSSED = "STOP_LEVEL_CROSSED"
 TARGET_LEVEL_CROSSED = "TARGET_LEVEL_CROSSED"
 OFF_PRICE_INCREMENT = "OFF_PRICE_INCREMENT"
+# CRYPTO_MAINTENANCE_V4's refusals (the trade keeps its levels).
+STOP_RAISE_BEFORE_1R = "STOP_RAISE_BEFORE_1R"
+STOP_INSIDE_HOURLY_RANGE = "STOP_INSIDE_HOURLY_RANGE"
+STOP_RAISE_TOO_SOON = "STOP_RAISE_TOO_SOON"
+HOURLY_RANGE_UNAVAILABLE = "HOURLY_RANGE_UNAVAILABLE"
+TARGET_ABOVE_PLAN_CAP = "TARGET_ABOVE_PLAN_CAP"
 _PRECISION = 80
 
 
@@ -272,11 +321,117 @@ _MAINTENANCE_V3_VALUES = {**_MAINTENANCE_V2_VALUES, "policy_id": MAINTENANCE_V3_
                           "throttled_review_bar_seconds": V3_THROTTLED_REVIEW_BAR_SECONDS,
                           "tight_review_bar_seconds": V3_TIGHT_REVIEW_BAR_SECONDS}
 CRYPTO_MAINTENANCE_V3 = MaintenancePolicyV3(**_MAINTENANCE_V3_VALUES)
-# The version admission records in the maintained arm (package jev-budget: V3; package
-# answer-rules recorded V2). Setups keep the version they recorded; V1's and V2's records,
-# readers, cadences and stored events are unchanged.
-ADMITTED_MAINTENANCE = CRYPTO_MAINTENANCE_V3
-MAINTENANCE_VERSIONS = (MAINTENANCE_VERSION, MAINTENANCE_V2_VERSION, MAINTENANCE_V3_VERSION)
+# CRYPTO_MAINTENANCE_V4 (package trade-plan): V3 with guarded stop raises.
+MAINTENANCE_V4_VERSION = "CRYPTO_MAINTENANCE_V4"
+RAISE_MIN_R = D(1)  # No stop raise before the trade has reached +1R.
+RAISE_RANGE_MULTIPLE = D(2)  # A raised stop at least 2 hourly ranges below the bid.
+RAISE_SPACING_SECONDS = 900  # At most one applied stop raise per 15 minutes per trade.
+BREAKEVEN_FEE_FRACTION = D("0.0025")  # pick_outcomes.TAKER_FEE_TIER1, on each leg.
+BREAKEVEN_BASIS = "ENTRY_PLUS_ROUND_TRIP_TAKER_FEES"
+STOP_RAISED_AT = "stop_raised_at"  # The state field every applied V4 stop raise records.
+
+
+@dataclass(frozen=True)
+class MaintenancePolicyV4(MaintenancePolicyV3):
+    """The exact ``CRYPTO_MAINTENANCE_V4`` record: V3's with its own ``policy_id`` and the
+    stop-raise guards (+1R first, two hourly ranges below the bid, one raise per 15 minutes,
+    breakeven after round-trip fees) and the trade plan's target cap."""
+
+    raise_min_r: str
+    raise_range_multiple: str
+    raise_spacing_seconds: int
+    breakeven_fee_fraction: str
+    breakeven_basis: str
+    target_cap: str
+
+    def __post_init__(self):
+        if asdict(self) != _MAINTENANCE_V4_VALUES:
+            raise ValueError("EXPLICIT_CRYPTO_MAINTENANCE_POLICY_REQUIRED")
+
+
+_MAINTENANCE_V4_VALUES = {**_MAINTENANCE_V3_VALUES, "policy_id": MAINTENANCE_V4_VERSION,
+                          "raise_min_r": str(RAISE_MIN_R),
+                          "raise_range_multiple": str(RAISE_RANGE_MULTIPLE),
+                          "raise_spacing_seconds": RAISE_SPACING_SECONDS,
+                          "breakeven_fee_fraction": str(BREAKEVEN_FEE_FRACTION),
+                          "breakeven_basis": BREAKEVEN_BASIS,
+                          "target_cap": "CRYPTO_TRADE_PLAN_V1_TARGET_CAP"}
+CRYPTO_MAINTENANCE_V4 = MaintenancePolicyV4(**_MAINTENANCE_V4_VALUES)
+
+# CRYPTO_MAINTENANCE_V5 (package jev-b1; docs/TRADING-QUALITY-PLAN.md sections 4 and 10, B1): V4's
+# numbers and raise guards, with two narrow yes/no questions in place of the action question
+# (``maintenance_v5``). Every name and number below is recorded in the policy record.
+MAINTENANCE_V5_VERSION = "CRYPTO_MAINTENANCE_V5"
+CONTEXT_V6_VERSION = "JEV_MANAGED_POSITION_CONTEXT_V6"
+QUESTION_V6_VERSION = "JEV_MANAGED_POSITION_QUESTIONS_V6"
+MAINTENANCE_ANSWER_RULE_V3 = "MAINTENANCE_ANSWER_RULE_V3"
+V5_REVIEW_BAR_SECONDS = 900  # A routine review at every completed 15-minute bar.
+V5_HOUR_BAR_SECONDS = 3600  # An immediate review at every completed 1-hour bar.
+V5_CONFIRM_BAR_SECONDS = 300  # Confirm mode: the next completed 5-minute bars ...
+V5_CONFIRM_BARS = 2  # ... two of them after a counted yes.
+V5_BTC_MOVE_FRACTION = D("0.03")  # Bitcoin 3% from its price at the last review.
+V5_YES_AT_OR_ABOVE = D("0.80")  # A Noul probability at or above it is YES ...
+V5_NO_AT_OR_BELOW = D("0.20")  # ... at or below it NO, in between UNCERTAIN.
+V5_CONFIRM_YES = 3  # Three counted yeses in a row confirm.
+V5_NEWS_MAX_ASKS = 3  # A news item is asked about in at most three answered reviews.
+V5_STATE_BYTE_BUDGET = 3072  # CONTEXT_V6's state budget (bytes, as sent).
+EXIT_IF_UNANSWERED, KEEP_IF_UNANSWERED = "EXIT", "KEEP"
+BAR_1H, CONFIRM_5M, BTC_MOVE = "BAR_1H", "CONFIRM_5M", "BTC_MOVE"
+
+
+@dataclass(frozen=True)
+class MaintenancePolicyV5(MaintenancePolicyV4):
+    """The exact ``CRYPTO_MAINTENANCE_V5`` record: V4's (the raise guards, the spend guard's
+    ``EXHAUSTED`` stop) with its own ``policy_id``, context ``CONTEXT_V6``, questions ``V6``,
+    ``MAINTENANCE_ANSWER_RULE_V3`` and its cadence and streak numbers. The V3 tier cadences stay
+    in the record unchanged and unused: V5 reviews on its own cadence in every tier below
+    ``EXHAUSTED``."""
+
+    hour_bar_seconds: int
+    confirm_bar_seconds: int
+    confirm_bars: int
+    btc_move_fraction: str
+    yes_at_or_above: str
+    no_at_or_below: str
+    confirm_yes: int
+    news_max_asks: int
+    state_byte_budget: int
+    invalidation_if_unanswered: str
+    news_if_unanswered: str
+
+    def __post_init__(self):
+        if asdict(self) != _MAINTENANCE_V5_VALUES:
+            raise ValueError("EXPLICIT_CRYPTO_MAINTENANCE_POLICY_REQUIRED")
+
+
+_MAINTENANCE_V5_VALUES = {**_MAINTENANCE_V4_VALUES, "policy_id": MAINTENANCE_V5_VERSION,
+                          "context_version": CONTEXT_V6_VERSION,
+                          "question_version": QUESTION_V6_VERSION,
+                          "answer_rule": MAINTENANCE_ANSWER_RULE_V3,
+                          "review_bar_seconds": V5_REVIEW_BAR_SECONDS,
+                          "hour_bar_seconds": V5_HOUR_BAR_SECONDS,
+                          "confirm_bar_seconds": V5_CONFIRM_BAR_SECONDS,
+                          "confirm_bars": V5_CONFIRM_BARS,
+                          "btc_move_fraction": str(V5_BTC_MOVE_FRACTION),
+                          "yes_at_or_above": str(V5_YES_AT_OR_ABOVE),
+                          "no_at_or_below": str(V5_NO_AT_OR_BELOW),
+                          "confirm_yes": V5_CONFIRM_YES,
+                          "news_max_asks": V5_NEWS_MAX_ASKS,
+                          "state_byte_budget": V5_STATE_BYTE_BUDGET,
+                          "invalidation_if_unanswered": EXIT_IF_UNANSWERED,
+                          "news_if_unanswered": KEEP_IF_UNANSWERED}
+CRYPTO_MAINTENANCE_V5 = MaintenancePolicyV5(**_MAINTENANCE_V5_VALUES)
+# The version admission records in the maintained arm (package jev-b1: V5; package trade-plan
+# recorded V4, package jev-budget V3, package answer-rules V2). Setups keep the version they
+# recorded; earlier records, readers, cadences and stored events are unchanged.
+ADMITTED_MAINTENANCE = CRYPTO_MAINTENANCE_V5
+MAINTENANCE_VERSIONS = (MAINTENANCE_VERSION, MAINTENANCE_V2_VERSION, MAINTENANCE_V3_VERSION,
+                        MAINTENANCE_V4_VERSION, MAINTENANCE_V5_VERSION)
+
+
+def is_v5(policy):
+    """Whether a recorded maintenance policy is ``CRYPTO_MAINTENANCE_V5``."""
+    return isinstance(policy, MaintenancePolicyV5)
 
 
 @dataclass(frozen=True)
@@ -317,10 +472,20 @@ def admission_fields(packet, arm):
 
 
 def policy_from_record(record):
-    """``CRYPTO_MAINTENANCE_V1``, ``_V2`` or ``_V3`` from its exact record (a state's
+    """``CRYPTO_MAINTENANCE_V1``, ``_V2``, ``_V3`` or ``_V4`` from its exact record (a state's
     ``maintenance_policy`` or a review context's ``policy``); anything else is refused."""
     if not isinstance(record, dict):
         raise ValueError("EXPLICIT_CRYPTO_MAINTENANCE_POLICY_REQUIRED")
+    if record.get("policy_id") == MAINTENANCE_V5_VERSION:
+        try:
+            return MaintenancePolicyV5(**record)
+        except TypeError:  # A field missing or extra: never a V5 record.
+            raise ValueError("EXPLICIT_CRYPTO_MAINTENANCE_POLICY_REQUIRED") from None
+    if record.get("policy_id") == MAINTENANCE_V4_VERSION:
+        try:
+            return MaintenancePolicyV4(**record)
+        except TypeError:  # A field missing or extra: never a V4 record.
+            raise ValueError("EXPLICIT_CRYPTO_MAINTENANCE_POLICY_REQUIRED") from None
     if record.get("policy_id") == MAINTENANCE_V3_VERSION:
         try:
             return MaintenancePolicyV3(**record)
@@ -373,7 +538,7 @@ def partial_entry_cancel_reason(*, opened_at, now, bid, ask, max_entry, stop):
         return PARTIAL_ENTRY_TIMEOUT
     if ask is not None and ask > max_entry:
         return PARTIAL_ENTRY_ABOVE_MAX_ENTRY
-    if bid is not None and bid <= stop:
+    if bid is not None and core.reaches_stop(bid, stop):
         return PARTIAL_ENTRY_AT_OR_BELOW_STOP
     return None
 
@@ -540,6 +705,111 @@ def highest(bars):
     return best
 
 
+# --- The hourly range (CRYPTO_TRADE_PLAN_V1 and CRYPTO_MAINTENANCE_V4) -------------------------
+
+HOURLY_RANGE_BASIS = "MEAN_HIGH_MINUS_LOW_OF_COMPLETED_1H_BARS_LAST_24H"
+HOURLY_RANGE_SECONDS = 86400  # The completed 1-hour bars that ended in the last 24 hours ...
+HOURLY_RANGE_BARS = 24  # ... of which there are at most 24 ...
+HOURLY_RANGE_MIN_BARS = 20  # ... and must be at least 20 (a thin coin can miss an hour).
+
+
+def hourly_range(bars_1h, now):
+    """``(range, evidence)``: the mean high minus low of the coin's completed 1-hour bars that
+    ended in the 24 hours before ``now`` (exact, 80 digits), or ``(None, evidence)`` with fewer
+    than ``HOURLY_RANGE_MIN_BARS`` of them. One bar per start; bars still forming are ignored."""
+    bars = within(completed(bars_1h, now), now, HOURLY_RANGE_SECONDS)
+    bars = [b for b in bars if (b.end_at - b.start_at).total_seconds() == 3600]
+    evidence = {
+        "basis": HOURLY_RANGE_BASIS, "as_of": now.isoformat(), "bars": len(bars),
+        "min_bars": HOURLY_RANGE_MIN_BARS,
+        "first_bar_start": bars[0].start_at.isoformat() if bars else None,
+        "last_bar_end": bars[-1].end_at.isoformat() if bars else None,
+        "hourly_range": None,
+    }
+    if len(bars) < HOURLY_RANGE_MIN_BARS:
+        return None, evidence
+    with localcontext() as context:
+        context.prec = _PRECISION
+        value = sum((number(b.high) - number(b.low) for b in bars), D(0)) / len(bars)
+    if value < 0:
+        return None, evidence
+    evidence["hourly_range"] = str(value)
+    return value, evidence
+
+
+# --- CRYPTO_MAINTENANCE_V4's stop-raise guards ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RaiseGuards:
+    """One V4 trade's guard inputs at one moment: the hourly range (None when unavailable), the
+    last applied stop raise (None before the first) and the trade plan's target cap (None
+    outside ``CRYPTO_TRADE_PLAN_V1``)."""
+
+    hourly_range: D | None
+    last_raise_at: datetime | None
+    target_cap: D | None = None
+
+    def record(self):
+        return {"hourly_range": str(self.hourly_range) if self.hourly_range is not None else None,
+                "last_stop_raise_at": self.last_raise_at.isoformat()
+                if self.last_raise_at is not None else None,
+                "target_cap": str(self.target_cap) if self.target_cap is not None else None}
+
+    @classmethod
+    def from_record(cls, record):
+        def dec(value):
+            return number(value) if value is not None else None
+        last = record.get("last_stop_raise_at")
+        return cls(dec(record.get("hourly_range")),
+                   datetime.fromisoformat(last) if last else None, dec(record.get("target_cap")))
+
+
+def raise_guards(policy, *, hourly_range, last_raise_at, target_cap=None):
+    """The guards of a ``CRYPTO_MAINTENANCE_V4`` trade; None under V1, V2 and V3 (no guard)."""
+    if not isinstance(policy, MaintenancePolicyV4):
+        return None
+    return RaiseGuards(hourly_range, last_raise_at, target_cap)
+
+
+def last_stop_raise(state):
+    """When the trade's last applied stop raise was recorded (V4's ``stop_raised_at``), or
+    None."""
+    value = (state or {}).get(STOP_RAISED_AT) if isinstance(state, dict) else None
+    return datetime.fromisoformat(value) if value else None
+
+
+def breakeven_price(entry, increment, fee_fraction=None):
+    """Breakeven rounded up to the grid: the average entry (V1-V3), or under V4 the entry plus
+    round-trip fees, entry x (1 + f) / (1 - f), so a sell there nets the buy's cost."""
+    if fee_fraction is None:
+        return ceil_grid(entry, increment)
+    with localcontext() as context:
+        context.prec = _PRECISION
+        return ceil_grid(entry * (1 + fee_fraction) / (1 - fee_fraction), increment)
+
+
+def range_floor(bid, hourly_range):
+    """The highest stop V4 allows: two hourly ranges below the bid."""
+    with localcontext() as context:
+        context.prec = _PRECISION
+        return bid - RAISE_RANGE_MULTIPLE * hourly_range
+
+
+def stop_raise_refusal(guards, *, best_bid, entry, risk, now):
+    """Why V4 allows no stop raise at all now (before any price is looked at), or None."""
+    with localcontext() as context:
+        context.prec = _PRECISION
+        if risk <= 0 or best_bid is None or best_bid < entry + RAISE_MIN_R * risk:
+            return STOP_RAISE_BEFORE_1R
+    if guards.last_raise_at is not None and (
+            (now - guards.last_raise_at).total_seconds() < RAISE_SPACING_SECONDS):
+        return STOP_RAISE_TOO_SOON
+    if guards.hourly_range is None:
+        return HOURLY_RANGE_UNAVAILABLE
+    return None
+
+
 # --- Options (code computes; Jev only chooses) ---------------------------------------------------
 
 
@@ -571,7 +841,8 @@ def _merge(candidates, price, basis, bar):
     candidates[price] = (bases, bar_end, sources)
 
 
-def stop_options(*, bars_15m, bars_1h, now, bid, entry, current_stop, best_bid, risk, increment):
+def stop_options(*, bars_15m, bars_1h, now, bid, entry, current_stop, best_bid, risk, increment,
+                 guards=None):
     """At most five stop options, highest first (``S1``...).
 
     Breakeven (the average entry rounded up to the increment) once the best bid since entry has
@@ -579,16 +850,31 @@ def stop_options(*, bars_15m, bars_1h, now, bid, entry, current_stop, best_bid, 
     apply rule); the 15-minute swing lows of the last 24 hours and the 1-hour swing lows of the
     last 72 hours, rounded down to the increment, above the current stop and at least 1% below
     the bid. Breakeven always keeps its place; the remaining places go to the highest swing lows.
+
+    ``guards`` (``CRYPTO_MAINTENANCE_V4``, ``raise_guards``): no option at all before +1R, within
+    15 minutes of the last applied raise or without the hourly range; breakeven is the entry
+    plus round-trip fees; and no option above two hourly ranges below the bid.
     """
     candidates = {}
     breakeven = None
+    ceiling = None
+    if guards is not None:
+        if stop_raise_refusal(guards, best_bid=best_bid, entry=entry, risk=risk, now=now):
+            return []
+        ceiling = range_floor(bid, guards.hourly_range)
+
+    def allowed(price):
+        return ceiling is None or price <= ceiling
+
     if risk > 0 and best_bid is not None and best_bid >= entry + risk:
-        price = ceil_grid(entry, increment)
+        price = breakeven_price(entry, increment,
+                                BREAKEVEN_FEE_FRACTION if guards is not None else None)
         with localcontext() as context:
             context.prec = _PRECISION
-            if current_stop < price <= bid * (1 - STOP_BID_MARGIN):
+            if current_stop < price <= bid * (1 - STOP_BID_MARGIN) and allowed(price):
                 breakeven = price
-                _merge(candidates, price, "BREAKEVEN", None)
+                _merge(candidates, price,
+                       "BREAKEVEN" if guards is None else "BREAKEVEN_AFTER_FEES", None)
     for bars, seconds, basis in (
         (bars_15m, SWING_LOW_15M_SECONDS, "SWING_LOW_15M"),
         (bars_1h, SWING_LOW_1H_SECONDS, "SWING_LOW_1H"),
@@ -597,7 +883,7 @@ def stop_options(*, bars_15m, bars_1h, now, bid, entry, current_stop, best_bid, 
             price = floor_grid(bar.low, increment)
             with localcontext() as context:
                 context.prec = _PRECISION
-                if current_stop < price <= bid * (1 - SWING_LOW_PRICE_MARGIN):
+                if current_stop < price <= bid * (1 - SWING_LOW_PRICE_MARGIN) and allowed(price):
                     _merge(candidates, price, basis, bar)
     chosen = [breakeven] if breakeven is not None else []
     for price in sorted(candidates, reverse=True):
@@ -611,19 +897,22 @@ def stop_options(*, bars_15m, bars_1h, now, bid, entry, current_stop, best_bid, 
     ]
 
 
-def target_options(*, bars_15m, bars_1h, now, bid, current_target, increment):
+def target_options(*, bars_15m, bars_1h, now, bid, current_target, increment, target_cap=None):
     """At most five target options, nearest first (``T1``...).
 
     The 1-hour and 4-hour swing highs of the last 7 days (4-hour bars aggregated from the
     1-hour bars), the 24-hour high and the 7-day high, each rounded up to the increment and
     above the current target and the bid. The 24-hour and 7-day highs always keep their
     places; the remaining places go to the swing highs nearest above the current target.
+    ``target_cap`` (``CRYPTO_MAINTENANCE_V4`` on a ``CRYPTO_TRADE_PLAN_V1`` trade): nothing above
+    the plan's 1.5R cap is offered.
     """
     bars_15m, bars_1h = completed(bars_15m, now), completed(bars_1h, now)
     candidates, fixed = {}, []
 
     def eligible(price):
-        return price > current_target and price > bid
+        return price > current_target and price > bid and (
+            target_cap is None or price <= target_cap)
 
     for label, source, seconds in (
         ("HIGH_24H", bars_15m + bars_1h, HIGH_24H_SECONDS),
@@ -659,11 +948,17 @@ def target_options(*, bars_15m, bars_1h, now, bid, current_target, increment):
 
 
 def check_change(*, old_stop, new_stop, old_target, new_target, bid, min_bid, max_bid,
-                 answered_at, now, increment):
+                 answered_at, now, increment, guards=None, best_bid=None, entry=None,
+                 risk=None):
     """The first refusal code of one proposed change, or None when it may be applied.
 
     ``min_bid``/``max_bid`` are the lowest and highest bids seen since the review was requested
     (the current bid included); ``new_stop``/``new_target`` are None when unchanged.
+
+    ``guards`` (``CRYPTO_MAINTENANCE_V4``; None for V1-V3, whose checks are unchanged): after
+    V3's checks, a new stop is refused before +1R (``best_bid`` against ``entry`` plus
+    ``risk``), within 15 minutes of the last applied raise, without the hourly range, or above
+    two hourly ranges below the bid; a new target above the trade plan's cap is refused.
     """
     age = (now - answered_at).total_seconds()
     if not 0 <= age < ANSWER_MAX_AGE_SECONDS:
@@ -680,6 +975,13 @@ def check_change(*, old_stop, new_stop, old_target, new_target, bid, min_bid, ma
                 return STOP_LEVEL_CROSSED
             if new_stop > bid * (1 - STOP_BID_MARGIN):
                 return STOP_TOO_CLOSE_TO_BID
+            if guards is not None:
+                refusal = stop_raise_refusal(guards, best_bid=best_bid, entry=entry, risk=risk,
+                                             now=now)
+                if refusal is not None:
+                    return refusal
+                if new_stop > range_floor(bid, guards.hourly_range):
+                    return STOP_INSIDE_HOURLY_RANGE
         if new_target is not None:
             if new_target <= bid:
                 return TARGET_NOT_ABOVE_PRICE
@@ -687,6 +989,9 @@ def check_change(*, old_stop, new_stop, old_target, new_target, bid, min_bid, ma
                 return TARGET_NOT_ABOVE_CURRENT
             if max_bid >= new_target:
                 return TARGET_LEVEL_CROSSED
+            if guards is not None and guards.target_cap is not None \
+                    and new_target > guards.target_cap:
+                return TARGET_ABOVE_PLAN_CAP
     return None
 
 
@@ -760,6 +1065,7 @@ class BenchmarkWindow:
         self.symbol, self.window_seconds, self.threshold = symbol, window_seconds, threshold
         self._seconds = deque()  # [second, low, high, last, last_at]
         self._since = None
+        self._last = None  # CRYPTO_MAINTENANCE_V5: the latest price and its time, kept by shocks.
         self._lock = threading.Lock()
 
     def observe(self, price, at):
@@ -768,6 +1074,8 @@ class BenchmarkWindow:
             return
         second = at.astimezone(UTC).replace(microsecond=0)
         with self._lock:
+            if self._last is None or at >= self._last[1]:
+                self._last = (price, at)
             if self._since is not None and at <= self._since:
                 return
             if self._seconds and self._seconds[-1][0] == second:
@@ -782,6 +1090,14 @@ class BenchmarkWindow:
         with self._lock:
             self._seconds.clear()
             self._since = at
+            self._last = None  # A gap: the last price is no longer current.
+
+    def latest(self):
+        """``(price, at)``: the latest Bitcoin price observed (a quote mid or a print) and its
+        time, or None (``CRYPTO_MAINTENANCE_V5``'s 3% move since a trade's last review). A shock
+        restarts the window but keeps this; a market gap or restart clears it."""
+        with self._lock:
+            return self._last
 
     def samples(self):
         with self._lock:

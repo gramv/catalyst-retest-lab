@@ -1,0 +1,14 @@
+# The local Docker stack's build context (Dockerfile.local): an allowlist.
+*
+!src/
+!src/**
+!deploy/requirements.managed.txt
+!deploy/local/
+!deploy/local/**
+!examples/
+!examples/**
+# Never in any image, whatever an exception above admits.
+**/.env
+**/.env.*
+**/__pycache__
+**/*.pyc

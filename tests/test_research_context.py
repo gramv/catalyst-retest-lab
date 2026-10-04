@@ -249,11 +249,12 @@ def test_ops_lists_the_optional_schedule_and_preflight_validates_it(tmp_path):
     assert name in ENV_NAMES and name in OPTIONAL_ENV and name not in REQUIRED_ENV
     config = private_example(tmp_path)
     env = config["environment"]
-    # The deployed schedule: one 08:00 run a day again from 2026-09-29, its picks live about
-    # 24 hours (owner, 2026-09-28 evening: the interim until the research loop's 2-hourly
-    # updates; every 2 hours ran 2026-09-28). The code's default (SCHEDULE) is the same value.
+    # The deployed schedule from 2026-09-29: RESEARCH_SCHEDULE_V2, the 08:00 daily run and an
+    # update run at every other even hour, every pick live until the next daily run (the
+    # research loop, docs/RESEARCH-LOOP-V2.md; every 2 hours, all full runs, ran 2026-09-28).
+    # The code's default (SCHEDULE) stays the daily run alone.
     assert ResearchSchedule.from_json(env[name]) == ResearchSchedule(
-        "America/New_York", ("08:00",), 60)
+        "America/New_York", tuple(f"{hour:02d}:00" for hour in range(0, 24, 2)), 60, "08:00")
     assert SCHEDULE == ResearchSchedule("America/New_York", ("08:00",), 60)
     assert env["MANAGED_REPORT_MAX_SECONDS"] == "86400"
     assert name not in preflight(config, ROOT)["invalid_configuration_names"]
@@ -408,6 +409,12 @@ def silent_cycle(repo, clock):
     return ResearchCycle(repo, reviewer, CyclePolicy(10, 10, 15, 60, 30), clock=clock)
 
 
+# The top-level keys RESEARCH_CONTEXT_V2 served, in order (``watching_setups`` joins in V3).
+V2_CONTEXT_KEYS = ["context_version", "as_of", "caller", "schedule", "report_format", "universe",
+                   "open_trades", "pending_reviews", "recent_outcomes", "lessons",
+                   "trade_authorized"]
+
+
 def test_context_lists_the_tradable_universe_with_market_data_and_sources(context_lab):
     lab = context_lab
     web = context_client(silent_cycle(lab.repo, lambda: lab.now[0]),
@@ -415,8 +422,11 @@ def test_context_lists_the_tradable_universe_with_market_data_and_sources(contex
     reply = web.get(ROUTE, headers=bearer(AGENTS["claude"]))
     assert reply.status_code == 200
     body = reply.json()
-    # RESEARCH_CONTEXT_V2 from package learning-app: V1's fields plus the caller's lessons.
-    assert body["context_version"] == "RESEARCH_CONTEXT_V2" and body["as_of"] == T0.isoformat()
+    # RESEARCH_CONTEXT_V2 from package learning-app: V1's fields plus the caller's lessons;
+    # RESEARCH_CONTEXT_V3 from package research-loop-app: V2's plus ``watching_setups``.
+    assert body["context_version"] == "RESEARCH_CONTEXT_V3" and body["as_of"] == T0.isoformat()
+    assert list(body) == V2_CONTEXT_KEYS[:7] + ["watching_setups"] + V2_CONTEXT_KEYS[7:]
+    assert body["watching_setups"] == []
     assert body["lessons"]["agent_id"] == "claude" and body["lessons"]["windows"] is None
     assert body["caller"] == {"role": "muse", "agent_id": "claude"}
     assert body["trade_authorized"] is False and body["pending_reviews"] == []
@@ -445,10 +455,12 @@ def test_context_lists_the_tradable_universe_with_market_data_and_sources(contex
     assert sources["volume_24h"]["window_end"] == "2026-09-26T12:00:00+00:00"
     assert sources["volume_24h"]["available"] is True
     assert "Fixture Asset Name" not in reply.text and "fixture-asset-id" not in reply.text
-    schedule = body["schedule"]
-    assert schedule["current_run_slot"] == "2026-09-26T08:00:00-04:00"
-    assert schedule["current_run_valid_until_limit"] == "2026-09-27T09:00:00-04:00"
-    assert schedule["next_runs"] == ["2026-09-27T08:00:00-04:00"]
+    # Under RESEARCH_SCHEDULE_V1 the schedule block is exactly what V2 served, keys in order.
+    assert json.dumps(body["schedule"]) == json.dumps({
+        "version": "RESEARCH_SCHEDULE_V1", "timezone": "America/New_York", "runs": ["08:00"],
+        "grace_minutes": 60, "current_run_slot": "2026-09-26T08:00:00-04:00",
+        "current_run_valid_until_limit": "2026-09-27T09:00:00-04:00",
+        "next_runs": ["2026-09-27T08:00:00-04:00"]})
     assert body["report_format"]["schema_version"] == REPORT_SCHEMA_V3
     assert body["report_format"]["picks_target"] == 20
     assert body["report_format"]["max_report_age_seconds"] == 60
@@ -653,6 +665,79 @@ def test_last_run_statuses_cover_intake_refusals_and_pending_reviews(mx):
         ("AAA/USD", "AWAITING_REVIEW", None),
         ("USDT/USD", "REJECTED_AT_INTAKE", "SYMBOL_NOT_IN_UNIVERSE")]
     assert run["run_slot"] == raw["run_slot"] and run["submitted_count"] == 2
+
+
+# --- RESEARCH_CONTEXT_V3: watching setups and the V2 schedule (package research-loop-app) --------
+
+def test_watching_setups_are_the_callers_own_v3_setups_still_watching(mx):
+    from tests.test_system_check import at_price, publish_v3, two_slots, v3_pick
+
+    engine, venue, _ = mx
+    old, _ = two_slots(venue.now)
+    live = at_price("100.49", "100.51", at=venue.now)
+    mine = publish_v3(mx, [v3_pick(i, s, venue.now) for i, s in enumerate(
+        ("ZZZ/USD", "AAA/USD", "BBB/USD", "CCC/USD"))], run_slot=old)
+    theirs = publish_v3(mx, [v3_pick(0, "DDD/USD", venue.now)], run_slot=old,
+                        agent_id="instinct")
+    watching = {s: engine.admit(mine[s], live_quote=live) for s in ("ZZZ/USD", "AAA/USD")}
+    trade = engine.admit(mine["BBB/USD"], live_quote=live)  # Filled below: no longer watching.
+    touch = observation(mx, trade_price="100", bid="99.99", ask="100.01")
+    assert engine.observe_trigger(trade, touch)["outcome"] == "APPROVED"
+    entry = next(o for o in venue.orders_of("buy") if o["symbol"] == "BBB/USD")
+    engine.ingest(venue.fill(entry["id"], entry["qty"]))
+    engine.manage(trade, observation(mx))
+    other = engine.admit(theirs["DDD/USD"], live_quote=live)
+    now = [venue.now]
+    service, _ = service_for(engine.repo, lambda: now[0], Feeds(lambda: now[0]))
+
+    def context(role="muse", agent_id="claude", legacy=False):
+        return service.context(SimpleNamespace(role=role, agent_id=agent_id, legacy=legacy))
+
+    mine_now = context()
+    rows = mine_now["watching_setups"]
+    # By symbol; CCC was selected but never admitted, BBB has left WATCHING.
+    assert [(row["symbol"], row["setup_id"]) for row in rows] == [
+        ("AAA/USD", str(watching["AAA/USD"])), ("ZZZ/USD", str(watching["ZZZ/USD"]))]
+    aaa = rows[0]
+    assert list(aaa) == ["setup_id", "symbol", "levels", "run_slot", "expires_at", "signal_id"]
+    assert aaa["levels"] == {"entry_trigger": "100", "max_entry_price": "100.10", "stop": "95",
+                             "target": "111"}
+    assert aaa["run_slot"] == SCHEDULE.local(old).isoformat()  # New York, as the schedule.
+    assert datetime.fromisoformat(aaa["expires_at"]) == datetime.fromisoformat(
+        mine["AAA/USD"]["expires_at"])
+    assert aaa["signal_id"] == mine["AAA/USD"]["signal_id"]
+    assert [t["setup_id"] for t in mine_now["open_trades"]] == [str(trade)]
+    assert [row["setup_id"] for row in context(agent_id="instinct")["watching_setups"]] == [
+        str(other)]
+    assert context(agent_id="muse", legacy=True)["watching_setups"] == []
+    assert context(role="status", agent_id=None)["watching_setups"] == []
+    # Without a configured schedule the run slot reads as the report recorded it.
+    service.schedule = None
+    assert context()["watching_setups"][0]["run_slot"] == mine["AAA/USD"]["run_slot"]
+
+
+def test_a_v2_schedule_adds_the_daily_run_and_the_kind_of_each_run(context_lab):
+    lab = context_lab
+    loop = ResearchSchedule("America/New_York", tuple(f"{h:02d}:00" for h in range(0, 24, 2)),
+                            60, daily="08:00")
+    service, _ = service_for(lab.repo, lambda: lab.now[0], lab.feeds, schedule=loop)
+    body = service.context(SimpleNamespace(role="muse", agent_id="claude", legacy=False))
+    assert body["context_version"] == "RESEARCH_CONTEXT_V3"
+    later = [f"2026-09-26T{h:02d}:00:00-04:00" for h in range(10, 24, 2)] + [
+        f"2026-09-27T{h:02d}:00:00-04:00" for h in range(0, 10, 2)]
+    # T0 is 08:30 in New York: the current run is the daily one, valid until the next one.
+    assert json.dumps(body["schedule"]) == json.dumps({
+        "version": "RESEARCH_SCHEDULE_V2", "timezone": "America/New_York",
+        "runs": list(loop.runs), "grace_minutes": 60, "daily": "08:00",
+        "current_run_slot": "2026-09-26T08:00:00-04:00", "current_run_kind": "FULL",
+        "current_run_valid_until_limit": "2026-09-27T09:00:00-04:00",
+        "next_runs": later, "next_run_kinds": ["UPDATE"] * 11 + ["FULL"]})
+    lab.now[0] = T0 + timedelta(hours=2)  # 10:30: an update run, still valid until 09:00.
+    schedule = service.context(SimpleNamespace(role="status", agent_id=None, legacy=False))[
+        "schedule"]
+    assert (schedule["current_run_slot"], schedule["current_run_kind"],
+            schedule["current_run_valid_until_limit"]) == (
+        "2026-09-26T10:00:00-04:00", "UPDATE", "2026-09-27T09:00:00-04:00")
 
 
 # --- Application wiring ---------------------------------------------------------------------------

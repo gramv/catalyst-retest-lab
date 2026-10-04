@@ -47,6 +47,7 @@ keeps the rule its RESEARCH_STARTED records. Admission SQL for V2: migration 023
 from dataclasses import dataclass
 from decimal import Decimal
 
+from catalyst_lab import research_selection_topk_v3 as v3
 from catalyst_lab.jev_contract import (
     BOTH_PICK_QUESTIONS,
     BOTH_PICK_QUESTIONS_V2,
@@ -79,7 +80,11 @@ from catalyst_lab.research_selection_b1 import (
 
 TOPK_POLICY = "JEV_TOP_K_SELECTION_V1"
 TOPK_POLICY_V2 = "JEV_TOP_K_SELECTION_V2"
-TOPK_POLICIES = frozenset({TOPK_POLICY, TOPK_POLICY_V2})
+# JEV_TOP_K_SELECTION_V3 (package jev-b2, 2026-10-03): research_selection_topk_v3. Its cycles share
+# the top-K publication, replacement and admission-decline paths; their reviews, ranking and
+# admission SQL branch (migration 030) are V3's own.
+TOPK_POLICY_V3 = v3.POLICY
+TOPK_POLICIES = frozenset({TOPK_POLICY, TOPK_POLICY_V2, TOPK_POLICY_V3})
 # V2 only: a veto label vetoes at this probability or above; below it is uncertain _UNSURE.
 VETO_MIN_PROBABILITY = Decimal("0.70")
 UNSURE_SUFFIX = "_UNSURE"
@@ -113,6 +118,12 @@ SQL_REFUSALS = ("TOPK_VETOED", "TOPK_SCORE_MISMATCH", "TOPK_RANKING_BINDING_FAIL
 # top-K pick declined at admission is replaced by the cycle's next-ranked pick that
 # ``ResearchCycle.publish_ranked`` accepts; one RESEARCH_REPLACEMENT records each decision.
 REPLACEMENT_RULE = "TOPK_REPLACEMENT_V1"
+# TOPK_REPLACEMENT_V2 (owner, 2026-09-29; docs/CONTRACT-RESOLUTIONS.md): for a cycle accepted
+# under RESEARCH_SCHEDULE_V2, V1's decision until the next daily (full) run is published
+# instead of the next run; an entry whose coin a later update run already selected is passed
+# over (SELECTED_BY_LATER_RUN), since that newer pick supersedes this run's.
+REPLACEMENT_RULE_V2 = "TOPK_REPLACEMENT_V2"
+SELECTED_BY_LATER_RUN = "SELECTED_BY_LATER_RUN"
 REPLACEMENT_KIND = "RESEARCH_REPLACEMENT"
 REPLACEMENT_PUBLISHED, REPLACEMENT_EXHAUSTED = "PUBLISHED", "EXHAUSTED"
 RANKING_EXHAUSTED = "TOPK_RANKING_EXHAUSTED"
@@ -120,6 +131,14 @@ RANKING_EXHAUSTED = "TOPK_RANKING_EXHAUSTED"
 # entry. Every other refusal is about the cycle, not the entry, and stops the decision.
 PASSED_OVER_REFUSALS = frozenset({"TOPK_ENTRY_SKIPPED", DUPLICATE_SYMBOL_IN_RUN, "REVIEW_EXPIRED",
                                   "TOPK_RANKING_BINDING_FAILURE"})
+# RESEARCH_REVIEW_BREAKER_GATE_V1 (owner, 2026-09-29; docs/CONTRACT-RESOLUTIONS.md): the research
+# pass starts a top-K pick's review (its kind review or its QUALITY_V3 review) only while the Jev
+# circuit breaker it shares with the trade reviews is CLOSED. While it is OPEN or HALF_OPEN the
+# pick waits, within its ranking deadline, and one RESEARCH_REVIEWS_DEFERRED per cycle and
+# breaker opening records how many picks wait. Both top-K versions, their question sets, the
+# ranking and publication are otherwise unchanged; V2, B1 and B2 cycles are not gated.
+REVIEW_GATE = "RESEARCH_REVIEW_BREAKER_GATE_V1"
+DEFERRED_KIND = "RESEARCH_REVIEWS_DEFERRED"
 
 QUESTION_SETS = {"NEWS": NEWS_PICK_QUESTIONS, "CHART": CHART_PICK_QUESTIONS,
                  "BOTH": BOTH_PICK_QUESTIONS}
@@ -171,8 +190,13 @@ CATEGORY_ORDER = {None: 0, **{category: index + 1
 
 
 def is_topk_policy(policy):
-    """True for either top-K version's policy name."""
+    """True for any top-K version's policy name."""
     return policy in TOPK_POLICIES
+
+
+def is_v3(policy):
+    """True for JEV_TOP_K_SELECTION_V3 (its own reviews, ranking and SQL branch)."""
+    return policy == TOPK_POLICY_V3
 
 
 def _policy_sets(policy):
@@ -213,6 +237,8 @@ class TopKRule:
     @property
     def veto_min_probability(self):
         """V2's 0.70; None under V1 (the unique most probable veto label is enough)."""
+        if is_v3(self.policy):
+            return v3.VETO_AT
         return VETO_THRESHOLDS[self.policy]
 
     # The attributes research_cycle reads from a SelectionRule: top-K has no floor.
@@ -245,8 +271,8 @@ def k_from_json(text):
 
 
 def selection_rule_from_env(environ):
-    """``MANAGED_SELECTION_RULE`` = ``JEV_TOP_K_SELECTION_V1`` or ``JEV_TOP_K_SELECTION_V2``
-    gives that top-K rule with K from ``MANAGED_TOPK_SELECTION_JSON`` (default 10) and refuses a
+    """``MANAGED_SELECTION_RULE`` = ``JEV_TOP_K_SELECTION_V1``, ``_V2`` or ``_V3`` gives
+    that top-K rule with K from ``MANAGED_TOPK_SELECTION_JSON`` (default 10) and refuses a
     quality floor; every other value is read by the V2/B1/B2 function, unchanged. K is
     validated whenever it is present and applies only to top-K, so the deploy example can carry
     it while the rule is the owner's.
@@ -270,6 +296,15 @@ def activation_body(rule, *, runtime_id):
     """The audited startup record admission SQL requires before a top-K cycle."""
     if not is_topk(rule):
         raise ValueError("TOPK_ACTIVATION_ONLY")
+    if is_v3(rule.policy):
+        return {
+            "selection_policy": rule.policy,
+            "k": rule.k,
+            "question_sets": v3.question_set_versions(),
+            **v3.thresholds(),
+            "runtime_id": str(runtime_id),
+            "source": "OWNER_CONFIGURATION_" + RULE_ENV,
+        }
     return {
         "selection_policy": rule.policy,
         "k": rule.k,
@@ -286,6 +321,15 @@ def activation_body(rule, *, runtime_id):
 
 def started_rule(rule, activation):
     """RESEARCH_STARTED's ``selection_rule`` block: the cycle's rule for its whole life."""
+    if is_v3(rule.policy):
+        return {
+            "selection_policy": rule.policy,
+            "k": rule.k,
+            "question_sets": v3.question_set_versions(),
+            **v3.thresholds(),
+            "activation_event_id": str(activation["event_id"]),
+            "activation_event_seq": activation["event_seq"],
+        }
     return {
         "selection_policy": rule.policy,
         "k": rule.k,
@@ -301,6 +345,12 @@ def stored_rule(stored):
     """The TopKRule of a stored ``selection_rule`` block, or SELECTION_RULE_UNAVAILABLE."""
     try:
         policy = stored.get("selection_policy") if isinstance(stored, dict) else None
+        if is_v3(policy):
+            if stored.get("question_sets") != v3.question_set_versions() or any(
+                stored.get(key) != value for key, value in v3.thresholds().items()
+            ):
+                raise ValueError
+            return TopKRule(policy, stored.get("k"))
         if (
             policy not in TOPK_POLICIES
             or stored.get("quality_policy") != QUALITY_V3_POLICY
@@ -589,4 +639,32 @@ def selected_fields(entry, ranking, *, k, agent_rank, quality_receipt_ids, repla
         "ranking_event_seq": ranking["event_seq"],
         "k": k,
         "replacement_for": replacement_for,
+    }
+
+
+# --- Waiting for a closed breaker (RESEARCH_REVIEW_BREAKER_GATE_V1) ----------------------------
+
+
+def deferral_key_for(cycle_id, scope_id, epoch):
+    """A cycle's one RESEARCH_REVIEWS_DEFERRED per breaker opening. The breaker belongs to one
+    review runtime scope, and its ``epoch`` goes up each time it opens (after the failures that
+    trip it, or after a failed or expired recovery probe); HALF_OPEN keeps the epoch."""
+    return f"research:{cycle_id}:reviews-deferred:{scope_id}:{epoch}"
+
+
+def deferral_body(*, cycle_id, breaker, scope_id, review_policy, waiting_picks, review_deadline):
+    """RESEARCH_REVIEWS_DEFERRED: the breaker as the research pass read it (``state``, ``epoch``,
+    ``blocked_until``), its scope and review policy, the number of the cycle's picks still
+    waiting for a review, and the earliest of their ranking deadlines (a pick not reviewed by its
+    deadline is ranked NOT_RANKED ``REVIEW_DEADLINE_PASSED``, as before)."""
+    return {
+        "cycle_id": str(cycle_id),
+        "gate": REVIEW_GATE,
+        "breaker_state": breaker["state"],
+        "breaker_epoch": breaker["epoch"],
+        "blocked_until": breaker.get("blocked_until"),
+        "runtime_scope": scope_id,
+        "review_policy": review_policy,
+        "waiting_picks": waiting_picks,
+        "review_deadline": review_deadline,
     }

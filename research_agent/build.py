@@ -39,9 +39,12 @@ from uuid import uuid4
 
 from catalyst_lab.agent_identity import AGENT_ID, AGENT_VERSION
 from catalyst_lab.research_dossier_v3 import compile_pick_dossier
+from catalyst_lab.research_evidence import rationale_reference_errors
 from catalyst_lab.research_report_v3 import MAX_PICKS, REPORT_SCHEMA_V3, _parse_pick
 from catalyst_lab.research_schedule import ResearchSchedule
 from research_agent import context as context_module
+from research_agent import derivatives as derivatives_module
+from research_agent import evidence as evidence_module
 from research_agent import lessons, levels, sources
 from research_agent.market import TIMEFRAMES
 
@@ -54,6 +57,107 @@ DEFAULT_VALIDITY = timedelta(hours=23, minutes=50)
 # Written into the run folder by `build --session` (see run.py); its presence is what
 # this package's own `submit` checks to refuse sending a session-only report to a live app.
 SESSION_MARKER_FILENAME = "SESSION_ONLY"
+OPEN_TRADE_SKIP_REASON = "A trade on this coin is open; its own review decides it."
+EXCLUDED_SKIP_REASON = "Left out by the operator's evidence filter (--exclude)."
+
+
+# The operator's evidence filter (owner direction 2026-10-02: no new pick without solid
+# evidence). ``exclude``: coins never offered as new picks, e.g. the coins that never filled on
+# Alpaca paper (POL, LDO and WIF to 2026-10-02). ``max_entry_distance``: a new pick whose
+# maximum entry sits further under the live Alpaca mid than this fraction is left out (far
+# entries rarely trigger: 7% of picks 3%+ away, against 57% within 2%, 2026-09-27 to 10-01).
+# Neither applies to ``first_coins`` (an update's adjusted picks: setups the agent already
+# holds). Both are recorded in the report's ``skipped`` rows and the update's ``left_out``.
+@dataclass(frozen=True)
+class EvidenceFilter:
+    exclude: frozenset = frozenset()
+    max_entry_distance: Decimal | None = None
+    # Method v8 (``research_agent/evidence.py``), each optional and for new picks only:
+    # the coin's Alpaca 24-hour USD volume must reach this unless the agent filled a trade of
+    # it in the context's window; the live mid may sit at most this far under the coin's
+    # 20-day average (a fraction; 0 = at or above it); a market-wide drop of at least this
+    # much over two hours (the median coin or BTC) leaves every new coin out of this run.
+    min_alpaca_volume_usd: Decimal | None = None
+    trend_floor: Decimal | None = None
+    selloff: Decimal | None = None
+
+    @staticmethod
+    def parse_exclude(text):
+        """``"pol, ldo,WIF"`` -> ``frozenset({"POL", "LDO", "WIF"})``; blank -> empty."""
+        coins = frozenset(part.strip().upper() for part in (text or "").split(",")
+                          if part.strip())
+        if any(not coin.isalnum() for coin in coins):
+            raise ValueError("EXCLUDE_COINS_INVALID")
+        return coins
+
+    @staticmethod
+    def _percent(text, *, lowest, highest, code):
+        try:
+            pct = Decimal(str(text).strip())
+        except (ArithmeticError, ValueError):
+            raise ValueError(code) from None
+        if not pct.is_finite() or not lowest <= pct <= highest:
+            raise ValueError(code)
+        return pct / 100
+
+    @classmethod
+    def parse_distance_pct(cls, text):
+        """``"2.5"`` (a percent) -> ``Decimal("0.025")``; refuses anything but 0 < x <= 50."""
+        value = cls._percent(text, lowest=Decimal("0"), highest=Decimal(50),
+                             code="MAX_ENTRY_DISTANCE_INVALID")
+        if value == 0:
+            raise ValueError("MAX_ENTRY_DISTANCE_INVALID")
+        return value
+
+    @classmethod
+    def parse_trend_floor_pct(cls, text):
+        """``"-2"`` (a percent, −50..50) -> ``Decimal("-0.02")``: how far under its 20-day
+        average a coin may trade (0: at or above it)."""
+        return cls._percent(text, lowest=Decimal(-50), highest=Decimal(50),
+                            code="TREND_FLOOR_INVALID")
+
+    @classmethod
+    def parse_selloff_pct(cls, text):
+        """``"2"`` (a percent, 0 < x <= 50) -> ``Decimal("0.02")``: the two-hour drop that
+        counts as a sell-off."""
+        value = cls._percent(text, lowest=Decimal(0), highest=Decimal(50),
+                             code="SELLOFF_INVALID")
+        if value == 0:
+            raise ValueError("SELLOFF_INVALID")
+        return value
+
+    @staticmethod
+    def parse_usd(text):
+        """``"5000"`` -> ``Decimal("5000")``; refuses a negative or non-numeric amount."""
+        try:
+            amount = Decimal(str(text).strip().replace(",", ""))
+        except (ArithmeticError, ValueError):
+            raise ValueError("MIN_ALPACA_VOLUME_INVALID") from None
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("MIN_ALPACA_VOLUME_INVALID")
+        return amount
+
+    def distance_reason(self, distance):
+        return (f"Entry {distance * 100:.2f}% under the price; the operator's evidence limit "
+                f"is {self.max_entry_distance * 100:.2f}% (--max-entry-distance-pct).")
+
+    def volume_reason(self, volume, window):
+        figure = f"${volume:,.0f}" if volume is not None else "unknown"
+        days = f" in the last {window} days" if window else ""
+        return (f"Alpaca 24 h volume {figure} is under the evidence minimum "
+                f"${self.min_alpaca_volume_usd:,.0f} and the agent has no fill on Alpaca{days}.")
+
+    def trend_reason(self, trend):
+        if trend is None:
+            return "No 20 completed daily bars to judge the trend against its 20-day average."
+        return (f"{trend * 100:+.1f}% vs its 20-day average: a pullback in a downtrend "
+                f"(the evidence floor is {self.trend_floor * 100:+.1f}%).")
+
+    def selloff_reason(self, state):
+        median, btc = state.get("median_2h"), state.get("btc_2h")
+        return (f"Sell-off in progress: the median coin {evidence_module.pct(median, 2)} and BTC "
+                f"{evidence_module.pct(btc, 2)} in 2 h (limit -{self.selloff * 100:.2f}%); "
+                "no new picks this run.")
 # The guidelines the live research context serves from package learning-app (391a720): V5 byte
 # for byte, then the learning loop. A live run declares whatever the context's report_format
 # names; only a context without one (session mode) falls back to these, pinned here because
@@ -258,11 +362,13 @@ def _stop_basis(setup, timeframe_word):
 
 
 def build_pick(*, coin, symbol, setup, agent_mid, agent_price_at, coinbase_ticker,
-               market_retrieved_at, news, now, signal_id=None, lesson_note=None):
+               market_retrieved_at, news, now, signal_id=None, lesson_note=None,
+               evidence_note=None):
     """One ``AgentPick``-shaped dict (``catalyst_lab.research_report_v3.AgentPick``),
     not yet checked against the app's models — ``build_report`` does that next.
     ``lesson_note`` (``lessons.lesson_sentence``) is added to ``why_over_peers`` when a lesson
-    ranked this pick early (guidelines V6: name the lesson behind a choice)."""
+    ranked this pick early (guidelines V6: name the lesson behind a choice); ``evidence_note``
+    (``evidence.sentence``: trend, volume, fills, market) is added to ``why_now``."""
     timeframe_word = TIMEFRAME_WORDS[setup.timeframe]
     entry_bar = setup.bars[setup.entry_index]
     stop_bar = setup.bars[setup.stop_index]
@@ -335,6 +441,7 @@ def build_pick(*, coin, symbol, setup, agent_mid, agent_price_at, coinbase_ticke
         (f"Price is {below_pct:.1f}% above a {timeframe_word} low that has held since "
          f"{_when(entry_bar.started_at)}; a pullback of that size fits the report's "
          "validity window."),
+        evidence_note,
     ]))[:600]
 
     why_these_levels = (
@@ -462,6 +569,7 @@ class BuildResult:
     skipped: tuple  # {"symbol", "reason"} — coins with no qualifying setup
     notes: tuple  # free-form strings (dropped news items, etc.) for the run summary
     lessons: dict | None = None  # the emphasis applied, for build-notes.json (None: none)
+    derivatives: dict | None = None  # what the derivatives context did (None: not given)
 
 
 def _validate_pick(index, pick, *, now, agent_id, valid_until):
@@ -477,6 +585,38 @@ def _validate_pick(index, pick, *, now, agent_id, valid_until):
                            error=str(getattr(exc, "code", exc)))
     return PickOutcome(coin=coin, symbol=pick["symbol"], pick=pick,
                        dossier_bytes=dossier.manifest["state_bytes"], error=None)
+
+
+def _with_derivatives(outcome, summary, *, index, now, agent_id, valid_until, record):
+    """``outcome`` with the coin's derivatives context: the first of
+    ``derivatives.variants`` (richest first) the app's own models accept, else ``outcome``
+    unchanged. The context never costs a pick and never changes which coins are picked, their
+    order or their levels. ``record`` collects what happened, for build-notes.json."""
+    if summary is None:
+        record["missing"].append(outcome.symbol)
+        return outcome
+    candidates, reasons = derivatives_module.variants(outcome.pick, summary)
+    for augmented, info in candidates:
+        # The citation check intake makes after the schema (check_pick's
+        # CITATION_UNRESOLVED): every claim must cite sources or bars retained in the pick.
+        problems = rationale_reference_errors(
+            augmented["selection_rationale"],
+            source_ids=[source["source_id"] for source in augmented["sources"]],
+            bar_ids=[bar["bar_id"] for bar in (augmented.get("technical_evidence") or {})
+                     .get("bars") or []],
+            prefix=f"picks[{index}].selection_rationale")
+        checked = _validate_pick(index, augmented, now=now, agent_id=agent_id,
+                                 valid_until=valid_until)
+        if not problems and checked.error is None:
+            record["attached"].append({"symbol": outcome.symbol, **info,
+                                       "without": reasons or None})
+            return checked
+        reasons.append(f"{checked.error or problems[0]['code']} with "
+                       f"{', '.join(info['source_ids'])}")
+    record["left_out"].append({"symbol": outcome.symbol,
+                               "reason": "; ".join(reasons) + "; the pick is sent without "
+                                         "the derivatives context"})
+    return outcome
 
 
 def run_slot_for(schedule, now):
@@ -542,7 +682,8 @@ def check_agent(agent_id, agent_version):
 
 def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, agent_id,
                  agent_version, run_id=None, now=None, verify_client=None, max_picks=None,
-                 session=False, emphasis=None, profile=levels.DEFAULT_PROFILE):
+                 session=False, emphasis=None, profile=levels.DEFAULT_PROFILE,
+                 derivatives=None, first_coins=(), evidence=None):
     """Every coin's level setup plus verified news, checked and assembled into one
     ``AGENT_RESEARCH_REPORT_V3``. Requires a real (non-offline) research context with a
     configured schedule: the report needs its ``run_slot``, which the offline fallback
@@ -562,6 +703,14 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
     ``profile`` is the research profile ``levels_by_coin`` was found with (one of
     ``levels.PROFILES``); only the skipped coins' reasons depend on it (the timeframes and
     windows they name).
+
+    ``derivatives`` (``derivatives.load``'s ``{coin: Summary}``, CLI ``build --derivatives``)
+    adds each pick's derivatives context after the pick passed on its own, and keeps it only
+    when the app's models accept the result: the picks, their order and their levels are the
+    same with or without it (``_with_derivatives``). ``first_coins`` (update mode's adjusted
+    picks) are built before the usual order; empty, the order is unchanged. ``evidence``
+    (``EvidenceFilter``) leaves out, with its reason and before the pick limit, a coin the
+    operator excluded or whose entry sits too far under the live mid; never a first coin.
     """
     check_agent(agent_id, agent_version)
     if context_module.is_offline(context) and not session:
@@ -589,16 +738,37 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
     # not an arbitrary alphabetical prefix.
     effective_max_picks = MAX_PICKS if max_picks is None else max_picks
     accepted, skipped, rejected, notes, ranked = [], [], [], [], {}
+    derivative_record = ({"attached": [], "left_out": [], "missing": []}
+                         if derivatives is not None else None)
     with_setup = sorted(
         ((coin, setup) for coin, (setup, _tried) in levels_by_coin.items() if setup is not None),
-        key=lambda pair: (pair[1].rule != "A", -pair[1].reward_risk, pair[0]),
+        key=lambda pair: (pair[0] not in first_coins, pair[1].rule != "A",
+                          -pair[1].reward_risk, pair[0]),
     )
     for coin, (setup, tried) in sorted(levels_by_coin.items()):
         if setup is None:
             skipped.append({"symbol": f"{coin}/USD", "reason": skip_reason(tried, profile)})
 
+    # The guidelines: a coin held open is decided by its own review and is not picked again
+    # (the app declines such a pick, ACTIVE_SYMBOL_ALREADY_MANAGED, and its place is lost).
+    open_symbols = context_module.open_trade_symbols(context)
+    # Method v8: the market's two-hour state, once per build, for the sell-off gate and the
+    # evidence sentence; None when no evidence filter is given.
+    state = evidence_module.market_state(market_data) if evidence is not None else None
+    selloff = (evidence is not None and evidence.selloff is not None
+               and evidence_module.in_selloff(state, evidence.selloff))
     for coin, setup in with_setup:
         symbol = f"{coin}/USD"
+        if symbol in open_symbols:
+            skipped.append({"symbol": symbol, "reason": OPEN_TRADE_SKIP_REASON})
+            continue
+        filtered = evidence is not None and coin not in first_coins
+        if filtered and selloff:
+            skipped.append({"symbol": symbol, "reason": evidence.selloff_reason(state)})
+            continue
+        if filtered and coin in evidence.exclude:
+            skipped.append({"symbol": symbol, "reason": EXCLUDED_SKIP_REASON})
+            continue
         if len(accepted) >= effective_max_picks:
             skipped.append({"symbol": symbol, "reason": "Report already at its pick limit."})
             continue
@@ -613,7 +783,30 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
                             "reason": "No live Alpaca quote (or its timestamp) for this "
                                      "coin in the context."})
             continue
+        if filtered and evidence.max_entry_distance is not None:
+            distance = (Decimal(str(agent_mid)) - setup.max_entry) / Decimal(str(agent_mid))
+            if distance > evidence.max_entry_distance:
+                skipped.append({"symbol": symbol, "reason": evidence.distance_reason(distance)})
+                continue
         raw_coin = (market_data.get("coinbase") or {}).get(coin) or {}
+        evidence_note = None
+        if evidence is not None:
+            # The facts for every pick's text; the v8 checks for new coins only.
+            volume = evidence_module.alpaca_volume_usd(context, symbol)
+            fills, _last_fill, window = evidence_module.fill_history(context, symbol)
+            trend = evidence_module.trend_vs_average(raw_coin, agent_mid,
+                                                     retrieved_at=market_retrieved_at)
+            if (filtered and evidence.min_alpaca_volume_usd is not None and fills == 0
+                    and (volume is None or volume < evidence.min_alpaca_volume_usd)):
+                skipped.append({"symbol": symbol,
+                                "reason": evidence.volume_reason(volume, window)})
+                continue
+            if filtered and evidence.trend_floor is not None and (
+                    trend is None or trend < evidence.trend_floor):
+                skipped.append({"symbol": symbol, "reason": evidence.trend_reason(trend)})
+                continue
+            evidence_note = evidence_module.sentence(trend=trend, volume=volume, fills=fills,
+                                                     window=window, state=state)
         news_items = news_by_coin.get(coin) or []
         verified = []
         if news_items:
@@ -627,12 +820,12 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
 
         def assembled(note, coin=coin, setup=setup, agent_mid=agent_mid,
                       alpaca_quote=alpaca_quote, raw_coin=raw_coin, coin_news=coin_news,
-                      symbol=symbol):
+                      symbol=symbol, evidence_note=evidence_note):
             pick = build_pick(coin=coin, symbol=symbol, setup=setup, agent_mid=agent_mid,
                               agent_price_at=alpaca_quote["quote_at"],
                               coinbase_ticker=raw_coin.get("ticker") or {},
                               market_retrieved_at=market_retrieved_at, news=coin_news, now=now,
-                              lesson_note=note)
+                              lesson_note=note, evidence_note=evidence_note)
             return _validate_pick(len(accepted) + len(rejected), pick, now=now,
                                   agent_id=agent_id, valid_until=valid_until)
 
@@ -647,8 +840,16 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
             rejected.append(outcome)
             notes.append(f"{coin}: dropped by the app's own validator ({outcome.error}).")
             continue
+        if derivatives is not None:
+            outcome = _with_derivatives(outcome, derivatives.get(coin),
+                                        index=len(accepted) + len(rejected), now=now,
+                                        agent_id=agent_id, valid_until=valid_until,
+                                        record=derivative_record)
         accepted.append(outcome)
-        ranked[outcome.symbol] = (lessons.rank_key(attributes, emphasis or ()), len(ranked),
+        # An update's adjusted picks (``first_coins``) stay first under any emphasis (package
+        # learning-loop2: ``update --lessons`` orders only the rest).
+        ranked[outcome.symbol] = ((coin not in first_coins,
+                                   *lessons.rank_key(attributes, emphasis or ())), len(ranked),
                                   [hint["dimension"] for hint in promoted])
 
     applied = None
@@ -661,7 +862,8 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
                                 if dims}}
     if not accepted:
         return BuildResult(report=None, accepted=(), rejected=tuple(rejected),
-                           skipped=tuple(skipped), notes=tuple(notes), lessons=applied)
+                           skipped=tuple(skipped), notes=tuple(notes), lessons=applied,
+                           derivatives=derivative_record)
     report = {
         "schema_version": REPORT_SCHEMA_V3,
         "report_id": str(uuid4()),
@@ -688,7 +890,8 @@ def build_report(*, context, market_data, levels_by_coin, news_by_coin=None, age
         report["context_as_of"] = context.get("as_of")
         report["valid_until"] = valid_until.isoformat()
     return BuildResult(report=report, accepted=tuple(accepted), rejected=tuple(rejected),
-                       skipped=tuple(skipped), notes=tuple(notes), lessons=applied)
+                       skipped=tuple(skipped), notes=tuple(notes), lessons=applied,
+                       derivatives=derivative_record)
 
 
 def validate_report(report, *, now=None, agent_id=None, default_valid_until=None):

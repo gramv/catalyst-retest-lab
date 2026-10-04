@@ -99,7 +99,7 @@ def test_the_jobs_configuration_holds_only_the_ledger_connection(tmp_path):
         cloud_config.jobs_config(jobs_env(), **places)
 
 
-# --- The run: each step independent, then exit 0 ------------------------------------------------
+# --- The run: each step independent, then exit 0, or 1 when a step did not end OK ----------------
 
 
 class Step:
@@ -121,24 +121,49 @@ def run_cron(monkeypatch, capsys, *, store_factory=lambda url: object(), steps=N
     return code, capsys.readouterr().out, reader
 
 
-def test_a_failing_step_is_logged_and_the_run_still_exits_zero(monkeypatch, capsys):
+def steps_ending(monkeypatch, *, shadow=None, replay=None):
+    """Every step ends OK unless given: ``shadow`` / ``replay`` replace those two steps."""
     from catalyst_lab import learning_jobs
+
+    monkeypatch.setattr(learning_jobs, "shadow_step",
+                        shadow or (lambda *_: (None, {"recorded": 1})))
+    monkeypatch.setattr(learning_jobs, "replay_step",
+                        replay or (lambda *_: (None, {"recorded": 2})))
+    monkeypatch.setattr(learning_jobs, "daily_step",
+                        lambda record, unavailable: lambda *_: (None, {"2026-09-27": "OK"}))
+    monkeypatch.setattr(learning_jobs, "weekly_step", lambda *_: (None, {}))
+    monkeypatch.setattr(learning_jobs, "regime_step", lambda *_: (None, {"days": {}}))
+    monkeypatch.setattr(learning_jobs, "calibration_step", lambda *_: (None, {"recorded": 0}))
+    # Package learning-loop2's steps.
+    monkeypatch.setattr(learning_jobs, "trade_paths_step", lambda *_: (None, {"path_recorded": 0}))
+    monkeypatch.setattr(learning_jobs, "missed_tradeable_step", lambda *_: (None, {}))
+
+
+def test_a_failing_step_is_logged_the_others_still_run_and_the_run_exits_one(monkeypatch,
+                                                                             capsys):
+    """Package ops-alarms (2026-09-29): a step that did not end OK exits 1, so Railway shows a
+    failed run (restart policy NEVER: nothing repeats). Until then the run exited 0 whatever
+    the steps logged. Every line is still printed."""
+    steps_ending(monkeypatch)
+    code, out, reader = run_cron(monkeypatch, capsys)
+    assert code == 0 and reader.closed and "JOBS DONE failed=0" in out
 
     def shadow(*_):
         raise RuntimeError("PUBLIC_BAR_CONNECTION_ERROR")
 
-    monkeypatch.setattr(learning_jobs, "shadow_step", shadow)
-    monkeypatch.setattr(learning_jobs, "replay_step", lambda *_: (None, {"recorded": 2}))
-    monkeypatch.setattr(learning_jobs, "daily_step",
-                        lambda record, unavailable: lambda *_: (None, {"2026-09-27": "OK"}))
-    monkeypatch.setattr(learning_jobs, "weekly_step", lambda *_: (None, {}))
+    steps_ending(monkeypatch, shadow=shadow)
     code, out, reader = run_cron(monkeypatch, capsys)
-    assert code == 0 and reader.closed
+    assert code == cloud_runtime.EXIT_JOBS_FAILED == 1 and reader.closed
     assert "JOBS STARTING release_commit=fixture-commit" in out
     assert "JOBS STEP code=PUBLIC_BAR_CONNECTION_ERROR result=FAILED step=shadow_outcomes" in out
     assert "JOBS STEP recorded=2 result=OK step=maintenance_replays" in out
+    assert out.count("JOBS STEP ") == len(STEPS)
     assert "JOBS DONE failed=1" in out
     assert "fixture-risk-password" not in out
+    # A step that returns its own failure code fails the run the same way.
+    steps_ending(monkeypatch, replay=lambda *_: ("REPLAY_BARS_UNAVAILABLE", {"failed": 1}))
+    code, out, _ = run_cron(monkeypatch, capsys)
+    assert code == 1 and "code=REPLAY_BARS_UNAVAILABLE failed=1 result=FAILED" in out
 
 
 def test_refusals_ledger_outages_and_the_time_limits(monkeypatch, capsys):
@@ -152,24 +177,70 @@ def test_refusals_ledger_outages_and_the_time_limits(monkeypatch, capsys):
         raise ValueError("DATABASE_UNAVAILABLE_AFTER_BOUNDED_WAIT")
 
     code, out, _ = run_cron(monkeypatch, capsys, store_factory=down)
-    assert code == 0
+    assert code == 1  # An unreachable ledger fails every step (exit 0 until 2026-09-29).
     for name in STEPS:
         assert (f"code=DATABASE_UNAVAILABLE_AFTER_BOUNDED_WAIT result=FAILED step={name}"
                 in out)
-    # A step not started by the soft limit is skipped; the process ends at the hard limit.
-    ticks = iter([0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+    assert f"JOBS DONE failed={len(STEPS)}" in out
+    # A step not started by the soft limit is skipped, which fails the run too.
+    ticks = iter([0.0, *[10_000.0] * (len(STEPS) - 1)])
     results = run_jobs(object(), Step(), now=NOW, deadline=5.0, monotonic=lambda: next(ticks))
-    assert [r.result for r in results] == ["FAILED"] + ["SKIPPED"] * 4  # No ledger object.
+    assert [r.result for r in results] == ["FAILED"] + ["SKIPPED"] * (len(STEPS) - 1)
     assert results[1].code == "JOB_TIME_LIMIT"
+    steps_ending(monkeypatch)
+    clock = iter([0.0, 0.0, *[cloud_runtime.JOBS_SOFT_SECONDS] * (len(STEPS) + 1)])
+    code, out, _ = run_cron(monkeypatch, capsys, monotonic=lambda: next(clock))
+    assert code == 1 and "result=OK step=shadow_outcomes" in out
+    skipped = len(STEPS) - 1
+    assert out.count("code=JOB_TIME_LIMIT result=SKIPPED") == skipped
+    assert f"JOBS DONE failed={skipped}" in out
     exited = threading.Event()
 
     def slow(*_args, **_kwargs):
         exited.wait(2)
         return []
 
+    statuses = []
+
+    def hard_exit(status):
+        statuses.append(status)
+        exited.set()
+
     code, out, _ = run_cron(monkeypatch, capsys, steps=slow, hard_seconds=0.05,
-                            hard_exit=lambda status: exited.set())
+                            hard_exit=hard_exit)
     assert exited.is_set() and "JOBS TIME_LIMIT_EXIT" in out
+    assert statuses == [1]  # The hard stop exits 1 (0 until 2026-09-29).
+
+
+def test_the_hard_stop_keeps_the_lines_of_the_steps_that_finished(monkeypatch, capsys):
+    """Each step's line is printed as the step ends: the hard stop (``os._exit``, which prints
+    nothing more) keeps the lines of the steps that finished before it. Until 2026-09-29 the
+    lines were printed after the last step, so a run the hard stop ended printed none."""
+    timers, statuses = [], []
+
+    class Timer:  # threading.Timer, fired by the test while the second step runs.
+        daemon = False
+
+        def __init__(self, seconds, function):
+            self.function = function
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    def hanging(*_):
+        timers[0].function()  # The 30-minute stop, while the replays run.
+        return None, {"recorded": 0}
+
+    monkeypatch.setattr(cloud_runtime.threading, "Timer", Timer)
+    steps_ending(monkeypatch, replay=hanging)
+    _, out, _ = run_cron(monkeypatch, capsys, hard_exit=statuses.append)
+    assert statuses == [1]
+    assert (out.index("JOBS STEP recorded=1 result=OK step=shadow_outcomes")
+            < out.index("JOBS TIME_LIMIT_EXIT") < out.index("step=maintenance_replays"))
 
 
 def test_previous_days_catch_up_two_missed_nights():
@@ -193,8 +264,9 @@ def test_the_steps_record_each_day_once_against_the_ledger(learning):  # noqa: F
     results = {r.name: r for r in run_jobs(learning.store, reader, now=now)}
     assert results["shadow_outcomes"].result == "OK"
     assert results["maintenance_replays"].result == "OK"
-    # The 25th ended before any universe was recorded (the outlook came on the 26th).
-    assert results["market_reality"].code == "REALITY_UNIVERSE_UNAVAILABLE"
+    # The 25th ended before any universe was recorded (the outlook came on the 26th): it can
+    # never be measured, so it is listed but does not fail the step (or the run's exit code).
+    assert (results["market_reality"].result, results["market_reality"].code) == ("OK", None)
     assert results["market_reality"].details == {
         "2026-09-25": "REALITY_UNIVERSE_UNAVAILABLE", "2026-09-26": "RECORDED",
         "2026-09-27": "RECORDED"}
@@ -207,6 +279,31 @@ def test_the_steps_record_each_day_once_against_the_ledger(learning):  # noqa: F
     assert again["market_reality"].details["2026-09-27"] == "ALREADY_RECORDED"
     assert again["weekly_review"].details == {week_end.isoformat(): "ALREADY_RECORDED"}
     assert recorded_reality(learning.store.repo, date(2026, 9, 27))["body"]["grades"]
+    # MARKET_REGIME_V1 (package learning-measure) runs first: the 26th and 27th (the 25th
+    # ended before any universe) are recorded once, and each reality day carries its regime.
+    assert results["market_regime"].result == "OK"
+    assert results["market_regime"].details["days"] == {"2026-09-26": "RECORDED",
+                                                         "2026-09-27": "RECORDED"}
+    assert again["market_regime"].details["days"] == {}
+    regime = recorded_reality(learning.store.repo, date(2026, 9, 27))["body"]["regime"]
+    assert regime["status"] == "RECORDED" and regime["regime_version"] == "MARKET_REGIME_V1"
+    assert regime["tag"] == "UNKNOWN/UNKNOWN/UNKNOWN/UNKNOWN"  # No hour bars in this fixture.
+    # Package learning-loop2: the daily brief of each recorded reality day, once; the 25th
+    # (no universe) is not applicable; the missed-tradeable record waits for its holds (the
+    # 26th is ready at 05:30 UTC on the 28th); the paths step has nothing closed to measure.
+    assert STEPS.index("daily_brief") == STEPS.index("scorecard") + 1
+    assert STEPS.index("trade_paths") > STEPS.index("market_reality")
+    assert (results["daily_brief"].result, results["daily_brief"].code) == ("OK", None)
+    assert results["daily_brief"].details == {
+        "2026-09-25": "BRIEF_UNIVERSE_UNAVAILABLE", "2026-09-26": "RECORDED",
+        "2026-09-27": "RECORDED"}
+    assert again["daily_brief"].details["2026-09-27"] == "ALREADY_RECORDED"
+    assert results["missed_tradeable"].result == "OK"
+    assert results["missed_tradeable"].details["2026-09-26"] == "RECORDED"
+    assert "2026-09-27" not in results["missed_tradeable"].details  # Holds not over yet.
+    assert results["trade_paths"].result == "OK"
+    assert results["trade_paths"].details["path_recorded"] == 0
+    assert "learning" in recorded_review(learning.store.repo, week_end)["body"]
 
 
 # --- The owner's commands (ops shell, catalyst_app, read-only) ----------------------------------
@@ -268,6 +365,29 @@ def test_scorecard_market_and_weekly_commands_print_recorded_or_preview(er, lear
     out = io.StringIO()
     assert cloud_runtime.scorecard(date(2026, 9, 29), out=out, repository=repo, now=now) == 1
     assert out.getvalue() == "CLOUD_LEARNING_UNAVAILABLE: SCORECARD_DAY_NOT_OVER\n"
+
+
+def test_the_daily_brief_command_prints_the_recorded_brief_or_a_preview(er, learning):  # noqa: F811
+    reply = learning.client.post("/api/v1/lab/market-outlooks", json=outlook(),
+                                 headers=bearer(AGENTS["claude"]))
+    assert reply.status_code == 202
+    repo = owner_repo(er)
+    now = datetime(2026, 9, 28, 5, 30, tzinfo=UTC)
+    day = date(2026, 9, 27)
+    minutes = {s: minute_rows(day_bounds(day)[0], [100, 106 if s == "SOL/USD" else 100])
+               for s in ("BTC/USD", "DOGE/USD", "ETH/USD", "SOL/USD")}
+    out = io.StringIO()
+    assert cloud_runtime.daily_brief(day, out=out, repository=repo, now=now,
+                                     reader_factory=lambda: Bars(minutes=minutes)) == 1
+    assert out.getvalue() == "CLOUD_LEARNING_UNAVAILABLE: BRIEF_REALITY_NOT_RECORDED\n"
+    run_jobs(learning.store, Bars(minutes=minutes), now=now)
+    out = io.StringIO()
+    assert cloud_runtime.daily_brief(day, out=out, repository=repo, now=now) == 0
+    text = out.getvalue()
+    assert text.startswith("(recorded)\nDaily brief 2026-09-27 (DAILY_BRIEF_V1")
+    assert "Mover SOL/USD 6.0000%" in text and '"research_focus"' in text
+    with pytest.raises(SystemExit):
+        cloud_runtime.main(["daily-brief", "--week-end", "2026-09-27"])
 
 
 def test_the_commands_refuse_without_the_ops_connection():

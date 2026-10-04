@@ -64,6 +64,8 @@ from catalyst_lab.research_selection_topk import (
     VETOED,
     ranking_key_for,
 )
+from catalyst_lab.strategies import core
+from catalyst_lab.strategies.core import ExitWalk, ShadowDataError
 
 SHADOW_METHOD_VERSION = "PICK_SHADOW_OUTCOME_V1"
 SHADOW_EVENT_KIND = "PICK_SHADOW_OUTCOME"
@@ -97,18 +99,14 @@ FEE_ASSUMPTION = {
 # Outcome classification (top-level; every shadow record has exactly one).
 NEVER_TRIGGERED_STOP_FIRST = "NEVER_TRIGGERED_STOP_FIRST"
 NEVER_TRIGGERED_EXPIRED = "NEVER_TRIGGERED_VALIDITY_EXPIRED"
-STOP = "STOP"
-TARGET = "TARGET"
-HOLD_EXIT = "HOLD_24H_EXIT"
-DATA_INCOMPLETE = "DATA_INCOMPLETE"
+STOP = core.STOP
+TARGET = core.TARGET
+HOLD_EXIT = core.HOLD_EXIT
+DATA_INCOMPLETE = core.DATA_INCOMPLETE
 NEVER_TRIGGERED = frozenset({NEVER_TRIGGERED_STOP_FIRST, NEVER_TRIGGERED_EXPIRED})
 TRADED_OUTCOMES = frozenset({STOP, TARGET, HOLD_EXIT})
 
 D0 = D(0)
-
-
-class ShadowDataError(ValueError):
-    """Malformed bar evidence; the caller keeps the pick's outcome unknown (fail-closed)."""
 
 
 # --- Pure bar simulation ------------------------------------------------------------------------
@@ -165,58 +163,20 @@ def parse_bars(rows):
     return bars
 
 
-@dataclass(frozen=True)
-class ExitWalk:
-    """The result of walking bars forward from a known price to its first stop/target/hold exit.
-
-    ``reason`` is one of ``STOP``, ``TARGET``, ``HOLD_24H_EXIT`` or ``DATA_INCOMPLETE`` (bars ran
-    out before the hold deadline with neither level hit -- the outcome is not yet knowable from
-    what was fetched). ``price``/``at`` are ``None`` only for ``DATA_INCOMPLETE``.
-    """
-
-    reason: str
-    price: D | None
-    at: datetime | None
-    ambiguous: bool
-    bars_examined: int
-    last_bar_at: datetime | None
-
-
 def walk_to_exit(stop, target, bars, *, hold_deadline):
     """First stop/target hit in ``bars`` (ascending, at or after the fill), else a 24-hour exit.
 
-    Shared by the shadow pick simulation and the unchanged-plan replay (``unchanged_plan.py``):
-    both are "starting now, with these levels, on these bars, what happens?"
+    Shared by the shadow pick simulation, the unchanged-plan replay (``unchanged_plan.py``) and
+    the strategy shadow (``strategy_shadow``): the decision core's ``walk_to_exit``
+    (``strategies.core``, STRATEGY_REGISTRY_V1), unchanged.
     """
-    examined, last_at = 0, None
-    for bar in bars:
-        if bar.start >= hold_deadline:
-            break
-        examined += 1
-        last_at = bar.start
-        hit_stop, hit_target = bar.low <= stop, bar.high >= target
-        if hit_stop and hit_target:
-            return ExitWalk(STOP, stop, bar.start, True, examined, last_at)
-        if hit_stop:
-            return ExitWalk(STOP, stop, bar.start, False, examined, last_at)
-        if hit_target:
-            return ExitWalk(TARGET, target, bar.start, False, examined, last_at)
-    at_or_after_deadline = [b for b in bars if b.start >= hold_deadline]
-    if at_or_after_deadline:
-        exit_bar = at_or_after_deadline[0]
-        return ExitWalk(HOLD_EXIT, exit_bar.open, hold_deadline, False, examined, last_at)
-    return ExitWalk(DATA_INCOMPLETE, None, None, False, examined, last_at)
+    return core.walk_to_exit(stop, target, bars, hold_deadline=hold_deadline)
 
 
 def r_values(entry_price, stop, exit_price, *, fee_rate=TAKER_FEE_TIER1):
     """Gross and (assumed-fee) net R, priced at ``entry_price`` -- the official-R convention
-    (P&L per unit / (entry - stop)), so no trade-size assumption is needed."""
-    risk = entry_price - stop
-    if risk <= 0:
-        raise ShadowDataError("NONPOSITIVE_RISK_DENOMINATOR")
-    gross_r = (exit_price - entry_price) / risk
-    fee_r = fee_rate * (entry_price + exit_price) / risk
-    return gross_r, gross_r - fee_r
+    (P&L per unit / (entry - stop)), so no trade-size assumption is needed (``core.r_values``)."""
+    return core.r_values(entry_price, stop, exit_price, fee_rate=fee_rate)
 
 
 # --- One pick's full simulation -----------------------------------------------------------------
@@ -279,10 +239,13 @@ def simulate_pick(levels, bars, *, window_start, window_end, hold=HOLD_HORIZON,
     trigger_bar, first_at = None, considered[0].start if considered else None
     outcome = NEVER_TRIGGERED_EXPIRED
     for bar in considered:
-        if bar.low <= stop:
+        # PULLBACK_V1's touch (the decision core, shared with the live trigger): the stop
+        # first, then the entry trigger, on the bar's low.
+        event = core.pullback_bar_event(bar, entry_trigger, stop)
+        if event == core.STOP_FIRST:
             outcome = NEVER_TRIGGERED_STOP_FIRST
             break
-        if bar.low <= entry_trigger:
+        if event == core.TRIGGER:
             trigger_bar = bar
             break
     if trigger_bar is None:
@@ -366,6 +329,9 @@ class PickRecord:
     setup_id: str | None
     arm: str | None
     engineering: bool
+    # TRADED_LEVELS_V1 (package learning-loop2): the admitted setup's traded levels (the plan's
+    # stop and target of a CRYPTO_TRADE_PLAN_V1 setup), None for every other pick.
+    traded_levels: dict | None = None
 
     def to_dict(self):
         from dataclasses import asdict
@@ -500,6 +466,7 @@ def cycle_picks(repository, cycle_id, *, now=None):
             setup_id=str(setup["setup_id"]) if setup else None,
             arm=(state or {}).get("arm") if setup else None,
             engineering=is_engineering(setup["record_json"]) if setup else False,
+            traded_levels=traded_levels(packet["levels"], state),
         ))
     records.sort(key=lambda r: (r.agent_rank if r.agent_rank is not None else 10**9, r.item_key))
     return records
@@ -530,7 +497,21 @@ def existing_shadow_outcomes(repository, cycle_id):
     return {row["body"]["pick"]["item_key"]: row for row in rows}
 
 
-def record_shadow_outcome(store, conn, pick, simulation):
+def traded_levels(levels, state):
+    """The plan's levels of an admitted ``CRYPTO_TRADE_PLAN_V1`` setup (entry trigger and max
+    entry as researched, the plan's stop and target), else None (TRADED_LEVELS_V1)."""
+    from catalyst_lab import trade_plan
+
+    try:
+        if not state or not trade_plan.active(state):
+            return None
+        return {k: str(v) for k, v in trade_plan.initial_levels(levels, state).items()
+                if k in ("entry_trigger", "max_entry_price", "stop", "target")}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def record_shadow_outcome(store, conn, pick, simulation, traded=None):
     """Append one immutable ``PICK_SHADOW_OUTCOME`` event; idempotent per (cycle, item, revision).
 
     ``setup_id`` is set on the event row (not only in its body) so an admitted, later-traded
@@ -554,6 +535,12 @@ def record_shadow_outcome(store, conn, pick, simulation):
     }
     body = {"pick": json_safe(pick_body), "outcome": simulation.to_dict(),
             "computed_at": datetime.now(UTC)}
+    if traded is not None:
+        # TRADED_LEVELS_V1 (package learning-loop2): the same walk on the levels the admitted
+        # setup traded (the plan's stop and target), beside the research levels' outcome.
+        body["traded_plan"] = {"levels_basis": "CRYPTO_TRADE_PLAN_V1",
+                               "levels": json_safe(pick.traded_levels),
+                               "outcome": traded.to_dict()}
     return store.event(
         conn, SHADOW_EVENT_KIND, body,
         setup_id=pick.setup_id, key=shadow_outcome_key(pick.cycle_id, pick.item_key, pick.revision),
@@ -626,8 +613,16 @@ def run_shadow_outcome_job(store, bar_reader, *, now=None, cycle_id=None, since=
             except ShadowDataError:
                 summary.invalid_levels += 1
                 continue
+            traded = None
+            if pick.traded_levels:
+                try:
+                    traded = simulate_pick(pick.traded_levels, bars,
+                                           window_start=pick.generated_at,
+                                           window_end=pick.window_end)
+                except ShadowDataError:
+                    traded = None  # The research levels' outcome is still recorded.
             with store.transaction() as conn:
-                record_shadow_outcome(store, conn, pick, simulation)
+                record_shadow_outcome(store, conn, pick, simulation, traded)
             summary.recorded += 1
             summary.recorded_item_keys.append(pick.item_key)
     return summary

@@ -171,6 +171,10 @@ MANAGEMENT_QUESTIONS = frozenset({"thesis_status", "action", "stop_option", "tar
 # "maintenance" answer for a maintained report-V3 crypto trade.
 MAINTENANCE_ACTIONS = crypto_maintenance.ACTIONS
 MAINTENANCE_QUESTIONS = frozenset({"trade_reason", "action", "stop_option", "target_option"})
+# CRYPTO_MAINTENANCE_V5 (JEV_MANAGED_POSITION_QUESTIONS_V6, package jev-b1): two yes/no Nouls;
+# the fixture answers invalidation_met yes (0.9) when the script says FLAG_EARLY_EXIT, else no.
+MAINTENANCE_V6_QUESTIONS = (frozenset({"invalidation_met"}),
+                            frozenset({"invalidation_met", "news_contradicts"}))
 # Package day-review: JEV_DAY_REVIEW_QUESTIONS_V1 (agent_case only when the agent answered) and
 # JEV_EARLY_EXIT_QUESTIONS_V1, answered by the fixture script's "day_review",
 # "day_review_final" and "early_exit" labels.
@@ -450,6 +454,8 @@ def _request_kind(questions, state):
         return "MANAGEMENT", (state.get("position") or {}).get("symbol")
     if keys == MAINTENANCE_QUESTIONS:
         return "MAINTENANCE", state.get("symbol")
+    if keys in MAINTENANCE_V6_QUESTIONS:
+        return "MAINTENANCE_V6", state.get("symbol")
     if keys in (DAY_REVIEW_QUESTIONS, DAY_REVIEW_QUESTIONS | {"agent_case"}):
         return "DAY_REVIEW", state.get("symbol")
     if keys == EARLY_EXIT_QUESTIONS:
@@ -768,6 +774,11 @@ class FixtureScript:
             reply = self._management(questions, spec["management"], helpers)
         elif kind == "MAINTENANCE":
             reply = self._maintenance(questions, spec["maintenance"], helpers)
+        elif kind == "MAINTENANCE_V6":
+            p = 0.9 if spec["maintenance"] == "FLAG_EARLY_EXIT" else 0.05
+            reply = {"model": JEV_MODEL,
+                     "answers": {name: {"type": "noul", "noul": p} for name in questions},
+                     "usage": {"input_tokens": 10, "output_tokens": 1}}
         elif kind == "DAY_REVIEW":
             final = (state.get("review") or {}).get("round") == "FINAL"
             labels = (spec["day_review_final"] or spec["day_review"]) if final else (
@@ -1093,9 +1104,13 @@ class AgentResearchSession:
             transport=httpx.MockTransport(self.venue.handle),
         )
         try:
+            # CRYPTO_TRADE_PLAN_V1 needs the coin's real 1-hour bars, which a session's simulated
+            # market does not have: a session admits on the pick's research levels, as before
+            # package trade-plan (docs/packages/trade-plan.md, open items).
             self.engine = SessionExecution(
                 repository, self.broker, policy=engineering_execution_policy(), clock=self.now,
                 review_store=self.reviews, risk_policy_id=RISK_POLICY_ID,
+                trade_plan_enabled=False,
             )
             self.repo = self.engine.repo
             if not self.engine.reconcile()["clean"]:
@@ -1882,9 +1897,11 @@ class AgentResearchSession:
                         reason=skipped.get("reason") if skipped else None)
         if request and request.get("context"):
             view["trigger_reasons"] = request["trigger"]["reasons"]
+            # CRYPTO_MAINTENANCE_V5's context has no options (Jev never chooses a level).
             view["options"] = {kind: [(o["option_id"], o["price"], o["bases"])
                                       for o in request["context"]["options"][kind]]
-                               for kind in ("stop", "target")}
+                               for kind in ("stop", "target")} if "options" in request[
+                "context"] else None
             view["state_bytes"] = request["context"]["manifest"]["state_bytes"]
         for _ in range(4):  # A raised stop is replaced at the venue by the protection loop.
             if not self.engine._load(setup_id)[1].get("stop_replace"):
